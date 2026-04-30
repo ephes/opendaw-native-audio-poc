@@ -18,27 +18,19 @@ JSON messages describe device and stream state:
 
 ```json
 {
-  "type": "meters",
-  "frameStart": 96000,
-  "rms": [0.01, 0.02],
-  "peak": [0.08, 0.12],
-  "clip": [false, false]
+  "type": "stream-error",
+  "code": "server-client-lagged",
+  "message": "WebSocket client skipped 3 audio blocks"
 }
 ```
 
-```json
-{
-  "type": "stream-error",
-  "code": "device-lost",
-  "message": "Input device disappeared"
-}
-```
+The current Rust server sends `stream-started` when a WebSocket client connects. It sends `stream-error` when the server detects a client-side stream delivery problem such as a lagging WebSocket receiver. `device-lost` is reserved for a later backend path that can report input-device loss through the protocol. Per-channel browser meters are computed in the Worker from received PCM blocks rather than sent as JSON.
 
 ## PCM Blocks
 
 PCM blocks should be binary WebSocket messages.
 
-Initial simple layout:
+Implemented layout:
 
 ```text
 bytes 0..8    u64 little-endian frameStart
@@ -47,6 +39,8 @@ bytes 12..14  u16 little-endian channelCount
 bytes 14..16  reserved
 bytes 16..N   Float32 little-endian interleaved PCM
 ```
+
+`frameStart` is the first frame index in the backend stream timeline. `frameCount * channelCount` Float32 samples follow the 16-byte header.
 
 For 12 channels at 48 kHz, raw throughput is modest:
 
@@ -60,13 +54,23 @@ The hard part is smooth scheduling and clock behavior, not raw bandwidth.
 
 The browser should receive PCM in a Worker, write it into a `SharedArrayBuffer` ring buffer, and let an `AudioWorkletProcessor` pull blocks from that buffer.
 
-The AudioWorklet should report:
+The first browser test page implements:
 
 - underrun count
 - overflow count
 - read/write distance
-- current playback latency estimate
-- per-channel meters, or enough data for the UI to compute them
+- per-channel peak meters computed by the Worker
+- selectable left/right source channels for stereo monitor output
+
+The static page must be served with cross-origin isolation headers for `SharedArrayBuffer`:
+
+```text
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+Cross-Origin-Resource-Policy: same-origin
+```
+
+The current in-page ring buffer state is an implementation detail, not part of the backend compatibility boundary. It uses a 256-byte metadata prefix with atomic Int32 counters followed by interleaved Float32 ring-buffer samples.
 
 ## Compatibility Boundary
 

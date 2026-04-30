@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>openDAW Native Audio Bridge PoC</title>
+    <link rel="stylesheet" href="/style.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Native Audio Bridge</h1>
+          <p id="stream-summary">Disconnected</p>
+        </div>
+        <div class="actions">
+          <button id="connect" type="button">Connect</button>
+          <button id="monitor" type="button" disabled>Start Monitor</button>
+        </div>
+      </header>
+
+      <section class="status-grid" aria-label="Stream status">
+        <div>
+          <span>Socket</span>
+          <strong id="socket-state">closed</strong>
+        </div>
+        <div>
+          <span>Buffer Fill</span>
+          <strong id="buffer-fill">0 frames</strong>
+        </div>
+        <div>
+          <span>Underruns</span>
+          <strong id="underruns">0</strong>
+        </div>
+        <div>
+          <span>Overflows</span>
+          <strong id="overflows">0</strong>
+        </div>
+      </section>
+
+      <section class="monitor-panel" aria-label="Monitor channel selection">
+        <label>
+          Left
+          <select id="left-channel"></select>
+        </label>
+        <label>
+          Right
+          <select id="right-channel"></select>
+        </label>
+      </section>
+
+      <section>
+        <h2>Meters</h2>
+        <div id="meters" class="meters"></div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
