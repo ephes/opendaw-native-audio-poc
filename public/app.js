@@ -1,15 +1,4 @@
-const STATE = {
-  WRITE_FRAME: 0,
-  READ_FRAME: 1,
-  OVERFLOW_COUNT: 2,
-  UNDERRUN_COUNT: 3,
-  CHANNELS: 4,
-  CAPACITY_FRAMES: 5,
-  CONNECTED: 6,
-  SAMPLE_RATE: 7,
-  FRAMES_PER_BLOCK: 8,
-  RECEIVED_BLOCKS: 9,
-};
+import { STATE, STATE_INTS } from "./ring-buffer.js";
 
 const els = {
   connect: document.querySelector("#connect"),
@@ -240,7 +229,7 @@ function handleWorkerMessage(event) {
   } else if (message.type === "shared-buffer") {
     sharedBuffer = message.sharedBuffer;
     streamInfo = message.stream;
-    stateView = new Int32Array(sharedBuffer, 0, 64);
+    stateView = new Int32Array(sharedBuffer, 0, STATE_INTS);
     setupStreamUi(streamInfo);
     els.monitor.disabled = false;
     if (workletNode) {

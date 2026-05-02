@@ -1,23 +1,14 @@
 import { decodePcmBlock } from "./pcm-block.js";
 import { PcmRecorder } from "./recorder.js";
+import {
+  createRingBufferViews,
+  RING_BUFFER_BYTES_PER_SAMPLE,
+  STATE,
+  STATE_BYTES,
+  STATE_INTS,
+} from "./ring-buffer.js";
 
-const STATE_BYTES = 256;
-const STATE_INTS = 64;
-const BYTES_PER_SAMPLE = 4;
 const CAPACITY_SECONDS = 2;
-
-const STATE = {
-  WRITE_FRAME: 0,
-  READ_FRAME: 1,
-  OVERFLOW_COUNT: 2,
-  UNDERRUN_COUNT: 3,
-  CHANNELS: 4,
-  CAPACITY_FRAMES: 5,
-  CONNECTED: 6,
-  SAMPLE_RATE: 7,
-  FRAMES_PER_BLOCK: 8,
-  RECEIVED_BLOCKS: 9,
-};
 
 let socket = null;
 let sharedBuffer = null;
@@ -114,10 +105,9 @@ function handleSocketMessage(event) {
 function configureStream(info) {
   streamInfo = info;
   const capacityFrames = Math.max(info.framesPerBlock * 8, info.sampleRate * CAPACITY_SECONDS);
-  const sampleBytes = capacityFrames * info.channels * BYTES_PER_SAMPLE;
+  const sampleBytes = capacityFrames * info.channels * RING_BUFFER_BYTES_PER_SAMPLE;
   sharedBuffer = new SharedArrayBuffer(STATE_BYTES + sampleBytes);
   stateView = new Int32Array(sharedBuffer, 0, STATE_INTS);
-  sampleView = new Float32Array(sharedBuffer, STATE_BYTES, capacityFrames * info.channels);
   Atomics.store(stateView, STATE.WRITE_FRAME, 0);
   Atomics.store(stateView, STATE.READ_FRAME, 0);
   Atomics.store(stateView, STATE.OVERFLOW_COUNT, 0);
@@ -128,6 +118,7 @@ function configureStream(info) {
   Atomics.store(stateView, STATE.SAMPLE_RATE, info.sampleRate);
   Atomics.store(stateView, STATE.FRAMES_PER_BLOCK, info.framesPerBlock);
   Atomics.store(stateView, STATE.RECEIVED_BLOCKS, 0);
+  sampleView = createRingBufferViews(sharedBuffer, stateView).sampleView;
   postMessage({ type: "shared-buffer", sharedBuffer, stream: info });
 }
 

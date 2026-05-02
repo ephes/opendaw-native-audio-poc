@@ -10,6 +10,7 @@ test:
     node --check public/audio-worker.js
     node --check public/pcm-block.js
     node --check public/recorder.js
+    node --check public/ring-buffer.js
     node --check public/wav.js
     node --check public/bridge-processor.js
 
