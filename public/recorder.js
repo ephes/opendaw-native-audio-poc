@@ -1039,7 +1039,7 @@ function formatBytes(bytes) {
 }
 
 function supportsOpfs() {
-  return Boolean(navigator.storage?.getDirectory);
+  return typeof navigator !== "undefined" && Boolean(navigator.storage?.getDirectory);
 }
 
 async function requestPersistentStorage() {

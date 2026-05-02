@@ -5,6 +5,7 @@ test:
     cargo fmt --check
     cargo check
     cargo test
+    node --test
     node --check public/app.js
     node --check public/audio-worker.js
     node --check public/recorder.js
