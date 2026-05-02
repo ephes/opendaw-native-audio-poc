@@ -1,3 +1,4 @@
+import { decodePcmBlock } from "./pcm-block.js";
 import { PcmRecorder } from "./recorder.js";
 
 const STATE_BYTES = 256;
@@ -134,42 +135,23 @@ function writePcmBlock(buffer) {
   if (!stateView || !sampleView || !streamInfo) {
     return;
   }
-  if (buffer.byteLength < 16) {
-    recorder.noteInvalidBlock(`PCM block too small: ${buffer.byteLength} bytes`);
-    postMessage({ type: "error", message: `PCM block too small: ${buffer.byteLength} bytes` });
-    return;
-  }
-  const view = new DataView(buffer);
-  const frameStart = Number(view.getBigUint64(0, true));
-  const frameCount = view.getUint32(8, true);
-  const channels = view.getUint16(12, true);
-  const expectedBytes = 16 + frameCount * channels * BYTES_PER_SAMPLE;
-  if (buffer.byteLength !== expectedBytes) {
-    recorder.noteInvalidBlock(
-      `PCM block byte length mismatch: expected ${expectedBytes}, got ${buffer.byteLength}`,
-    );
-    postMessage({
-      type: "error",
-      message: `PCM block byte length mismatch: expected ${expectedBytes}, got ${buffer.byteLength}`,
-    });
-    return;
-  }
-  if (channels !== streamInfo.channels) {
-    recorder.noteChannelMismatch({
-      frameStart,
-      frameCount,
-      expectedChannels: streamInfo.channels,
-      actualChannels: channels,
-    });
-    postMessage({
-      type: "error",
-      message: `PCM block channel mismatch: expected ${streamInfo.channels}, got ${channels}`,
-    });
+  const block = decodePcmBlock(buffer, { expectedChannels: streamInfo.channels });
+  if (!block.ok) {
+    if (block.kind === "channel-mismatch") {
+      recorder.noteChannelMismatch({
+        frameStart: block.frameStart,
+        frameCount: block.frameCount,
+        expectedChannels: streamInfo.channels,
+        actualChannels: block.channels,
+      });
+    } else {
+      recorder.noteInvalidBlock(block.message);
+    }
+    postMessage({ type: "error", message: block.message });
     return;
   }
 
-  const incoming = new Float32Array(buffer, 16);
-  const dataBytes = new Uint8Array(buffer, 16, incoming.byteLength);
+  const { frameStart, frameCount, channels, samples, dataBytes } = block;
   const receivedBlockIndex = Atomics.load(stateView, STATE.RECEIVED_BLOCKS);
   recorder.recordBlock({ frameStart, frameCount, channels, receivedBlockIndex, dataBytes });
   const capacityFrames = Atomics.load(stateView, STATE.CAPACITY_FRAMES);
@@ -188,12 +170,12 @@ function writePcmBlock(buffer) {
     const ringFrame = (writeFrame + frame) % capacityFrames;
     const ringOffset = ringFrame * channels;
     const inputOffset = frame * channels;
-    sampleView.set(incoming.subarray(inputOffset, inputOffset + channels), ringOffset);
+    sampleView.set(samples.subarray(inputOffset, inputOffset + channels), ringOffset);
   }
 
   Atomics.store(stateView, STATE.WRITE_FRAME, writeFrame + frameCount);
   Atomics.add(stateView, STATE.RECEIVED_BLOCKS, 1);
-  maybePostMeters(incoming, frameCount, channels);
+  maybePostMeters(samples, frameCount, channels);
 }
 
 function maybePostMeters(samples, frameCount, channels) {
