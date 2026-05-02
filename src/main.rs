@@ -30,6 +30,7 @@ use serde::Serialize;
 use tokio::{
     net::TcpListener,
     sync::broadcast,
+    task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
 use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
@@ -82,6 +83,11 @@ struct AppState {
     stream_info: StreamStarted,
     blocks: broadcast::Sender<Arc<AudioBlock>>,
     native_stats: Arc<NativeInputStats>,
+}
+
+struct SourceRuntime {
+    input_stream: Option<Stream>,
+    sine_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,6 +190,14 @@ impl Source {
     }
 }
 
+impl Drop for SourceRuntime {
+    fn drop(&mut self) {
+        if let Some(task) = &self.sine_task {
+            task.abort();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -256,6 +270,24 @@ async fn serve(args: ServeArgs) -> Result<()> {
         eprintln!("Warning: --device is ignored when --source sine is selected");
     }
 
+    let (app, source_runtime) = build_app(args.clone())?;
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind http server on http://{addr}"))?;
+
+    println!(
+        "Serving {}-channel {:?} stream at {} Hz on http://{}",
+        args.channels, args.source, args.sample_rate, addr
+    );
+    println!("WebSocket endpoint: ws://{addr}/ws");
+
+    let result = axum::serve(listener, app).await.context("server failed");
+    drop(source_runtime);
+    result
+}
+
+fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
     let (block_tx, _) = broadcast::channel::<Arc<AudioBlock>>(PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS);
     let native_stats = Arc::new(NativeInputStats::new(
         args.source,
@@ -272,16 +304,25 @@ async fn serve(args: ServeArgs) -> Result<()> {
         sample_format: "f32-interleaved",
     };
 
-    let _input_stream = match args.source {
+    let mut source_runtime = SourceRuntime {
+        input_stream: None,
+        sine_task: None,
+    };
+    match args.source {
         Source::Sine => {
-            spawn_sine_source(args.clone(), block_tx.clone(), native_stats.clone());
-            None
+            source_runtime.sine_task = Some(spawn_sine_source(
+                args.clone(),
+                block_tx.clone(),
+                native_stats.clone(),
+            ));
         }
-        Source::Input => Some(start_input_source(
-            args.clone(),
-            block_tx.clone(),
-            native_stats.clone(),
-        )?),
+        Source::Input => {
+            source_runtime.input_stream = Some(start_input_source(
+                args.clone(),
+                block_tx.clone(),
+                native_stats.clone(),
+            )?);
+        }
     };
 
     let state = AppState {
@@ -307,18 +348,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         ))
         .with_state(state);
 
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind http server on http://{addr}"))?;
-
-    println!(
-        "Serving {}-channel {:?} stream at {} Hz on http://{}",
-        args.channels, args.source, args.sample_rate, addr
-    );
-    println!("WebSocket endpoint: ws://{addr}/ws");
-
-    axum::serve(listener, app).await.context("server failed")
+    Ok((app, source_runtime))
 }
 
 fn validate_serve_args(args: &ServeArgs) -> Result<()> {
@@ -415,7 +445,7 @@ fn spawn_sine_source(
     args: ServeArgs,
     block_tx: broadcast::Sender<Arc<AudioBlock>>,
     native_stats: Arc<NativeInputStats>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let channels = usize::from(args.channels);
         let frames_per_block = args.frames_per_block as usize;
@@ -455,7 +485,7 @@ fn spawn_sine_source(
             next_tick += block_duration;
             tokio::time::sleep_until(next_tick).await;
         }
-    });
+    })
 }
 
 fn deterministic_noise(frame: u64, channel: u64) -> f32 {
@@ -683,4 +713,203 @@ fn encode_pcm_block(block: &AudioBlock) -> Vec<u8> {
         payload.extend_from_slice(&sample.to_le_bytes());
     }
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{Stream as WsStream, StreamExt};
+    use serde_json::Value;
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{Error as WsError, Message as ClientMessage},
+    };
+
+    #[tokio::test]
+    async fn sine_websocket_protocol_starts_with_stats_and_pcm_block() {
+        let args = ServeArgs {
+            source: Source::Sine,
+            device: None,
+            channels: 2,
+            sample_rate: 48_000,
+            frames_per_block: 64,
+            // The test binds its own ephemeral listener directly.
+            port: 0,
+        };
+        let (app, source_runtime) = build_app(args.clone()).expect("sine app should build");
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("ephemeral listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let (mut socket, _) = connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("websocket should connect");
+
+        let started = message_text_json(recv_ws_message(&mut socket).await);
+        assert_eq!(
+            started.get("type").and_then(Value::as_str),
+            Some("stream-started")
+        );
+        assert_eq!(
+            started.get("sampleRate").and_then(Value::as_u64),
+            Some(u64::from(args.sample_rate))
+        );
+        assert_eq!(
+            started.get("channels").and_then(Value::as_u64),
+            Some(u64::from(args.channels))
+        );
+        assert_eq!(
+            started.get("framesPerBlock").and_then(Value::as_u64),
+            Some(u64::from(args.frames_per_block))
+        );
+        assert_eq!(
+            started.get("sampleFormat").and_then(Value::as_str),
+            Some("f32-interleaved")
+        );
+
+        let stats = message_text_json(recv_ws_message(&mut socket).await);
+        assert_eq!(
+            stats.get("type").and_then(Value::as_str),
+            Some("native-input-stats")
+        );
+        assert_eq!(stats.get("source").and_then(Value::as_str), Some("sine"));
+        assert_eq!(
+            stats.get("nativeDroppedBlocks").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            stats.get("nativeDroppedFrames").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            stats.get("nativeDropEvents").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            stats
+                .get("bridgeQueueCapacityBlocks")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert!(
+            stats.get("atFrame").and_then(Value::as_u64).is_some(),
+            "sine stats should include a non-negative atFrame"
+        );
+
+        let duplicate_stats_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        let mut saw_pcm_block = false;
+        loop {
+            match tokio::time::timeout_at(duplicate_stats_deadline, socket.next()).await {
+                Ok(Some(Ok(ClientMessage::Binary(payload)))) => {
+                    assert_pcm_block(&payload, args.frames_per_block, args.channels);
+                    saw_pcm_block = true;
+                }
+                Ok(Some(Ok(ClientMessage::Text(text)))) => {
+                    let event: Value =
+                        serde_json::from_str(text.as_ref()).expect("text event should be JSON");
+                    let event_type = event.get("type").and_then(Value::as_str);
+                    assert_ne!(
+                        event_type,
+                        Some("native-input-stats"),
+                        "native-input-stats should not repeat before the periodic interval"
+                    );
+                    assert_ne!(
+                        event_type,
+                        Some("stream-error"),
+                        "test client should not lag the websocket stream"
+                    );
+                }
+                Ok(Some(Ok(ClientMessage::Ping(_))) | Some(Ok(ClientMessage::Pong(_)))) => {}
+                Ok(Some(Ok(other))) => panic!("unexpected websocket message: {other:?}"),
+                Ok(Some(Err(error))) => panic!("websocket receive failed: {error}"),
+                Ok(None) => panic!("websocket closed before protocol assertions completed"),
+                Err(_) => break,
+            }
+        }
+        assert!(saw_pcm_block, "expected at least one PCM binary block");
+
+        let mut saw_periodic_stats = false;
+        let periodic_stats_deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+        loop {
+            match tokio::time::timeout_at(periodic_stats_deadline, socket.next()).await {
+                Ok(Some(Ok(ClientMessage::Text(text)))) => {
+                    let event: Value =
+                        serde_json::from_str(text.as_ref()).expect("text event should be JSON");
+                    if event.get("type").and_then(Value::as_str) == Some("native-input-stats") {
+                        assert_eq!(event.get("source").and_then(Value::as_str), Some("sine"));
+                        saw_periodic_stats = true;
+                        break;
+                    }
+                }
+                Ok(Some(Ok(ClientMessage::Binary(payload)))) => {
+                    assert_pcm_block(&payload, args.frames_per_block, args.channels);
+                }
+                Ok(Some(Ok(ClientMessage::Ping(_))) | Some(Ok(ClientMessage::Pong(_)))) => {}
+                Ok(Some(Ok(other))) => panic!("unexpected websocket message: {other:?}"),
+                Ok(Some(Err(error))) => panic!("websocket receive failed: {error}"),
+                Ok(None) => panic!("websocket closed before periodic stats assertion completed"),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_periodic_stats,
+            "expected a periodic native-input-stats event after startup"
+        );
+
+        server.abort();
+        let _ = server.await;
+        drop(source_runtime);
+    }
+
+    async fn recv_ws_message<S>(socket: &mut S) -> ClientMessage
+    where
+        S: WsStream<Item = std::result::Result<ClientMessage, WsError>> + Unpin,
+    {
+        tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("timed out waiting for websocket message")
+            .expect("websocket closed")
+            .expect("websocket receive failed")
+    }
+
+    fn message_text_json(message: ClientMessage) -> Value {
+        match message {
+            ClientMessage::Text(text) => {
+                serde_json::from_str(text.as_ref()).expect("text message should be JSON")
+            }
+            other => panic!("expected text websocket message, got {other:?}"),
+        }
+    }
+
+    fn assert_pcm_block(payload: &[u8], frames_per_block: u32, channels: u16) {
+        assert!(
+            payload.len() >= 16,
+            "PCM block should include the 16-byte header"
+        );
+
+        let frame_start = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let frame_count = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+        let channel_count = u16::from_le_bytes(payload[12..14].try_into().unwrap());
+        let reserved = u16::from_le_bytes(payload[14..16].try_into().unwrap());
+
+        assert_eq!(frame_count, frames_per_block);
+        assert_eq!(channel_count, channels);
+        assert_eq!(reserved, 0);
+        assert_eq!(frame_start % u64::from(frames_per_block), 0);
+        assert_eq!(
+            payload.len(),
+            16 + frame_count as usize * usize::from(channel_count) * size_of::<f32>()
+        );
+
+        for sample in payload[16..].chunks_exact(size_of::<f32>()) {
+            let value = f32::from_le_bytes(sample.try_into().unwrap());
+            assert!(value.is_finite(), "PCM sample should be a finite Float32");
+        }
+    }
 }

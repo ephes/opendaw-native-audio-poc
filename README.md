@@ -66,7 +66,7 @@ just serve-sine
 just serve-l12
 ```
 
-`just test` runs `cargo fmt --check`, `cargo check`, and JavaScript syntax checks for the static browser modules. `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
+`just test` runs `cargo fmt --check`, `cargo check`, `cargo test`, and JavaScript syntax checks for the static browser modules. `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
 
 ## Current Implementation
 
