@@ -1,3 +1,5 @@
+import { PcmRecorder } from "./recorder.js";
+
 const STATE_BYTES = 256;
 const STATE_INTS = 64;
 const BYTES_PER_SAMPLE = 4;
@@ -22,6 +24,10 @@ let stateView = null;
 let sampleView = null;
 let streamInfo = null;
 let lastMeterPost = 0;
+let recorder = new PcmRecorder({
+  readCounters,
+  postMessage: (message) => postMessage(message),
+});
 
 self.addEventListener("message", (event) => {
   const message = event.data;
@@ -29,6 +35,28 @@ self.addEventListener("message", (event) => {
     connect(message.url);
   } else if (message.type === "disconnect") {
     disconnect();
+  } else if (message.type === "recording-start") {
+    runRecorderAction(() => recorder.start(streamInfo));
+  } else if (message.type === "recording-stop") {
+    runRecorderAction(() => recorder.stop());
+  } else if (message.type === "recording-reset") {
+    runRecorderAction(() => recorder.clear());
+  } else if (message.type === "recording-counters-reset") {
+    recorder.rebaselineCounters("monitor-start-reset");
+  } else if (message.type === "export-manifest") {
+    runExport(() => recorder.exportManifest());
+  } else if (message.type === "export-selected-wav") {
+    runExport(() => recorder.exportSelectedChannelWav(message.channelIndex));
+  } else if (message.type === "recovery-scan") {
+    runRecoveryScan();
+  } else if (message.type === "export-recovered-manifest") {
+    runExport(() => recorder.exportRecoveredManifest(message.sessionId));
+  } else if (message.type === "export-recovered-wav") {
+    runExport(() =>
+      recorder.exportRecoveredSelectedChannelWav(message.sessionId, message.channelIndex),
+    );
+  } else if (message.type === "delete-recovered-session") {
+    runDeleteRecoveredSession(message.sessionId);
   }
 });
 
@@ -68,6 +96,7 @@ function handleSocketMessage(event) {
     if (message.type === "stream-started") {
       configureStream(message);
     } else if (message.type === "stream-error") {
+      recorder.noteWebSocketLag({ code: message.code, message: message.message });
       postMessage({ type: "error", message: message.message, code: message.code });
     }
     return;
@@ -99,10 +128,33 @@ function writePcmBlock(buffer) {
   if (!stateView || !sampleView || !streamInfo) {
     return;
   }
+  if (buffer.byteLength < 16) {
+    recorder.noteInvalidBlock(`PCM block too small: ${buffer.byteLength} bytes`);
+    postMessage({ type: "error", message: `PCM block too small: ${buffer.byteLength} bytes` });
+    return;
+  }
   const view = new DataView(buffer);
+  const frameStart = Number(view.getBigUint64(0, true));
   const frameCount = view.getUint32(8, true);
   const channels = view.getUint16(12, true);
+  const expectedBytes = 16 + frameCount * channels * BYTES_PER_SAMPLE;
+  if (buffer.byteLength !== expectedBytes) {
+    recorder.noteInvalidBlock(
+      `PCM block byte length mismatch: expected ${expectedBytes}, got ${buffer.byteLength}`,
+    );
+    postMessage({
+      type: "error",
+      message: `PCM block byte length mismatch: expected ${expectedBytes}, got ${buffer.byteLength}`,
+    });
+    return;
+  }
   if (channels !== streamInfo.channels) {
+    recorder.noteChannelMismatch({
+      frameStart,
+      frameCount,
+      expectedChannels: streamInfo.channels,
+      actualChannels: channels,
+    });
     postMessage({
       type: "error",
       message: `PCM block channel mismatch: expected ${streamInfo.channels}, got ${channels}`,
@@ -111,6 +163,9 @@ function writePcmBlock(buffer) {
   }
 
   const incoming = new Float32Array(buffer, 16);
+  const dataBytes = new Uint8Array(buffer, 16, incoming.byteLength);
+  const receivedBlockIndex = Atomics.load(stateView, STATE.RECEIVED_BLOCKS);
+  recorder.recordBlock({ frameStart, frameCount, channels, receivedBlockIndex, dataBytes });
   const capacityFrames = Atomics.load(stateView, STATE.CAPACITY_FRAMES);
   let writeFrame = Atomics.load(stateView, STATE.WRITE_FRAME);
   let readFrame = Atomics.load(stateView, STATE.READ_FRAME);
@@ -151,4 +206,68 @@ function maybePostMeters(samples, frameCount, channels) {
     }
   }
   postMessage({ type: "meters", peak });
+}
+
+function readCounters() {
+  if (!stateView) {
+    return {
+      underruns: 0,
+      overflows: 0,
+      receivedBlocks: 0,
+    };
+  }
+  return {
+    underruns: Atomics.load(stateView, STATE.UNDERRUN_COUNT),
+    overflows: Atomics.load(stateView, STATE.OVERFLOW_COUNT),
+    receivedBlocks: Atomics.load(stateView, STATE.RECEIVED_BLOCKS),
+  };
+}
+
+function runRecorderAction(action) {
+  action().catch((error) => {
+    postMessage({ type: "recording-error", message: error.message });
+    postMessage({ type: "recording-status", status: recorder.status() });
+  });
+}
+
+function runExport(action) {
+  action()
+    .then((result) => {
+      postMessage({ type: "download", filename: result.filename, blob: result.blob });
+    })
+    .catch((error) => {
+      postMessage({ type: "recording-error", message: error.message });
+      postMessage({ type: "recording-status", status: recorder.status() });
+    });
+}
+
+function runRecoveryScan() {
+  recorder
+    .scanRecoverySessions()
+    .then((result) => {
+      postMessage({ type: "recovery-sessions", result });
+    })
+    .catch((error) => {
+      postMessage({
+        type: "recovery-sessions",
+        result: {
+          available: false,
+          error: error.message,
+          scannedAt: new Date().toISOString(),
+          sessions: [],
+        },
+      });
+    });
+}
+
+function runDeleteRecoveredSession(sessionId) {
+  recorder
+    .deleteRecoveredSession(sessionId)
+    .then((result) => {
+      postMessage({ type: "recovery-sessions", result });
+    })
+    .catch((error) => {
+      postMessage({ type: "recording-error", message: error.message });
+      runRecoveryScan();
+    });
 }

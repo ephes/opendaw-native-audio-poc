@@ -49,6 +49,89 @@
         </label>
       </section>
 
+      <section class="recording-panel" aria-label="Recording controls">
+        <div class="recording-actions">
+          <button id="record-start" type="button" disabled>Start Recording</button>
+          <button id="record-stop" type="button" disabled>Stop Recording</button>
+          <button id="record-reset" type="button" disabled>Reset/Clear Recording</button>
+          <button id="export-manifest" type="button" disabled>Export Manifest</button>
+          <label>
+            WAV Channel
+            <select id="wav-channel" disabled></select>
+          </label>
+          <button id="export-wav" type="button" disabled>Export Selected WAV</button>
+        </div>
+        <div class="recording-status-grid">
+          <div>
+            <span>Recording</span>
+            <strong id="record-state">idle</strong>
+          </div>
+          <div>
+            <span>Duration</span>
+            <strong id="record-duration">0:00</strong>
+          </div>
+          <div>
+            <span>Recorded Frames</span>
+            <strong id="record-frames">0</strong>
+          </div>
+          <div>
+            <span>Blocks</span>
+            <strong id="record-blocks">0 / 0</strong>
+          </div>
+          <div>
+            <span>Next Frame</span>
+            <strong id="record-next-frame">-</strong>
+          </div>
+          <div>
+            <span>Chunks</span>
+            <strong id="record-chunks">0</strong>
+          </div>
+          <div>
+            <span>Gaps / Overlaps</span>
+            <strong id="record-gaps">0 / 0</strong>
+          </div>
+          <div>
+            <span>Under / Over</span>
+            <strong id="record-under-over">0 / 0</strong>
+          </div>
+          <div>
+            <span>WS Lag</span>
+            <strong id="record-lag">0</strong>
+          </div>
+          <div>
+            <span>Backlog</span>
+            <strong id="record-backlog">0 B / 0 B</strong>
+          </div>
+          <div>
+            <span>Storage</span>
+            <strong id="record-storage">opfs</strong>
+          </div>
+        </div>
+        <p id="record-error" class="recording-error"></p>
+      </section>
+
+      <section class="recovery-panel" aria-label="OPFS recording recovery">
+        <div class="panel-heading">
+          <h2>OPFS Sessions</h2>
+          <button id="recovery-refresh" type="button">Scan Recovery</button>
+        </div>
+        <div class="recovery-actions">
+          <label>
+            Session
+            <select id="recovery-session"></select>
+          </label>
+          <label>
+            WAV Channel
+            <select id="recovery-wav-channel" disabled></select>
+          </label>
+          <button id="recovery-export-manifest" type="button" disabled>Export Recovery Manifest</button>
+          <button id="recovery-export-wav" type="button" disabled>Export Recovered WAV</button>
+          <button id="recovery-delete" type="button" disabled>Delete Session</button>
+        </div>
+        <div id="recovery-summary" class="recovery-summary">No recovery scan has run.</div>
+        <div id="recovery-details" class="recovery-details"></div>
+      </section>
+
       <section>
         <h2>Meters</h2>
         <div id="meters" class="meters"></div>

@@ -72,6 +72,8 @@ Cross-Origin-Resource-Policy: same-origin
 
 The current in-page ring buffer state is an implementation detail, not part of the backend compatibility boundary. It uses a 256-byte metadata prefix with atomic Int32 counters followed by interleaved Float32 ring-buffer samples.
 
+Browser recording artifacts are also outside the backend compatibility boundary. This includes `native-pcm-recordings-index.json`, `native-pcm-*-manifest.json`, `native-pcm-*-recovered-manifest.json`, `native-pcm-*-chunk-*.f32`, and exported `native-pcm-*.wav` files. The current OPFS chunk, manifest, and recovery artifact formats are documented in the README's Browser Recording Mode and OPFS Recovery sections.
+
 ## Compatibility Boundary
 
 The WebSocket protocol is the compatibility boundary. A later Swift backend should be able to emit the same messages and binary PCM blocks without changing the browser receiver.

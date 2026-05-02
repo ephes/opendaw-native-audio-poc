@@ -36,6 +36,7 @@ class NativeBridgeProcessor extends AudioWorkletProcessor {
       this.alignReadCursor();
       Atomics.store(this.state, STATE.OVERFLOW_COUNT, 0);
       Atomics.store(this.state, STATE.UNDERRUN_COUNT, 0);
+      this.port.postMessage({ type: "counters-reset" });
     } else if (message.type === "channels") {
       this.left = message.left;
       this.right = message.right;

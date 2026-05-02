@@ -50,7 +50,7 @@ cargo run -- serve --source sine --channels 12 --sample-rate 48000
 Attempt to open a native input device by case-insensitive name substring and stream it to the same browser page:
 
 ```sh
-cargo run -- serve --source input --device "ZOOM" --channels 12 --sample-rate 48000
+cargo run -- serve --source input --device "ZOOM" --channels 14 --sample-rate 48000
 ```
 
 `--device` is a case-insensitive substring match against the cpal input device name. It is ignored for `--source sine`.
@@ -61,9 +61,12 @@ Development shorthand:
 
 ```sh
 just test
+just list
+just serve-sine
+just serve-l12
 ```
 
-This runs `cargo fmt --check` and `cargo check`.
+`just test` runs `cargo fmt --check` and `cargo check`. `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
 
 ## Current Implementation
 
@@ -76,8 +79,97 @@ The first functional slice includes:
 - Worker-owned WebSocket receiver writing PCM into a `SharedArrayBuffer` ring buffer.
 - `AudioWorkletProcessor` stereo monitor output with selectable source channels.
 - Per-channel peak meters, underrun counter, overflow counter, and buffer fill display.
+- Browser-side recording mode that captures received WebSocket PCM blocks into OPFS Float32 chunks with an exportable manifest.
+- Selected-channel Float32 WAV export for manual DAW inspection.
 
 The input path requires the device to report the requested exact channel count and sample rate through cpal. If that combination is not available, the CLI exits with a device/config-specific error.
+
+## Browser Recording Mode
+
+The static page can now record the received native PCM stream before it is written to the monitor ring buffer. This is still a PoC reliability probe, not a production recorder.
+
+Workflow:
+
+1. Start the server, for example:
+
+   ```sh
+   just serve-sine
+   ```
+
+   or, with the observed ZOOM LiveTrak L-12 CoreAudio device:
+
+   ```sh
+   just serve-l12
+   ```
+
+2. Open `http://127.0.0.1:4545`.
+3. Click Connect.
+4. Optionally click Start Monitor and choose a stereo monitor pair.
+5. Click Start Recording.
+6. Let the stream run.
+7. Click Stop Recording.
+8. Inspect the recording counters and export artifacts.
+
+Recording uses the Origin Private File System through `navigator.storage.getDirectory()`. Use a Chromium-class desktop browser for this slice. If OPFS is unavailable, recording refuses to arm and monitoring remains usable. The page asks the browser for persistent storage when recording starts, but the browser may still return `false`; long tests should be run in a profile with sufficient free disk space.
+
+Raw size is substantial:
+
+```text
+14 channels * 48000 frames/s * 4 bytes = 2.688 MB/s
+20 minutes at 14 channels ~= 3.2 GB
+```
+
+The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
+
+The manifest includes:
+
+- session id, start/stop wall-clock timestamps, sample rate, channel count, frames per block, and sample format
+- first `frameStart`, expected next frame, total recorded frames, recorded block count, chunk count, and byte count
+- per-chunk file names, frame spans, byte sizes, and per-block `frameStart`/`frameCount` metadata
+- detected gaps, overlaps, discontinuities, channel mismatches, invalid blocks, WebSocket lag events, monitor counter resets, byte-based write-backlog warnings, and underrun/overflow deltas during recording
+
+Export Selected WAV writes one mono 32-bit float WAV for the selected source channel. This is intended for DAW import and channel-mapping checks. WAV export reads OPFS chunks and deinterleaves the selected channel, but the resulting mono WAV is assembled as a browser `Blob`; exporting very long channels can still be memory-intensive. All-channel WAV export is intentionally left out of this slice.
+
+The Disconnect button is disabled while recording is active or the recorder is in an error state. Stop the recording first so the Worker can flush queued OPFS writes, close the current chunk, and write the final manifest. If recording enters an error state, use Reset/Clear Recording before disconnecting so OPFS chunks from the current session are removed. Starting monitor playback during a recording resets the existing monitor underrun/overflow counters; the recorder records that reset and rebases the recording deltas.
+
+## OPFS Recovery
+
+The page now scans OPFS for PoC recording artifacts on load and through the OPFS Sessions panel. Recovery is browser-side only; it does not change the WebSocket protocol or write files from Rust.
+
+Recovery scan looks only at this PoC's `native-pcm-*` OPFS artifacts:
+
+- `native-pcm-recordings-index.json`
+- `native-pcm-*-manifest.json`
+- `native-pcm-*-chunk-*.f32`
+
+After a reload, tab close, or browser failure before Stop Recording, reopen the page and use OPFS Sessions:
+
+1. Click Scan Recovery if the list is stale.
+2. Select an abandoned or stopped session.
+3. Inspect state, stream shape, duration/frames, chunk count/bytes, and reconstruction warnings.
+4. Export Recovery Manifest to download `<sessionId>-recovered-manifest.json`.
+5. Export Recovered WAV for one selected channel when the stream shape and required chunks validate.
+6. Delete Session to remove that session's OPFS manifest and chunks and its index entry.
+
+Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
+
+Cleanly stopped prior sessions may also appear in OPFS Sessions after a reload. They can be exported through the recovery controls or deleted from OPFS. Delete only removes files whose names match the selected `native-pcm-*` session; it does not clear unrelated site data.
+
+While a recording is active or still has an open in-memory chunk, OPFS Sessions may list it for visibility but disables recovery manifest and WAV export until the recording is stopped or reset.
+
+For lower-latency browser monitoring, restart with a smaller block size, for example `just serve-l12 4545 240`. Smaller blocks reduce WebSocket aggregation and AudioWorklet target latency, but they increase message rate and should be re-tested for gaps, overflows, and backlog.
+
+Known limits:
+
+- OPFS support and persistence behavior vary by browser and profile.
+- OPFS has no normal user-visible filesystem path. Use the recovery/delete UI to inspect and remove PoC recording artifacts.
+- A browser/tab crash may leave the currently-open OPFS writable absent or truncated; recovery surfaces this as warnings and does not hide corruption.
+- OPFS write throughput is not backpressured into the WebSocket stream. The recorder serializes writes, displays pending/high-water backlog bytes, and records repeated write-backlog warnings at 64 MiB high-water increments, but extreme storage stalls can still end the session.
+- Selected-channel WAV export still assembles one mono Blob and can be memory-intensive for very long sessions.
+- Browser background throttling and tab lifecycle behavior are not fully proven.
+- `frameStart` is the bridge aggregation timeline, not a hardware clock timestamp.
+- If the Rust cpal callback drops input buffers because its bridge queue is full, the Rust process logs drops to stderr, but those counts are not currently included in the WebSocket protocol or recording manifest.
+- The Rust cpal callback still allocates before queue backpressure can be observed; this is PoC-only.
 
 ## Verification
 
@@ -86,6 +178,9 @@ Automated checks:
 ```sh
 cargo fmt --check
 cargo check
+cargo clippy --all-targets
+cargo test
+just test
 cargo run -- list
 cargo run -- serve --source sine --channels 12 --sample-rate 48000
 ```
@@ -98,17 +193,32 @@ Manual checks:
 4. Click Start Monitor and choose the left/right monitor channels.
 5. Leave the stream running and watch underrun/overflow counters.
 
+Short recording check with the sine source:
+
+1. Start `just serve-sine`.
+2. Open `http://127.0.0.1:4545`.
+3. Click Connect.
+4. Click Start Recording.
+5. Let it run for 30-60 seconds.
+6. Click Stop Recording.
+7. Confirm the manifest counters report 12 channels, 48 kHz, plausible duration/frames, and no unexpected gaps.
+8. Export the manifest.
+9. Choose a source channel and export the selected-channel WAV.
+10. Import or inspect the WAV as 32-bit float mono audio.
+
 If ZOOM hardware is attached:
 
 ```sh
 cargo run -- serve --source input --device "ZOOM" --channels 14 --sample-rate 48000
 ```
 
-Record whether cpal exposes the device with more than two channels and whether the requested config opens.
+Record whether cpal exposes the device with more than two channels and whether the requested config opens. For recording checks, speak into known channels such as channel 1 and a later channel such as 9 or 13, then export selected-channel WAVs and verify mapping/alignment in a DAW.
 
 ## Success Criteria
 
-The PoC is successful when the browser test page can show independent meters for at least 8-12 channels at 48 kHz and run for 10-20 minutes without recurring buffer underruns or overflows.
+The monitor path is successful when the browser test page can show independent meters for at least 8-12 channels at 48 kHz and run for 10-20 minutes without recurring buffer underruns or overflows.
+
+The recording reliability slice is successful when the browser can record a 10-20 minute 14-channel native stream into OPFS chunks, export a manifest with aligned `frameStart`/`frameCount` metadata, report gaps/overlaps/underrun/overflow/WebSocket lag counters, and export selected-channel WAVs that can be inspected in a DAW.
 
 ## Hardware Notes
 
