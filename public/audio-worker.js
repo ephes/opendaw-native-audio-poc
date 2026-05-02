@@ -24,6 +24,7 @@ let stateView = null;
 let sampleView = null;
 let streamInfo = null;
 let lastMeterPost = 0;
+let nativeInputStats = null;
 let recorder = new PcmRecorder({
   readCounters,
   postMessage: (message) => postMessage(message),
@@ -88,6 +89,7 @@ function disconnect() {
   stateView = null;
   sampleView = null;
   streamInfo = null;
+  nativeInputStats = null;
 }
 
 function handleSocketMessage(event) {
@@ -95,6 +97,10 @@ function handleSocketMessage(event) {
     const message = JSON.parse(event.data);
     if (message.type === "stream-started") {
       configureStream(message);
+    } else if (message.type === "native-input-stats") {
+      nativeInputStats = message;
+      recorder.setNativeInputStats(message);
+      postMessage({ type: "native-input-stats", stats: nativeInputStats });
     } else if (message.type === "stream-error") {
       recorder.noteWebSocketLag({ code: message.code, message: message.message });
       postMessage({ type: "error", message: message.message, code: message.code });

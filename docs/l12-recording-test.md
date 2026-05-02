@@ -38,6 +38,9 @@ See the README Browser Recording Mode section for the full workflow and artifact
 - Underruns during recording:
 - Overflows during recording:
 - WebSocket lag events:
+- Native dropped callback buffers:
+- Native dropped frames:
+- Native drop events:
 - Storage or export errors:
 - Exported manifest filename:
 - Exported WAV channel(s):
@@ -58,6 +61,9 @@ See the README Browser Recording Mode section for the full workflow and artifact
 - Underruns during recording:
 - Overflows during recording:
 - WebSocket lag events:
+- Native dropped callback buffers:
+- Native dropped frames:
+- Native drop events:
 - Storage or export errors:
 - DAW/import result:
 
@@ -72,6 +78,7 @@ See the README Browser Recording Mode section for the full workflow and artifact
 - Reconstructed channels / sample rate / frames-per-block:
 - Reconstructed frames:
 - Reconstructed chunks / bytes:
+- Native dropped callback buffers / frames / events in recovered manifest:
 - Exported recovery manifest filename:
 - Exported recovered WAV channel(s):
 - WAV export result:

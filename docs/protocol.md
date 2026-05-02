@@ -24,7 +24,28 @@ JSON messages describe device and stream state:
 }
 ```
 
-The current Rust server sends `stream-started` when a WebSocket client connects. It sends `stream-error` when the server detects a client-side stream delivery problem such as a lagging WebSocket receiver. `device-lost` is reserved for a later backend path that can report input-device loss through the protocol. Per-channel browser meters are computed in the Worker from received PCM blocks rather than sent as JSON.
+```json
+{
+  "type": "native-input-stats",
+  "source": "input",
+  "nativeDroppedBlocks": 0,
+  "nativeDroppedFrames": 0,
+  "nativeDropEvents": 0,
+  "bridgeQueueCapacityBlocks": 64,
+  "atFrame": 1234560
+}
+```
+
+The current Rust server sends `stream-started` when a WebSocket client connects, then sends an initial `native-input-stats` event, then sends additional stats events about once per second. It sends `stream-error` when the server detects a client-side stream delivery problem such as a lagging WebSocket receiver. `device-lost` is reserved for a later backend path that can report input-device loss through the protocol. Per-channel browser meters are computed in the Worker from received PCM blocks rather than sent as JSON.
+
+`native-input-stats` is a cumulative backend observability event. It does not change the binary PCM block layout and older clients can ignore it. Fields:
+
+- `source`: `"sine"` or `"input"`.
+- `nativeDroppedBlocks`: count of cpal callback buffers that the Rust input bridge could not enqueue before browser delivery. For `source: "sine"`, this remains `0`.
+- `nativeDroppedFrames`: cumulative frames in those dropped callback buffers.
+- `nativeDropEvents`: cumulative failed enqueue attempts. In the current Rust PoC this increments with each dropped callback buffer.
+- `bridgeQueueCapacityBlocks`: capacity of the Rust callback-to-aggregation queue for `source: "input"`; `0` for `source: "sine"`.
+- `atFrame`: latest backend source frame cursor. For `source: "input"` this advances in the cpal callback timeline, including dropped frames. It does not necessarily equal the latest emitted PCM `frameStart + frameCount` because aggregation can hold pending frames and dropped callback buffers still advance the source cursor. For `source: "sine"` this advances in the synthetic source timeline.
 
 ## PCM Blocks
 
@@ -58,6 +79,7 @@ The first browser test page implements:
 
 - underrun count
 - overflow count
+- native dropped block/frame/event counters from `native-input-stats`
 - read/write distance
 - per-channel peak meters computed by the Worker
 - selectable left/right source channels for stereo monitor output

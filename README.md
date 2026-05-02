@@ -66,7 +66,7 @@ just serve-sine
 just serve-l12
 ```
 
-`just test` runs `cargo fmt --check` and `cargo check`. `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
+`just test` runs `cargo fmt --check`, `cargo check`, and JavaScript syntax checks for the static browser modules. `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
 
 ## Current Implementation
 
@@ -78,7 +78,7 @@ The first functional slice includes:
 - Static browser test page under `public/`.
 - Worker-owned WebSocket receiver writing PCM into a `SharedArrayBuffer` ring buffer.
 - `AudioWorkletProcessor` stereo monitor output with selectable source channels.
-- Per-channel peak meters, underrun counter, overflow counter, and buffer fill display.
+- Per-channel peak meters, underrun counter, overflow counter, buffer fill display, and native input drop counters.
 - Browser-side recording mode that captures received WebSocket PCM blocks into OPFS Float32 chunks with an exportable manifest.
 - Selected-channel Float32 WAV export for manual DAW inspection.
 
@@ -126,9 +126,12 @@ The manifest includes:
 - session id, start/stop wall-clock timestamps, sample rate, channel count, frames per block, and sample format
 - first `frameStart`, expected next frame, total recorded frames, recorded block count, chunk count, and byte count
 - per-chunk file names, frame spans, byte sizes, and per-block `frameStart`/`frameCount` metadata
+- native input stats snapshots under `nativeInputStats`, including start/latest/stop counters for dropped callback buffers, dropped frames, drop events, bridge queue capacity, source, and backend `atFrame`
 - detected gaps, overlaps, discontinuities, channel mismatches, invalid blocks, WebSocket lag events, monitor counter resets, byte-based write-backlog warnings, and underrun/overflow deltas during recording
 
 Export Selected WAV writes one mono 32-bit float WAV for the selected source channel. This is intended for DAW import and channel-mapping checks. WAV export reads OPFS chunks and deinterleaves the selected channel, but the resulting mono WAV is assembled as a browser `Blob`; exporting very long channels can still be memory-intensive. All-channel WAV export is intentionally left out of this slice.
+
+The top status counters show cumulative native dropped cpal callback buffers, dropped frames, and drop events from the Rust backend. The recording status panel also shows native dropped callback buffers/frames/events during the active recording. These counters are separate from WebSocket PCM blocks, browser-side gaps/overlaps, WebSocket lag, and monitor underrun/overflow counters.
 
 The Disconnect button is disabled while recording is active or the recorder is in an error state. Stop the recording first so the Worker can flush queued OPFS writes, close the current chunk, and write the final manifest. If recording enters an error state, use Reset/Clear Recording before disconnecting so OPFS chunks from the current session are removed. Starting monitor playback during a recording resets the existing monitor underrun/overflow counters; the recorder records that reset and rebases the recording deltas.
 
@@ -151,7 +154,7 @@ After a reload, tab close, or browser failure before Stop Recording, reopen the 
 5. Export Recovered WAV for one selected channel when the stream shape and required chunks validate.
 6. Delete Session to remove that session's OPFS manifest and chunks and its index entry.
 
-Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
+Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, native input stats from the original manifest when present, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing native input stats in an older manifest, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
 
 Cleanly stopped prior sessions may also appear in OPFS Sessions after a reload. They can be exported through the recovery controls or deleted from OPFS. Delete only removes files whose names match the selected `native-pcm-*` session; it does not clear unrelated site data.
 
@@ -168,7 +171,7 @@ Known limits:
 - Selected-channel WAV export still assembles one mono Blob and can be memory-intensive for very long sessions.
 - Browser background throttling and tab lifecycle behavior are not fully proven.
 - `frameStart` is the bridge aggregation timeline, not a hardware clock timestamp.
-- If the Rust cpal callback drops input buffers because its bridge queue is full, the Rust process logs drops to stderr, but those counts are not currently included in the WebSocket protocol or recording manifest.
+- Native input drop counters are cumulative observability counters, not recovery data. If they increase, audio was lost before browser delivery; the browser cannot reconstruct those missing frames.
 - The Rust cpal callback still allocates before queue backpressure can be observed; this is PoC-only.
 
 ## Verification
@@ -192,6 +195,7 @@ Manual checks:
 3. Confirm the page reports the stream settings and the channel meters move.
 4. Click Start Monitor and choose the left/right monitor channels.
 5. Leave the stream running and watch underrun/overflow counters.
+6. Confirm native dropped callback buffers, frames, and events stay at `0` for the sine source.
 
 Short recording check with the sine source:
 
@@ -201,7 +205,7 @@ Short recording check with the sine source:
 4. Click Start Recording.
 5. Let it run for 30-60 seconds.
 6. Click Stop Recording.
-7. Confirm the manifest counters report 12 channels, 48 kHz, plausible duration/frames, and no unexpected gaps.
+7. Confirm the manifest counters report 12 channels, 48 kHz, plausible duration/frames, no unexpected gaps, and `nativeInputStats` with zero native drops.
 8. Export the manifest.
 9. Choose a source channel and export the selected-channel WAV.
 10. Import or inspect the WAV as 32-bit float mono audio.

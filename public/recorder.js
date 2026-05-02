@@ -25,6 +25,26 @@ export class PcmRecorder {
     this.nextBacklogWarningBytes = BACKLOG_WARNING_BYTES;
     this.lastStatusPost = 0;
     this.lastError = "";
+    this.nativeInputStats = defaultNativeInputStats();
+  }
+
+  setNativeInputStats(stats) {
+    const normalized = normalizeNativeInputStats(stats);
+    const previous = this.nativeInputStats;
+    this.nativeInputStats = normalized;
+    if (
+      this.session?.nativeInputStats &&
+      (this.state === "recording" || this.state === "stopping")
+    ) {
+      const previousSessionStats = this.session.nativeInputStats.latest;
+      this.session.nativeInputStats.latest = { ...normalized };
+      if (nativeCountersIncreased(previousSessionStats, normalized)) {
+        this.session.nativeInputStats.events.push({ ...normalized });
+        this.postStatus(true);
+      }
+    } else if (nativeCountersIncreased(previous, normalized)) {
+      this.postStatus(true);
+    }
   }
 
   async start(streamInfo) {
@@ -40,6 +60,7 @@ export class PcmRecorder {
     this.root = await this.openStorageRoot();
     const persisted = await requestPersistentStorage();
     const counters = this.readCounters();
+    const nativeStats = this.currentNativeInputStats();
     const now = new Date().toISOString();
     const sessionId = `native-pcm-${new Date().toISOString().replace(/[:.]/g, "-")}`;
 
@@ -75,6 +96,12 @@ export class PcmRecorder {
         receivedBlocks: counters.receivedBlocks,
       },
       counterDeltasAtStop: null,
+      nativeInputStats: {
+        start: { ...nativeStats },
+        latest: { ...nativeStats },
+        stop: null,
+        events: [],
+      },
       receivedBlocksAtStop: null,
       writeBacklogHighWaterBlocks: 0,
       writeBacklogHighWaterBytes: 0,
@@ -112,9 +139,12 @@ export class PcmRecorder {
       this.state = "stopping";
       const stopCounters = this.readCounters();
       if (this.session) {
+        const nativeStats = this.currentNativeInputStats();
         this.session.state = "stopping";
         this.session.receivedBlocksAtStop = stopCounters.receivedBlocks;
         this.session.counterDeltasAtStop = this.counterDeltas(stopCounters);
+        this.session.nativeInputStats.latest = { ...nativeStats };
+        this.session.nativeInputStats.stop = { ...nativeStats };
         await this.updateIndexSession("stopping");
       }
       this.postStatus(true);
@@ -425,6 +455,7 @@ export class PcmRecorder {
       sampleFormat: session.sampleFormat,
       manifestFileName: session.manifestFileName,
       chunkFilePrefix: session.chunkFilePrefix,
+      nativeInputStats: session.nativeInputStats ?? null,
       manifestPresent: session.manifestPresent,
       indexPresent: session.indexPresent,
       exportableWav: session.exportableWav,
@@ -568,6 +599,9 @@ export class PcmRecorder {
         writeBacklogHighWaterBytes: 0,
         underrunsDuringRecording: 0,
         overflowsDuringRecording: 0,
+        nativeDroppedBlocksDuringRecording: 0,
+        nativeDroppedFramesDuringRecording: 0,
+        nativeDropEventsDuringRecording: 0,
         storageMode: supportsOpfs() ? "opfs" : "unavailable",
         lastError: this.lastError,
       };
@@ -577,6 +611,7 @@ export class PcmRecorder {
     const stopped = this.session.stoppedAt ? Date.parse(this.session.stoppedAt) : Date.now();
     const bytes = this.session.chunks.reduce((total, chunk) => total + chunk.bytes, 0);
     const counterDeltas = this.session.counterDeltasAtStop ?? this.counterDeltas();
+    const nativeInputDeltas = this.nativeInputDeltas();
     const receivedBlocksEnd = this.session.receivedBlocksAtStop ?? this.readCounters().receivedBlocks;
     return {
       state: this.state,
@@ -603,6 +638,7 @@ export class PcmRecorder {
       writeBacklogHighWaterBlocks: this.session.writeBacklogHighWaterBlocks,
       writeBacklogHighWaterBytes: this.session.writeBacklogHighWaterBytes,
       ...counterDeltas,
+      ...nativeInputDeltas,
       storageMode: "opfs",
       lastError: this.lastError,
     };
@@ -752,6 +788,10 @@ export class PcmRecorder {
   }
 
   buildManifest() {
+    const nativeInputStats = cloneNativeInputStatsRecord(this.session.nativeInputStats);
+    if (nativeInputStats && !nativeInputStats.stop) {
+      nativeInputStats.latest = this.currentNativeInputStats();
+    }
     const manifest = {
       ...this.session,
       storage: { ...this.session.storage },
@@ -759,6 +799,7 @@ export class PcmRecorder {
       counterDeltasAtStop: this.session.counterDeltasAtStop
         ? { ...this.session.counterDeltasAtStop }
         : null,
+      nativeInputStats,
       integrity: {
         gaps: this.session.integrity.gaps.map((entry) => ({ ...entry })),
         overlaps: this.session.integrity.overlaps.map((entry) => ({ ...entry })),
@@ -795,6 +836,36 @@ export class PcmRecorder {
         counters.overflows - this.session.counterBaselines.overflows,
       ),
     };
+  }
+
+  nativeInputDeltas() {
+    if (!this.session?.nativeInputStats) {
+      return {
+        nativeDroppedBlocksDuringRecording: 0,
+        nativeDroppedFramesDuringRecording: 0,
+        nativeDropEventsDuringRecording: 0,
+      };
+    }
+    const start = this.session.nativeInputStats.start;
+    const latest = this.session.nativeInputStats.stop ?? this.currentNativeInputStats();
+    return {
+      nativeDroppedBlocksDuringRecording: Math.max(
+        0,
+        latest.nativeDroppedBlocks - start.nativeDroppedBlocks,
+      ),
+      nativeDroppedFramesDuringRecording: Math.max(
+        0,
+        latest.nativeDroppedFrames - start.nativeDroppedFrames,
+      ),
+      nativeDropEventsDuringRecording: Math.max(
+        0,
+        latest.nativeDropEvents - start.nativeDropEvents,
+      ),
+    };
+  }
+
+  currentNativeInputStats() {
+    return { ...this.nativeInputStats };
   }
 
   manifestFileName() {
@@ -899,6 +970,63 @@ export class PcmRecorder {
   }
 }
 
+function defaultNativeInputStats() {
+  return {
+    available: false,
+    source: "unknown",
+    nativeDroppedBlocks: 0,
+    nativeDroppedFrames: 0,
+    nativeDropEvents: 0,
+    bridgeQueueCapacityBlocks: 0,
+    atFrame: 0,
+    receivedAt: null,
+  };
+}
+
+function normalizeNativeInputStats(stats) {
+  const fallback = defaultNativeInputStats();
+  if (!stats || typeof stats !== "object") {
+    return fallback;
+  }
+  return {
+    available: true,
+    source: typeof stats.source === "string" ? stats.source : fallback.source,
+    nativeDroppedBlocks: nonNegativeNumber(stats.nativeDroppedBlocks),
+    nativeDroppedFrames: nonNegativeNumber(stats.nativeDroppedFrames),
+    nativeDropEvents: nonNegativeNumber(stats.nativeDropEvents),
+    bridgeQueueCapacityBlocks: nonNegativeNumber(stats.bridgeQueueCapacityBlocks),
+    atFrame: nonNegativeNumber(stats.atFrame),
+    receivedAt: new Date().toISOString(),
+  };
+}
+
+function nonNegativeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function nativeCountersIncreased(previous, next) {
+  if (!previous || !next) {
+    return false;
+  }
+  return (
+    next.nativeDroppedBlocks > previous.nativeDroppedBlocks ||
+    next.nativeDroppedFrames > previous.nativeDroppedFrames ||
+    next.nativeDropEvents > previous.nativeDropEvents
+  );
+}
+
+function cloneNativeInputStatsRecord(record) {
+  if (!record) {
+    return null;
+  }
+  return {
+    start: record.start ? { ...record.start } : null,
+    latest: record.latest ? { ...record.latest } : null,
+    stop: record.stop ? { ...record.stop } : null,
+    events: Array.isArray(record.events) ? record.events.map((entry) => ({ ...entry })) : [],
+  };
+}
+
 function formatBytes(bytes) {
   const units = ["B", "KiB", "MiB", "GiB"];
   let value = bytes;
@@ -991,6 +1119,13 @@ async function buildRecoveredSession({
         message: `Could not read ${manifestFileName}: ${error.message}`,
       });
     }
+  }
+  if (manifest && !manifest.nativeInputStats) {
+    warnings.push({
+      code: "missing-native-input-stats",
+      message: "Original manifest has no nativeInputStats; native-side drop counters are unknown.",
+      fatal: false,
+    });
   }
 
   const manifestChunks = Array.isArray(manifest?.chunks) ? manifest.chunks : [];
@@ -1090,6 +1225,7 @@ async function buildRecoveredSession({
     channels: channels ?? 0,
     framesPerBlock: framesPerBlock ?? 0,
     sampleFormat,
+    nativeInputStats: manifest?.nativeInputStats ?? null,
     manifestFileName: manifestFileName ?? indexEntry?.manifestFileName ?? `${sessionId}${MANIFEST_SUFFIX}`,
     chunkFilePrefix: indexEntry?.chunkFilePrefix ?? `${sessionId}-chunk-`,
     manifestPresent: Boolean(manifest),

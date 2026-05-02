@@ -19,6 +19,9 @@ const els = {
   bufferFill: document.querySelector("#buffer-fill"),
   underruns: document.querySelector("#underruns"),
   overflows: document.querySelector("#overflows"),
+  nativeDroppedBlocks: document.querySelector("#native-dropped-blocks"),
+  nativeDroppedFrames: document.querySelector("#native-dropped-frames"),
+  nativeDropEvents: document.querySelector("#native-drop-events"),
   meters: document.querySelector("#meters"),
   leftChannel: document.querySelector("#left-channel"),
   rightChannel: document.querySelector("#right-channel"),
@@ -37,6 +40,7 @@ const els = {
   recordGaps: document.querySelector("#record-gaps"),
   recordUnderOver: document.querySelector("#record-under-over"),
   recordLag: document.querySelector("#record-lag"),
+  recordNativeDrops: document.querySelector("#record-native-drops"),
   recordBacklog: document.querySelector("#record-backlog"),
   recordStorage: document.querySelector("#record-storage"),
   recordError: document.querySelector("#record-error"),
@@ -62,6 +66,7 @@ let recordingStartPending = false;
 let socketStateValue = "closed";
 let recoveryResult = null;
 let recoveryScanPending = false;
+let nativeInputStats = defaultNativeInputStats();
 
 els.connect.addEventListener("click", () => {
   if (socketStateValue === "connecting" || socketStateValue === "open") {
@@ -169,6 +174,7 @@ function disconnect() {
   meterBars = [];
   recordingStatus = null;
   recordingStartPending = false;
+  nativeInputStats = defaultNativeInputStats();
   els.meters.replaceChildren();
   els.leftChannel.replaceChildren();
   els.rightChannel.replaceChildren();
@@ -243,6 +249,9 @@ function handleWorkerMessage(event) {
   } else if (message.type === "meters") {
     renderMeters(message.peak);
     renderCounters();
+  } else if (message.type === "native-input-stats") {
+    nativeInputStats = normalizeNativeInputStats(message.stats);
+    renderNativeInputStats();
   } else if (message.type === "error") {
     els.streamSummary.textContent = message.message;
   } else if (message.type === "recording-status") {
@@ -320,6 +329,7 @@ function renderCounters() {
     els.bufferFill.textContent = "0 frames";
     els.underruns.textContent = "0";
     els.overflows.textContent = "0";
+    renderNativeInputStats();
     return;
   }
   const write = Atomics.load(stateView, STATE.WRITE_FRAME);
@@ -328,6 +338,13 @@ function renderCounters() {
   els.bufferFill.textContent = `${fill} frames`;
   els.underruns.textContent = String(Atomics.load(stateView, STATE.UNDERRUN_COUNT));
   els.overflows.textContent = String(Atomics.load(stateView, STATE.OVERFLOW_COUNT));
+  renderNativeInputStats();
+}
+
+function renderNativeInputStats() {
+  els.nativeDroppedBlocks.textContent = formatNumber(nativeInputStats.nativeDroppedBlocks);
+  els.nativeDroppedFrames.textContent = formatNumber(nativeInputStats.nativeDroppedFrames);
+  els.nativeDropEvents.textContent = formatNumber(nativeInputStats.nativeDropEvents);
 }
 
 function setSocketState(state) {
@@ -352,6 +369,9 @@ function renderRecordingStatus() {
       overlaps: 0,
       underrunsDuringRecording: 0,
       overflowsDuringRecording: 0,
+      nativeDroppedBlocksDuringRecording: 0,
+      nativeDroppedFramesDuringRecording: 0,
+      nativeDropEventsDuringRecording: 0,
       websocketLagEvents: 0,
       pendingWriteBytes: 0,
       writeBacklogHighWaterBytes: 0,
@@ -375,6 +395,8 @@ function renderRecordingStatus() {
   els.recordUnderOver.textContent =
     `${formatNumber(status.underrunsDuringRecording)} / ${formatNumber(status.overflowsDuringRecording)}`;
   els.recordLag.textContent = formatNumber(status.websocketLagEvents);
+  els.recordNativeDrops.textContent =
+    `${formatNumber(status.nativeDroppedBlocksDuringRecording)} / ${formatNumber(status.nativeDroppedFramesDuringRecording)} / ${formatNumber(status.nativeDropEventsDuringRecording)}`;
   els.recordBacklog.textContent =
     `${formatBytes(status.pendingWriteBytes)} / ${formatBytes(status.writeBacklogHighWaterBytes)}`;
   els.recordStorage.textContent = status.storageMode;
@@ -469,6 +491,7 @@ function renderRecovery() {
     recoveryMetric("Frames", formatNumber(session.recoveredFrames)),
     recoveryMetric("Chunks", `${formatNumber(session.chunkCount)} (${formatBytes(session.recoveredBytes)})`),
     recoveryMetric("Warnings", formatNumber(session.warnings?.length ?? 0)),
+    recoveryMetric("Native Drops", formatNativeDrops(session.nativeInputStats)),
     recoveryMetric(
       "WAV Export",
       session.openInMemory
@@ -552,6 +575,39 @@ function formatDuration(seconds) {
 
 function formatNumber(value) {
   return new Intl.NumberFormat().format(value ?? 0);
+}
+
+function defaultNativeInputStats() {
+  return {
+    source: "unknown",
+    nativeDroppedBlocks: 0,
+    nativeDroppedFrames: 0,
+    nativeDropEvents: 0,
+  };
+}
+
+function normalizeNativeInputStats(stats) {
+  if (!stats || typeof stats !== "object") {
+    return defaultNativeInputStats();
+  }
+  return {
+    source: typeof stats.source === "string" ? stats.source : "unknown",
+    nativeDroppedBlocks: nonNegativeNumber(stats.nativeDroppedBlocks),
+    nativeDroppedFrames: nonNegativeNumber(stats.nativeDroppedFrames),
+    nativeDropEvents: nonNegativeNumber(stats.nativeDropEvents),
+  };
+}
+
+function nonNegativeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function formatNativeDrops(nativeStats) {
+  const stats = nativeStats?.stop ?? nativeStats?.latest ?? nativeStats?.start;
+  if (!stats) {
+    return "unknown";
+  }
+  return `${formatNumber(stats.nativeDroppedBlocks)} / ${formatNumber(stats.nativeDroppedFrames)} / ${formatNumber(stats.nativeDropEvents)}`;
 }
 
 function formatDateTime(value) {

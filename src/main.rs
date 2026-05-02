@@ -27,11 +27,18 @@ use cpal::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use tokio::{net::TcpListener, sync::broadcast, time::Instant};
+use tokio::{
+    net::TcpListener,
+    sync::broadcast,
+    time::{Instant, MissedTickBehavior},
+};
 use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
 const DEFAULT_PORT: u16 = 4545;
 const DEFAULT_FRAMES_PER_BLOCK: u32 = 960;
+const PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS: usize = 256;
+const INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS: usize = 64;
+const NATIVE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
 #[command(version, about = "openDAW native audio bridge PoC")]
@@ -64,7 +71,7 @@ struct ServeArgs {
     port: u16,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum Source {
     Sine,
     Input,
@@ -74,6 +81,7 @@ enum Source {
 struct AppState {
     stream_info: StreamStarted,
     blocks: broadcast::Sender<Arc<AudioBlock>>,
+    native_stats: Arc<NativeInputStats>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +110,78 @@ struct StreamError<'a> {
     event_type: &'static str,
     code: &'a str,
     message: String,
+}
+
+#[derive(Debug)]
+struct NativeInputStats {
+    source: &'static str,
+    bridge_queue_capacity_blocks: u64,
+    native_dropped_blocks: AtomicU64,
+    native_dropped_frames: AtomicU64,
+    native_drop_events: AtomicU64,
+    at_frame: AtomicU64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeInputStatsEvent {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    source: &'static str,
+    native_dropped_blocks: u64,
+    native_dropped_frames: u64,
+    native_drop_events: u64,
+    bridge_queue_capacity_blocks: u64,
+    at_frame: u64,
+}
+
+impl NativeInputStats {
+    fn new(source: Source, bridge_queue_capacity_blocks: u64) -> Self {
+        Self {
+            source: source.protocol_name(),
+            bridge_queue_capacity_blocks,
+            native_dropped_blocks: AtomicU64::new(0),
+            native_dropped_frames: AtomicU64::new(0),
+            native_drop_events: AtomicU64::new(0),
+            at_frame: AtomicU64::new(0),
+        }
+    }
+
+    fn advance_to_frame(&self, at_frame: u64) {
+        self.at_frame.store(at_frame, Ordering::Relaxed);
+    }
+
+    fn advance_by_frames(&self, frames: u64) -> u64 {
+        self.at_frame.fetch_add(frames, Ordering::Relaxed) + frames
+    }
+
+    fn note_dropped_callback_buffer(&self, frames: u64) -> u64 {
+        self.native_dropped_blocks.fetch_add(1, Ordering::Relaxed);
+        self.native_dropped_frames
+            .fetch_add(frames, Ordering::Relaxed);
+        self.native_drop_events.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn snapshot(&self) -> NativeInputStatsEvent {
+        NativeInputStatsEvent {
+            event_type: "native-input-stats",
+            source: self.source,
+            native_dropped_blocks: self.native_dropped_blocks.load(Ordering::Relaxed),
+            native_dropped_frames: self.native_dropped_frames.load(Ordering::Relaxed),
+            native_drop_events: self.native_drop_events.load(Ordering::Relaxed),
+            bridge_queue_capacity_blocks: self.bridge_queue_capacity_blocks,
+            at_frame: self.at_frame.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Source {
+    fn protocol_name(self) -> &'static str {
+        match self {
+            Source::Sine => "sine",
+            Source::Input => "input",
+        }
+    }
 }
 
 #[tokio::main]
@@ -176,7 +256,14 @@ async fn serve(args: ServeArgs) -> Result<()> {
         eprintln!("Warning: --device is ignored when --source sine is selected");
     }
 
-    let (block_tx, _) = broadcast::channel::<Arc<AudioBlock>>(256);
+    let (block_tx, _) = broadcast::channel::<Arc<AudioBlock>>(PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS);
+    let native_stats = Arc::new(NativeInputStats::new(
+        args.source,
+        match args.source {
+            Source::Sine => 0,
+            Source::Input => INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS as u64,
+        },
+    ));
     let stream_info = StreamStarted {
         event_type: "stream-started",
         sample_rate: args.sample_rate,
@@ -187,15 +274,20 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let _input_stream = match args.source {
         Source::Sine => {
-            spawn_sine_source(args.clone(), block_tx.clone());
+            spawn_sine_source(args.clone(), block_tx.clone(), native_stats.clone());
             None
         }
-        Source::Input => Some(start_input_source(args.clone(), block_tx.clone())?),
+        Source::Input => Some(start_input_source(
+            args.clone(),
+            block_tx.clone(),
+            native_stats.clone(),
+        )?),
     };
 
     let state = AppState {
         stream_info,
         blocks: block_tx,
+        native_stats,
     };
     let public_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("public");
     let app = Router::new()
@@ -256,36 +348,74 @@ async fn websocket_stream(socket: WebSocket, state: AppState) {
     if sender.send(Message::Text(started.into())).await.is_err() {
         return;
     }
+    if send_native_stats(&mut sender, &state.native_stats)
+        .await
+        .is_err()
+    {
+        return;
+    }
 
     let drain_client_messages =
         tokio::spawn(async move { while receiver.next().await.is_some() {} });
 
+    let mut stats_interval = tokio::time::interval_at(
+        Instant::now() + NATIVE_STATS_INTERVAL,
+        NATIVE_STATS_INTERVAL,
+    );
+    stats_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
-        match blocks.recv().await {
-            Ok(block) => {
-                let payload = encode_pcm_block(&block);
-                if sender.send(Message::Binary(payload.into())).await.is_err() {
+        tokio::select! {
+            _ = stats_interval.tick() => {
+                if send_native_stats(&mut sender, &state.native_stats).await.is_err() {
                     break;
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                let error = StreamError {
-                    event_type: "stream-error",
-                    code: "server-client-lagged",
-                    message: format!("WebSocket client skipped {skipped} audio blocks"),
-                };
-                if let Ok(json) = serde_json::to_string(&error) {
-                    let _ = sender.send(Message::Text(json.into())).await;
+            result = blocks.recv() => {
+                match result {
+                    Ok(block) => {
+                        let payload = encode_pcm_block(&block);
+                        if sender.send(Message::Binary(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let error = StreamError {
+                            event_type: "stream-error",
+                            code: "server-client-lagged",
+                            message: format!("WebSocket client skipped {skipped} audio blocks"),
+                        };
+                        if let Ok(json) = serde_json::to_string(&error) {
+                            let _ = sender.send(Message::Text(json.into())).await;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
 
     drain_client_messages.abort();
 }
 
-fn spawn_sine_source(args: ServeArgs, block_tx: broadcast::Sender<Arc<AudioBlock>>) {
+async fn send_native_stats(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    stats: &NativeInputStats,
+) -> Result<(), axum::Error> {
+    match serde_json::to_string(&stats.snapshot()) {
+        Ok(json) => sender.send(Message::Text(json.into())).await,
+        Err(error) => {
+            eprintln!("Failed to serialize native input stats: {error}");
+            Ok(())
+        }
+    }
+}
+
+fn spawn_sine_source(
+    args: ServeArgs,
+    block_tx: broadcast::Sender<Arc<AudioBlock>>,
+    native_stats: Arc<NativeInputStats>,
+) {
     tokio::spawn(async move {
         let channels = usize::from(args.channels);
         let frames_per_block = args.frames_per_block as usize;
@@ -320,6 +450,7 @@ fn spawn_sine_source(args: ServeArgs, block_tx: broadcast::Sender<Arc<AudioBlock
             });
             let _ = block_tx.send(block);
             frame_start += u64::from(args.frames_per_block);
+            native_stats.advance_to_frame(frame_start);
 
             next_tick += block_duration;
             tokio::time::sleep_until(next_tick).await;
@@ -342,6 +473,7 @@ fn deterministic_noise(frame: u64, channel: u64) -> f32 {
 fn start_input_source(
     args: ServeArgs,
     block_tx: broadcast::Sender<Arc<AudioBlock>>,
+    native_stats: Arc<NativeInputStats>,
 ) -> Result<Stream> {
     let host = cpal::default_host();
     let device = select_input_device(&host, args.device.as_deref())?;
@@ -359,8 +491,8 @@ fn start_input_source(
         sample_rate: SampleRate(args.sample_rate),
         buffer_size: cpal::BufferSize::Default,
     };
-    let (sample_tx, sample_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
-    let dropped_callback_buffers = Arc::new(AtomicU64::new(0));
+    let (sample_tx, sample_rx) =
+        std::sync::mpsc::sync_channel::<Vec<f32>>(INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS);
     let err_fn = move |error| {
         eprintln!("Input stream error: {error}");
     };
@@ -371,18 +503,18 @@ fn start_input_source(
     // so a full queue still pays this allocation cost before the drop is counted.
     let stream = match sample_format {
         SampleFormat::F32 => {
-            let dropped = dropped_callback_buffers.clone();
+            let stats = native_stats.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
-                    send_input_samples(&sample_tx, data.to_vec(), &dropped);
+                    send_input_samples(&sample_tx, data.to_vec(), args.channels, &stats);
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::I16 => {
-            let dropped = dropped_callback_buffers.clone();
+            let stats = native_stats.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _| {
@@ -390,14 +522,14 @@ fn start_input_source(
                         .iter()
                         .map(|sample| *sample as f32 / i16::MAX as f32)
                         .collect();
-                    send_input_samples(&sample_tx, samples, &dropped);
+                    send_input_samples(&sample_tx, samples, args.channels, &stats);
                 },
                 err_fn,
                 None,
             )?
         }
         SampleFormat::U16 => {
-            let dropped = dropped_callback_buffers.clone();
+            let stats = native_stats.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[u16], _| {
@@ -405,7 +537,7 @@ fn start_input_source(
                         .iter()
                         .map(|sample| (*sample as f32 - 32767.5) / 32767.5)
                         .collect();
-                    send_input_samples(&sample_tx, samples, &dropped);
+                    send_input_samples(&sample_tx, samples, args.channels, &stats);
                 },
                 err_fn,
                 None,
@@ -434,20 +566,23 @@ fn start_input_source(
 fn send_input_samples(
     sample_tx: &SyncSender<Vec<f32>>,
     samples: Vec<f32>,
-    dropped_callback_buffers: &AtomicU64,
+    channels: u16,
+    native_stats: &NativeInputStats,
 ) {
+    let frames = samples.len() as u64 / u64::from(channels);
+    let at_frame = native_stats.advance_by_frames(frames);
     match sample_tx.try_send(samples) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
-            let dropped = dropped_callback_buffers.fetch_add(1, Ordering::Relaxed) + 1;
+            let dropped = native_stats.note_dropped_callback_buffer(frames);
             if dropped == 1 || dropped.is_power_of_two() {
                 eprintln!(
-                    "Input callback dropped {dropped} buffers because the bridge queue is full"
+                    "Input callback dropped {dropped} buffers ({at_frame} latest input frames) because the bridge queue is full"
                 );
             }
         }
         Err(TrySendError::Disconnected(_)) => {
-            let dropped = dropped_callback_buffers.fetch_add(1, Ordering::Relaxed) + 1;
+            let dropped = native_stats.note_dropped_callback_buffer(frames);
             if dropped == 1 {
                 eprintln!(
                     "Input callback cannot forward buffers because the bridge queue is closed"
