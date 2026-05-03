@@ -64,6 +64,7 @@ just test
 just inspect-recording <manifest.json>
 just smoke-browser
 just smoke-l12
+just l12-recording-session
 just list
 just serve-sine
 just serve-l12
@@ -77,6 +78,8 @@ For known-bad or exploratory artifacts where native drops are expected, run `nod
 `just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling.
 
 `just smoke-l12` is an opt-in real-device monitor smoke for the observed ZOOM LiveTrak L-12 path. It starts a temporary input-source server with device substring `ZOOM`, 14 channels, 48 kHz, and 960 frames per block, then runs the same headless browser monitor checks for 30 seconds. It requires the L-12 to be connected and available through CoreAudio. If the device is missing or the requested config cannot open, the command reports that the hardware smoke did not run and includes the Rust server output, such as device selection, config, or stream-open errors. Override the duration with `just smoke-l12 <milliseconds>`, or use the full form `just smoke-l12 <milliseconds> <port> <frames-per-block> <device-substring> <channels> <sample-rate>`. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling. The smoke expects all 14 meters to become active and native dropped callback buffers/frames/events to remain `0`; set `SMOKE_EXPECT_ACTIVE_METERS` only when deliberately running with known silent inputs, and set `SMOKE_EXPECT_NATIVE_DROPS_ZERO=0` only when deliberately investigating a known hardware drop condition.
+
+`just l12-recording-session` is an opt-in tmux harness for the real-device 10-20 minute L-12 recording validation. It creates a timestamped local run directory under `.runs/l12-recording/`, writes a run checklist, starts a named tmux session with a server window, a one-shot `just smoke-l12` preflight window, and a notes window, and captures pane output to run logs. When preflight is enabled, the server window waits until the smoke passes before opening the L-12 for the long-running server. It does not automate browser recording controls, export manifests, read OPFS, import into a DAW, or run as part of `just test`. After stopping the browser recording and exporting the manifest manually, run the generated `just inspect-recording <manifest.json>` command and keep the report with the run notes. Override the just defaults positionally with `just l12-recording-session <session> <port> <frames-per-block> <device-substring> <channels> <sample-rate> <smoke-ms>`, or run `node scripts/l12-recording-session.mjs --help` for named flags such as `--replace`, `--open`, `--attach`, and `--dry-run`.
 
 `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
 
@@ -113,6 +116,14 @@ Workflow:
    ```sh
    just serve-l12
    ```
+
+   For a repeatable L-12 hardware run with tmux logging and a generated checklist, use:
+
+   ```sh
+   just l12-recording-session
+   ```
+
+   Then attach with the printed `tmux attach -t ...` command and use the printed browser URL.
 
 2. Open `http://127.0.0.1:4545`.
 3. Click Connect.
@@ -238,9 +249,10 @@ If ZOOM hardware is attached:
 ```sh
 cargo run -- serve --source input --device "ZOOM" --channels 14 --sample-rate 48000
 just smoke-l12 1000
+just l12-recording-session
 ```
 
-Record whether cpal exposes the device with more than two channels and whether the requested config opens. `just smoke-l12` is a short monitor smoke, not recording automation; it verifies the browser page reaches monitoring, shows 14 active meters, and reports clean monitor and native-drop counters. For recording checks, speak into known channels such as channel 1 and a later channel such as 9 or 13, then export selected-channel WAVs and verify mapping/alignment in a DAW.
+Record whether cpal exposes the device with more than two channels and whether the requested config opens. `just smoke-l12` is a short monitor smoke, not recording automation; it verifies the browser page reaches monitoring, shows 14 active meters, and reports clean monitor and native-drop counters. `just l12-recording-session` wraps the longer manual recording check in tmux, logs the server/preflight panes, and writes the run checklist under `.runs/l12-recording/`. For recording checks, speak into known channels such as channel 1 and a later channel such as 9 or 13, then export selected-channel WAVs and verify mapping/alignment in a DAW.
 After exporting the L-12 recording manifest, run `just inspect-recording <manifest.json>` and keep the PASS/FAIL report with the manual test notes.
 
 ## Success Criteria

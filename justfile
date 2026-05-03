@@ -15,9 +15,13 @@ test:
     node --check public/bridge-processor.js
     node --check scripts/browser-smoke.mjs
     node --check scripts/inspect-recording-manifest.mjs
+    node --check scripts/l12-recording-session.mjs
 
 inspect-recording manifest channels="14" sample_rate="48000" frames_per_block="960":
     node scripts/inspect-recording-manifest.mjs {{manifest}} --expect-channels {{channels}} --expect-sample-rate {{sample_rate}} --expect-frames-per-block {{frames_per_block}} --expect-native-drops-zero
+
+l12-recording-session session="opendaw-l12" port="4545" frames_per_block="960" device="ZOOM" channels="14" sample_rate="48000" smoke_ms="1000" replace="false" open_browser="false" attach="false" dry_run="false":
+    set --; if [ "{{replace}}" = "true" ]; then set -- "$@" --replace; fi; if [ "{{open_browser}}" = "true" ]; then set -- "$@" --open; fi; if [ "{{attach}}" = "true" ]; then set -- "$@" --attach; fi; if [ "{{dry_run}}" = "true" ]; then set -- "$@" --dry-run; fi; node scripts/l12-recording-session.mjs --session "{{session}}" --port {{port}} --frames-per-block {{frames_per_block}} --device "{{device}}" --channels {{channels}} --sample-rate {{sample_rate}} --smoke-ms {{smoke_ms}} "$@"
 
 smoke-browser monitor_ms="30000":
     SMOKE_MONITOR_MS={{monitor_ms}} node scripts/browser-smoke.mjs

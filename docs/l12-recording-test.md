@@ -20,6 +20,23 @@ just smoke-l12 1000
 
 The smoke requires connected ZOOM hardware. By default it opens the input source with device substring `ZOOM`, 14 channels, 48 kHz, and 960 frames per block, then drives the browser monitor path headlessly and expects 14 active meters with zero underruns, overflows, and native dropped callback buffers/frames/events. If the device is absent or the requested config cannot open, the command reports that the hardware smoke did not run and includes the Rust server output. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling. Overrides follow the `just` target order: `just smoke-l12 <monitor-ms> <port> <frames-per-block> <device-substring> <channels> <sample-rate>`. Set `CHROME_PATH` for a non-default Chromium binary. Set `SMOKE_EXPECT_ACTIVE_METERS` only when deliberately running with known silent inputs.
 
+For the longer manual L-12 recording validation, prefer the opt-in tmux orchestration harness:
+
+```sh
+just l12-recording-session
+```
+
+The harness requires `tmux` and connected L-12 hardware. It creates a timestamped run directory under `.runs/l12-recording/`, starts a named tmux session with server, preflight, and notes windows, captures pane output to logs, prints the browser URL, and writes a run checklist with the exact post-export inspector command. When preflight is enabled, the server window waits until the smoke passes before opening the L-12 for the long-running server. It does not click browser controls, read OPFS, export the manifest, import into a DAW, or run in `just test`.
+
+Useful overrides:
+
+```sh
+just l12-recording-session opendaw-l12 4545 960 ZOOM 14 48000 1000
+node scripts/l12-recording-session.mjs --replace
+node scripts/l12-recording-session.mjs --open --attach
+node scripts/l12-recording-session.mjs --dry-run
+```
+
 ## Setup
 
 - Date:
@@ -29,9 +46,11 @@ The smoke requires connected ZOOM hardware. By default it opens the input source
 - Command:
 
   ```sh
-  just serve-l12
+  just l12-recording-session
   ```
 
+- Run directory:
+- tmux session:
 - Preflight monitor smoke result:
 - Browser storage persistence granted: yes/no
 - Monitor enabled: yes/no
