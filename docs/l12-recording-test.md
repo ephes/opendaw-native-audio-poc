@@ -4,6 +4,14 @@ Use this file as a repeatable manual checklist for browser-side recording tests 
 
 See the README Browser Recording Mode section for the full workflow and artifact format. If `127.0.0.1:4545` is already in use, start the server with another port, for example `--port 4546`, and open that URL instead. Prefer starting monitor playback before recording when monitor counters matter; starting monitor during recording intentionally resets and rebases underrun/overflow deltas.
 
+After exporting a manifest, run the offline manifest inspector and keep its report with these notes:
+
+```sh
+just inspect-recording <manifest.json>
+```
+
+The command does not use the L-12, Chrome, OPFS, browser automation, DAW import, or raw `.f32` chunk files. It fails on stream-shape mismatches, gaps, overlaps, discontinuities, channel mismatches, invalid blocks, chunk/block frame or byte inconsistencies, fatal recovery warnings, and native dropped callback buffers/frames/events. It reports monitor underruns/overflows, WebSocket lag, counter resets, and write-backlog high-water counters as warnings.
+
 Before a longer recording run, the opt-in monitor smoke can check the real-device path quickly:
 
 ```sh
@@ -52,6 +60,8 @@ The smoke requires connected ZOOM hardware. By default it opens the input source
 - Native drop events:
 - Storage or export errors:
 - Exported manifest filename:
+- Manifest inspector command:
+- Manifest inspector result:
 - Exported WAV channel(s):
 - DAW/import result:
 
@@ -74,6 +84,9 @@ The smoke requires connected ZOOM hardware. By default it opens the input source
 - Native dropped frames:
 - Native drop events:
 - Storage or export errors:
+- Exported manifest filename:
+- Manifest inspector command:
+- Manifest inspector result:
 - DAW/import result:
 
 ## Recovery Test
@@ -89,6 +102,8 @@ The smoke requires connected ZOOM hardware. By default it opens the input source
 - Reconstructed chunks / bytes:
 - Native dropped callback buffers / frames / events in recovered manifest:
 - Exported recovery manifest filename:
+- Manifest inspector command:
+- Manifest inspector result:
 - Exported recovered WAV channel(s):
 - WAV export result:
 - Deleted recovered session: yes/no

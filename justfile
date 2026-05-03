@@ -14,6 +14,10 @@ test:
     node --check public/wav.js
     node --check public/bridge-processor.js
     node --check scripts/browser-smoke.mjs
+    node --check scripts/inspect-recording-manifest.mjs
+
+inspect-recording manifest channels="14" sample_rate="48000" frames_per_block="960":
+    node scripts/inspect-recording-manifest.mjs {{manifest}} --expect-channels {{channels}} --expect-sample-rate {{sample_rate}} --expect-frames-per-block {{frames_per_block}} --expect-native-drops-zero
 
 smoke-browser monitor_ms="30000":
     SMOKE_MONITOR_MS={{monitor_ms}} node scripts/browser-smoke.mjs

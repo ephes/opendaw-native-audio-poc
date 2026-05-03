@@ -61,6 +61,7 @@ Development shorthand:
 
 ```sh
 just test
+just inspect-recording <manifest.json>
 just smoke-browser
 just smoke-l12
 just list
@@ -68,7 +69,10 @@ just serve-sine
 just serve-l12
 ```
 
-`just test` runs `cargo fmt --check`, `cargo check`, `cargo test`, Node.js unit tests, and JavaScript syntax checks for the static browser modules. It does not run any browser smoke checks; run `just smoke-browser` for the sine path and `just smoke-l12` for the opt-in hardware path.
+`just test` runs `cargo fmt --check`, `cargo check`, `cargo test`, Node.js unit tests, and JavaScript syntax checks for the static browser modules and offline scripts. It does not run any browser smoke checks; run `just smoke-browser` for the sine path and `just smoke-l12` for the opt-in hardware path.
+
+`just inspect-recording <manifest.json>` validates an exported or recovered recording manifest from disk without hardware, Chrome, OPFS access, browser automation, or raw `.f32` chunk files. The target defaults to the observed L-12 shape: 14 channels, 48 kHz, 960 frames per block, `f32-interleaved`, and zero native input drop deltas.
+For known-bad or exploratory artifacts where native drops are expected, run `node scripts/inspect-recording-manifest.mjs <manifest.json>` directly and choose only the expectations that apply.
 
 `just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling.
 
@@ -117,6 +121,15 @@ Workflow:
 6. Let the stream run.
 7. Click Stop Recording.
 8. Inspect the recording counters and export artifacts.
+9. Run offline manifest inspection on the exported manifest.
+
+For the observed L-12 path, inspect the exported manifest with:
+
+```sh
+just inspect-recording ./native-pcm-...-manifest.json
+```
+
+The inspector checks the manifest stream shape, continuity arrays, chunk/block frame and byte math, top-level frame/block totals, and native input drop deltas. It fails on gaps, overlaps, discontinuities, channel mismatches, invalid blocks, malformed chunk metadata, fatal recovery warnings, and native dropped callback buffers/frames/events when the zero-drop expectation is enabled. It reports monitor underruns/overflows, WebSocket lag events, monitor counter resets, and write-backlog high-water counters as warnings because those are browser/monitor observability signals rather than direct proof of native input loss.
 
 Recording uses the Origin Private File System through `navigator.storage.getDirectory()`. Use a Chromium-class desktop browser for this slice. If OPFS is unavailable, recording refuses to arm and monitoring remains usable. The page asks the browser for persistent storage when recording starts, but the browser may still return `false`; long tests should be run in a profile with sufficient free disk space.
 
@@ -216,8 +229,9 @@ Short recording check with the sine source:
 6. Click Stop Recording.
 7. Confirm the manifest counters report 12 channels, 48 kHz, plausible duration/frames, no unexpected gaps, and `nativeInputStats` with zero native drops.
 8. Export the manifest.
-9. Choose a source channel and export the selected-channel WAV.
-10. Import or inspect the WAV as 32-bit float mono audio.
+9. Run `node scripts/inspect-recording-manifest.mjs <manifest.json> --expect-channels 12 --expect-sample-rate 48000 --expect-frames-per-block 960 --expect-native-drops-zero`.
+10. Choose a source channel and export the selected-channel WAV.
+11. Import or inspect the WAV as 32-bit float mono audio.
 
 If ZOOM hardware is attached:
 
@@ -227,6 +241,7 @@ just smoke-l12 1000
 ```
 
 Record whether cpal exposes the device with more than two channels and whether the requested config opens. `just smoke-l12` is a short monitor smoke, not recording automation; it verifies the browser page reaches monitoring, shows 14 active meters, and reports clean monitor and native-drop counters. For recording checks, speak into known channels such as channel 1 and a later channel such as 9 or 13, then export selected-channel WAVs and verify mapping/alignment in a DAW.
+After exporting the L-12 recording manifest, run `just inspect-recording <manifest.json>` and keep the PASS/FAIL report with the manual test notes.
 
 ## Success Criteria
 
