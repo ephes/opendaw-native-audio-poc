@@ -13,6 +13,10 @@ test:
     node --check public/ring-buffer.js
     node --check public/wav.js
     node --check public/bridge-processor.js
+    node --check scripts/browser-smoke.mjs
+
+smoke-browser monitor_ms="30000":
+    SMOKE_MONITOR_MS={{monitor_ms}} node scripts/browser-smoke.mjs
 
 list:
     cargo run -- list

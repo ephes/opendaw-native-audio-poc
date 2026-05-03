@@ -61,12 +61,13 @@ Development shorthand:
 
 ```sh
 just test
+just smoke-browser
 just list
 just serve-sine
 just serve-l12
 ```
 
-`just test` runs `cargo fmt --check`, `cargo check`, `cargo test`, Node.js unit tests, and JavaScript syntax checks for the static browser modules. `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
+`just test` runs `cargo fmt --check`, `cargo check`, `cargo test`, Node.js unit tests, and JavaScript syntax checks for the static browser modules. `just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
 
 ## Current Implementation
 
