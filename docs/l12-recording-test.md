@@ -4,6 +4,14 @@ Use this file as a repeatable manual checklist for browser-side recording tests 
 
 See the README Browser Recording Mode section for the full workflow and artifact format. If `127.0.0.1:4545` is already in use, start the server with another port, for example `--port 4546`, and open that URL instead. Prefer starting monitor playback before recording when monitor counters matter; starting monitor during recording intentionally resets and rebases underrun/overflow deltas.
 
+Before a longer recording run, the opt-in monitor smoke can check the real-device path quickly:
+
+```sh
+just smoke-l12 1000
+```
+
+The smoke requires connected ZOOM hardware. By default it opens the input source with device substring `ZOOM`, 14 channels, 48 kHz, and 960 frames per block, then drives the browser monitor path headlessly and expects 14 active meters with zero underruns, overflows, and native dropped callback buffers/frames/events. If the device is absent or the requested config cannot open, the command reports that the hardware smoke did not run and includes the Rust server output. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling. Overrides follow the `just` target order: `just smoke-l12 <monitor-ms> <port> <frames-per-block> <device-substring> <channels> <sample-rate>`. Set `CHROME_PATH` for a non-default Chromium binary. Set `SMOKE_EXPECT_ACTIVE_METERS` only when deliberately running with known silent inputs.
+
 ## Setup
 
 - Date:
@@ -13,9 +21,10 @@ See the README Browser Recording Mode section for the full workflow and artifact
 - Command:
 
   ```sh
-  cargo run -- serve --source input --device "ZOOM" --channels 14 --sample-rate 48000
+  just serve-l12
   ```
 
+- Preflight monitor smoke result:
 - Browser storage persistence granted: yes/no
 - Monitor enabled: yes/no
 - Monitor pair:

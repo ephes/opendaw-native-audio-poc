@@ -5,10 +5,7 @@ import os from "node:os";
 import path from "node:path";
 
 const HOST = "127.0.0.1";
-const CHANNELS = 12;
-const SAMPLE_RATE = 48_000;
-const FRAMES_PER_BLOCK = 960;
-const MONITOR_MS = Number.parseInt(process.env.SMOKE_MONITOR_MS ?? "30000", 10);
+const config = readConfig();
 
 async function main() {
   const resources = { chrome: null, server: null };
@@ -39,23 +36,84 @@ async function main() {
       throw new Error("Node.js global WebSocket is required for the browser smoke test");
     }
 
-    resources.server = startServer(serverPort);
+    resources.server = startServer(config, serverPort);
     resources.chrome = startChrome(chromePath, chromeDebugPort);
 
-    await waitForHttp(`http://${HOST}:${serverPort}/`, resources.server.output);
-    const result = await runBrowserSmoke(serverPort, chromeDebugPort, resources.chrome.output);
+    console.error(
+      `${config.label}: source=${config.source} device=${config.device ?? "<default>"} channels=${config.channels} sampleRate=${config.sampleRate} framesPerBlock=${config.framesPerBlock} monitorMs=${config.monitorMs}`,
+    );
+
+    await waitForHttp(`http://${HOST}:${serverPort}/`, resources.server);
+    const result = await runBrowserSmoke(config, serverPort, chromeDebugPort, resources.chrome.output);
     console.log(JSON.stringify(result, null, 2));
     if (result.failures.length > 0) {
       process.exitCode = 1;
     }
   } catch (error) {
-    console.error(error.stack || error.message);
+    console.error(error instanceof SmokeStartupError ? error.message : error.stack || error.message);
     process.exitCode = 1;
   } finally {
     process.off("SIGINT", handleSignal);
     process.off("SIGTERM", handleSignal);
     await cleanup();
   }
+}
+
+function readConfig() {
+  const source = readEnum("SMOKE_SOURCE", "sine", ["sine", "input"]);
+  const channels = readPositiveInt("SMOKE_CHANNELS", 12);
+  const sampleRate = readPositiveInt("SMOKE_SAMPLE_RATE", 48_000);
+  const framesPerBlock = readPositiveInt("SMOKE_FRAMES_PER_BLOCK", 960);
+  const monitorMs = readPositiveInt("SMOKE_MONITOR_MS", 30_000);
+  const serverTimeoutMs = readPositiveInt("SMOKE_SERVER_TIMEOUT_MS", 60_000);
+  const expectedActiveMeters = readPositiveInt("SMOKE_EXPECT_ACTIVE_METERS", channels);
+  const device = process.env.SMOKE_DEVICE || null;
+  const expectNativeDropsZero = readBool("SMOKE_EXPECT_NATIVE_DROPS_ZERO", true);
+  const label = process.env.SMOKE_LABEL || `${source} browser smoke`;
+
+  return {
+    source,
+    device,
+    channels,
+    sampleRate,
+    framesPerBlock,
+    monitorMs,
+    serverTimeoutMs,
+    expectedActiveMeters,
+    expectNativeDropsZero,
+    label,
+  };
+}
+
+function readEnum(name, fallback, allowed) {
+  const value = process.env[name] ?? fallback;
+  if (!allowed.includes(value)) {
+    throw new Error(`${name} must be one of ${allowed.join(", ")}, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function readPositiveInt(name, fallback) {
+  const raw = process.env[name] ?? String(fallback);
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value <= 0 || String(value) !== raw) {
+    throw new Error(`${name} must be a positive integer, got ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+function readBool(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined) {
+    return fallback;
+  }
+  if (["1", "true", "yes"].includes(raw.toLowerCase())) {
+    return true;
+  }
+  if (["0", "false", "no"].includes(raw.toLowerCase())) {
+    return false;
+  }
+  throw new Error(`${name} must be true/false or 1/0, got ${JSON.stringify(raw)}`);
 }
 
 async function cleanupResources({ chrome, server }) {
@@ -80,37 +138,50 @@ function findChromePath() {
   return found;
 }
 
-function startServer(port) {
+function startServer(config, port) {
   const output = [];
+  const args = [
+    "run",
+    "--",
+    "serve",
+    "--source",
+    config.source,
+    "--channels",
+    String(config.channels),
+    "--sample-rate",
+    String(config.sampleRate),
+    "--port",
+    String(port),
+    "--frames-per-block",
+    String(config.framesPerBlock),
+  ];
+  if (config.source === "input" && config.device) {
+    args.splice(5, 0, "--device", config.device);
+  }
   const child = spawn(
     "cargo",
-    [
-      "run",
-      "--",
-      "serve",
-      "--source",
-      "sine",
-      "--channels",
-      String(CHANNELS),
-      "--sample-rate",
-      String(SAMPLE_RATE),
-      "--port",
-      String(port),
-      "--frames-per-block",
-      String(FRAMES_PER_BLOCK),
-    ],
+    args,
     {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  let exitInfo = null;
 
   child.stdout.on("data", (chunk) => appendOutput(output, chunk));
   child.stderr.on("data", (chunk) => appendOutput(output, chunk));
   child.on("error", (error) => appendOutput(output, `server spawn failed: ${error.message}\n`));
+  child.on("exit", (code, signal) => {
+    exitInfo = { code, signal };
+  });
 
   return {
+    command: `cargo ${args.join(" ")}`,
+    config,
     output,
+    getExitInfo() {
+      return exitInfo;
+    },
     async stop() {
       await stopProcessGroup(child);
     },
@@ -153,7 +224,7 @@ function startChrome(chromePath, debugPort) {
   };
 }
 
-async function runBrowserSmoke(port, debugPort, chromeOutput) {
+async function runBrowserSmoke(config, port, debugPort, chromeOutput) {
   const target = await waitForPageTarget(debugPort, chromeOutput);
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   await onceSocketOpen(socket);
@@ -181,7 +252,7 @@ async function runBrowserSmoke(port, debugPort, chromeOutput) {
   await evalExpr(cdp, `document.querySelector("#connect").click(); undefined`);
   await waitFor(cdp, `document.querySelector("#socket-state")?.textContent === "open"`);
   await waitFor(cdp, `!document.querySelector("#monitor")?.disabled`);
-  await waitFor(cdp, `document.querySelector("#meters")?.children.length === ${CHANNELS}`);
+  await waitFor(cdp, `document.querySelector("#meters")?.children.length === ${config.channels}`);
 
   const beforeMonitor = await evalExpr(cdp, `({
     summary: document.querySelector("#stream-summary")?.textContent,
@@ -195,21 +266,30 @@ async function runBrowserSmoke(port, debugPort, chromeOutput) {
 
   await evalExpr(cdp, `document.querySelector("#monitor").click(); undefined`);
   await waitFor(cdp, `document.querySelector("#monitor")?.textContent === "Monitoring"`);
-  await sleep(MONITOR_MS);
+  await sleep(config.monitorMs);
 
   const afterMonitor = await evalExpr(cdp, `(() => {
     const fills = [...document.querySelectorAll(".meter-fill")]
       .map((element) => Number.parseFloat(element.style.width || "0"));
     const dbs = [...document.querySelectorAll(".meter-db")]
       .map((element) => element.textContent);
+    const active = fills.map(
+      (value, index) => value > 0 || (typeof dbs[index] === "string" && dbs[index] !== "-inf"),
+    );
     return {
       monitorText: document.querySelector("#monitor")?.textContent,
       socket: document.querySelector("#socket-state")?.textContent,
       summary: document.querySelector("#stream-summary")?.textContent,
       meterCount: document.querySelector("#meters")?.children.length,
-      activeMeters: fills.filter((value) => value > 0).length,
+      // db text catches real input below the -60 dB meter-fill floor.
+      activeMeters: active.filter(Boolean).length,
+      inactiveMeters: active
+        .map((isActive, index) => isActive ? null : index + 1)
+        .filter((channel) => channel !== null),
       firstMeterWidth: fills[0] ?? null,
       firstMeterDb: dbs[0] ?? null,
+      meterWidths: fills,
+      meterDbs: dbs,
       bufferFill: document.querySelector("#buffer-fill")?.textContent,
       underruns: document.querySelector("#underruns")?.textContent,
       overflows: document.querySelector("#overflows")?.textContent,
@@ -223,13 +303,19 @@ async function runBrowserSmoke(port, debugPort, chromeOutput) {
     .filter((event) => ["Runtime.exceptionThrown", "Log.entryAdded"].includes(event.method))
     .map((event) => event.params);
   const runtimeExceptions = pageEvents.filter((event) => event.exceptionDetails);
-  const failures = collectFailures({ isolation, beforeMonitor, afterMonitor, runtimeExceptions });
+  const failures = collectFailures({
+    config,
+    isolation,
+    beforeMonitor,
+    afterMonitor,
+    runtimeExceptions,
+  });
 
   socket.close();
-  return { isolation, beforeMonitor, afterMonitor, pageEvents, failures };
+  return { config, isolation, beforeMonitor, afterMonitor, pageEvents, failures };
 }
 
-function collectFailures({ isolation, beforeMonitor, afterMonitor, runtimeExceptions }) {
+function collectFailures({ config, isolation, beforeMonitor, afterMonitor, runtimeExceptions }) {
   const failures = [];
   if (!isolation.crossOriginIsolated) {
     failures.push("page is not crossOriginIsolated");
@@ -240,14 +326,24 @@ function collectFailures({ isolation, beforeMonitor, afterMonitor, runtimeExcept
   if (beforeMonitor.socket !== "open") {
     failures.push("socket did not open");
   }
-  if (beforeMonitor.meterCount !== CHANNELS) {
-    failures.push(`expected ${CHANNELS} meters, saw ${beforeMonitor.meterCount}`);
+  const expectedSummary =
+    `${config.channels} channels, ${config.sampleRate} Hz, ${config.framesPerBlock} frames/block`;
+  if (beforeMonitor.summary !== expectedSummary) {
+    failures.push(`expected stream summary ${JSON.stringify(expectedSummary)}, saw ${JSON.stringify(beforeMonitor.summary)}`);
+  }
+  if (beforeMonitor.meterCount !== config.channels) {
+    failures.push(`expected ${config.channels} meters, saw ${beforeMonitor.meterCount}`);
   }
   if (afterMonitor.monitorText !== "Monitoring") {
     failures.push("monitor did not enter Monitoring state");
   }
-  if (afterMonitor.activeMeters !== CHANNELS) {
-    failures.push(`expected ${CHANNELS} active meters, saw ${afterMonitor.activeMeters}`);
+  if (afterMonitor.activeMeters !== config.expectedActiveMeters) {
+    const inactive = afterMonitor.inactiveMeters?.length
+      ? `; inactive channels: ${afterMonitor.inactiveMeters.join(", ")}`
+      : "";
+    failures.push(
+      `expected ${config.expectedActiveMeters} active meters, saw ${afterMonitor.activeMeters}${inactive}`,
+    );
   }
   if (afterMonitor.underruns !== "0") {
     failures.push(`expected 0 underruns after monitor start, saw ${afterMonitor.underruns}`);
@@ -256,9 +352,10 @@ function collectFailures({ isolation, beforeMonitor, afterMonitor, runtimeExcept
     failures.push(`expected 0 overflows after monitor start, saw ${afterMonitor.overflows}`);
   }
   if (
-    afterMonitor.nativeDroppedBlocks !== "0" ||
-    afterMonitor.nativeDroppedFrames !== "0" ||
-    afterMonitor.nativeDropEvents !== "0"
+    config.expectNativeDropsZero &&
+    (afterMonitor.nativeDroppedBlocks !== "0" ||
+      afterMonitor.nativeDroppedFrames !== "0" ||
+      afterMonitor.nativeDropEvents !== "0")
   ) {
     failures.push(
       `expected zero native drops, saw ${afterMonitor.nativeDroppedBlocks}/${afterMonitor.nativeDroppedFrames}/${afterMonitor.nativeDropEvents}`,
@@ -356,20 +453,67 @@ async function waitForPageTarget(debugPort, chromeOutput) {
   );
 }
 
-async function waitForHttp(url, serverOutput) {
-  const deadline = Date.now() + 20_000;
+async function waitForHttp(url, server) {
+  const deadline = Date.now() + server.config.serverTimeoutMs;
   while (Date.now() < deadline) {
-    try {
-      const response = await fetch(url);
-      if (response.ok) {
-        return;
-      }
-    } catch (_error) {
-      // The Rust server may still be compiling or binding.
+    const exitInfo = server.getExitInfo();
+    if (exitInfo) {
+      throw serverStartupError(server, {
+        reason: `server exited with code ${exitInfo.code} signal ${exitInfo.signal}`,
+        mode: "exited",
+      });
+    }
+    if (await fetchOk(url, 1_000)) {
+      return;
     }
     await sleep(100);
   }
-  throw new Error(`Timed out waiting for ${url}\nServer output:\n${serverOutput.join("")}`);
+  const exitInfo = server.getExitInfo();
+  if (exitInfo) {
+    throw serverStartupError(server, {
+      reason: `server exited with code ${exitInfo.code} signal ${exitInfo.signal}`,
+      mode: "exited",
+    });
+  }
+  throw serverStartupError(server, {
+    reason: `timed out after ${server.config.serverTimeoutMs} ms waiting for ${url}`,
+    mode: "timeout",
+  });
+}
+
+function serverStartupError(server, { reason, mode }) {
+  const hardwareNote =
+    mode === "exited" && server.config.source === "input"
+      ? "\nThis hardware-dependent smoke did not run. Check that the input device is connected and that the requested device substring, channel count, sample rate, and frames/block are supported."
+      : "";
+  const timeoutNote =
+    mode === "timeout"
+      ? "\nThe Rust server did not become ready before the smoke timeout. A first run after a clean checkout or dependency change may still be compiling; try `cargo build` first or increase SMOKE_SERVER_TIMEOUT_MS."
+      : "";
+  return new SmokeStartupError(
+    `${server.config.label}: ${reason}\nCommand: ${server.command}${hardwareNote}${timeoutNote}\nServer output:\n${server.output.join("")}`,
+  );
+}
+
+async function fetchOk(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    return response.ok;
+  } catch (_error) {
+    // The Rust server may still be compiling, binding, or hidden by another process on the port.
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+class SmokeStartupError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SmokeStartupError";
+  }
 }
 
 async function fetchJson(url) {

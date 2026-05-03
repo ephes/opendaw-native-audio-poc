@@ -18,6 +18,9 @@ test:
 smoke-browser monitor_ms="30000":
     SMOKE_MONITOR_MS={{monitor_ms}} node scripts/browser-smoke.mjs
 
+smoke-l12 monitor_ms="30000" port="" frames_per_block="960" device="ZOOM" channels="14" sample_rate="48000":
+    SMOKE_LABEL='L-12 browser smoke' SMOKE_SOURCE=input SMOKE_DEVICE='{{device}}' SMOKE_CHANNELS={{channels}} SMOKE_SAMPLE_RATE={{sample_rate}} SMOKE_FRAMES_PER_BLOCK={{frames_per_block}} SMOKE_MONITOR_MS={{monitor_ms}} SMOKE_PORT='{{port}}' node scripts/browser-smoke.mjs
+
 list:
     cargo run -- list
 

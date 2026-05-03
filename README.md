@@ -62,12 +62,19 @@ Development shorthand:
 ```sh
 just test
 just smoke-browser
+just smoke-l12
 just list
 just serve-sine
 just serve-l12
 ```
 
-`just test` runs `cargo fmt --check`, `cargo check`, `cargo test`, Node.js unit tests, and JavaScript syntax checks for the static browser modules. `just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. `just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
+`just test` runs `cargo fmt --check`, `cargo check`, `cargo test`, Node.js unit tests, and JavaScript syntax checks for the static browser modules. It does not run any browser smoke checks; run `just smoke-browser` for the sine path and `just smoke-l12` for the opt-in hardware path.
+
+`just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling.
+
+`just smoke-l12` is an opt-in real-device monitor smoke for the observed ZOOM LiveTrak L-12 path. It starts a temporary input-source server with device substring `ZOOM`, 14 channels, 48 kHz, and 960 frames per block, then runs the same headless browser monitor checks for 30 seconds. It requires the L-12 to be connected and available through CoreAudio. If the device is missing or the requested config cannot open, the command reports that the hardware smoke did not run and includes the Rust server output, such as device selection, config, or stream-open errors. Override the duration with `just smoke-l12 <milliseconds>`, or use the full form `just smoke-l12 <milliseconds> <port> <frames-per-block> <device-substring> <channels> <sample-rate>`. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling. The smoke expects all 14 meters to become active and native dropped callback buffers/frames/events to remain `0`; set `SMOKE_EXPECT_ACTIVE_METERS` only when deliberately running with known silent inputs, and set `SMOKE_EXPECT_NATIVE_DROPS_ZERO=0` only when deliberately investigating a known hardware drop condition.
+
+`just serve-sine` defaults to 12 channels at 48 kHz on port 4545 with 960 frames per block; override with `just serve-sine <channels> <sample-rate> <port> <frames-per-block>`. `just serve-l12` starts the observed ZOOM LiveTrak L-12 path with 14 channels at 48 kHz and 960 frames per block; override with `just serve-l12 <port> <frames-per-block>`.
 
 ## Current Implementation
 
@@ -185,6 +192,7 @@ cargo check
 cargo clippy --all-targets
 cargo test
 just test
+just smoke-browser 1000
 cargo run -- list
 cargo run -- serve --source sine --channels 12 --sample-rate 48000
 ```
@@ -215,9 +223,10 @@ If ZOOM hardware is attached:
 
 ```sh
 cargo run -- serve --source input --device "ZOOM" --channels 14 --sample-rate 48000
+just smoke-l12 1000
 ```
 
-Record whether cpal exposes the device with more than two channels and whether the requested config opens. For recording checks, speak into known channels such as channel 1 and a later channel such as 9 or 13, then export selected-channel WAVs and verify mapping/alignment in a DAW.
+Record whether cpal exposes the device with more than two channels and whether the requested config opens. `just smoke-l12` is a short monitor smoke, not recording automation; it verifies the browser page reaches monitoring, shows 14 active meters, and reports clean monitor and native-drop counters. For recording checks, speak into known channels such as channel 1 and a later channel such as 9 or 13, then export selected-channel WAVs and verify mapping/alignment in a DAW.
 
 ## Success Criteria
 
