@@ -4,6 +4,8 @@ This repository is a minimal feasibility probe for feeding native macOS multicha
 
 The question to answer is not whether a native app can record multichannel audio. The question is whether native CoreAudio capture can be bridged into a browser/WebView AudioWorklet reliably enough that openDAW could eventually use it as a desktop-only capture backend.
 
+See [docs/opendaw-integration-plan.md](docs/opendaw-integration-plan.md) for the first scoped plan that turns the validated PoC evidence into an openDAW-facing integration target.
+
 ## Target Architecture
 
 ```text
