@@ -301,3 +301,17 @@ sample rates: 48000..48000 Hz
 Manual browser check: connecting the page and starting monitor playback produced audible local microphone monitoring from the L-12 input. The monitor path intentionally starts near the current write cursor so it does not play back the whole buffer accumulated before monitoring starts.
 
 15-minute browser soak check with the L-12 showed stable monitoring with `0` underruns, 14 meters active, and 23 overflows visible at the end of the run. Those overflows are consistent with ring-buffer fill before monitor playback starts, so monitor startup now resets underrun/overflow counters after aligning the read cursor.
+
+## WebSocket access boundary
+
+Before `/ws` upgrades, the bridge requires exactly one `Host: 127.0.0.1:<bound-port>`
+and one `Origin: http://127.0.0.1:<bound-port>`. Open the printed numeric loopback
+URL; `localhost`, other aliases, foreign origins, `null`, missing Origin,
+noncanonical values, and duplicate headers receive HTTP 403 with no stream.
+The bound port is used even with `--port 0`; for HTTP port 80, both
+headers omit `:80` to match browser serialization.
+
+Nonbrowser clients must explicitly send the same Origin header as the served
+page. There is no missing-Origin bypass. This protects against unrelated browser
+pages; it does not authenticate local programs, which can forge these headers.
+COOP/COEP response headers provide isolation, not WebSocket authorization.
