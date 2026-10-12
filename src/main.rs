@@ -16,7 +16,7 @@ use axum::{
         State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderValue, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
@@ -80,6 +80,7 @@ enum Source {
 
 #[derive(Clone)]
 struct AppState {
+    authority: String,
     stream_info: StreamStarted,
     blocks: broadcast::Sender<Arc<AudioBlock>>,
     native_stats: Arc<NativeInputStats>,
@@ -270,11 +271,15 @@ async fn serve(args: ServeArgs) -> Result<()> {
         eprintln!("Warning: --device is ignored when --source sine is selected");
     }
 
-    let (app, source_runtime) = build_app(args.clone())?;
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind http server on http://{addr}"))?;
+
+    let addr = listener.local_addr()?;
+    let mut args = args;
+    args.port = addr.port();
+    let (app, source_runtime) = build_app(args.clone())?;
 
     println!(
         "Serving {}-channel {:?} stream at {} Hz on http://{}",
@@ -326,6 +331,7 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
     };
 
     let state = AppState {
+        authority: loopback_authority(args.port),
         stream_info,
         blocks: block_tx,
         native_stats,
@@ -364,8 +370,39 @@ fn validate_serve_args(args: &ServeArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+fn loopback_authority(port: u16) -> String {
+    if port == 80 {
+        "127.0.0.1".to_owned()
+    } else {
+        format!("127.0.0.1:{port}")
+    }
+}
+
+fn trusted_websocket_request(headers: &HeaderMap, authority: &str) -> bool {
+    let expected_origin = format!("http://{authority}");
+    // Exactly one canonical value: never derive trust from a caller-supplied Host.
+    [
+        (header::HOST, authority),
+        (header::ORIGIN, expected_origin.as_str()),
+    ]
+    .into_iter()
+    .all(|(name, expected)| {
+        let mut values = headers.get_all(name).iter();
+        matches!(values.next(), Some(value) if value.as_bytes() == expected.as_bytes())
+            && values.next().is_none()
+    })
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !trusted_websocket_request(&headers, &state.authority) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(move |socket| websocket_stream(socket, state))
+        .into_response()
 }
 
 async fn websocket_stream(socket: WebSocket, state: AppState) {
@@ -722,12 +759,44 @@ mod tests {
     use serde_json::Value;
     use tokio_tungstenite::{
         connect_async,
-        tungstenite::{Error as WsError, Message as ClientMessage},
+        tungstenite::{Error as WsError, Message as ClientMessage, client::IntoClientRequest},
     };
+
+    #[test]
+    fn websocket_guard_rejects_ambiguous_headers_and_aliases() {
+        assert_eq!(loopback_authority(49123), "127.0.0.1:49123");
+        assert_eq!(loopback_authority(80), "127.0.0.1");
+        let mut default_port = HeaderMap::new();
+        default_port.insert(header::HOST, "127.0.0.1".parse().unwrap());
+        default_port.insert(header::ORIGIN, "http://127.0.0.1".parse().unwrap());
+        assert!(trusted_websocket_request(
+            &default_port,
+            &loopback_authority(80)
+        ));
+        let authority = "127.0.0.1:49123";
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, authority.parse().unwrap());
+        headers.insert(header::ORIGIN, "http://127.0.0.1:49123".parse().unwrap());
+        assert!(trusted_websocket_request(&headers, authority));
+        for name in [header::HOST, header::ORIGIN] {
+            let mut duplicate = headers.clone();
+            duplicate.append(name.clone(), headers[&name].clone());
+            assert!(!trusted_websocket_request(&duplicate, authority));
+        }
+        for origin in [
+            "http://localhost:49123",
+            "https://127.0.0.1:49123",
+            "http://127.0.0.1:49123/",
+            "http://127.0.0.1:49123, null",
+        ] {
+            headers.insert(header::ORIGIN, origin.parse().unwrap());
+            assert!(!trusted_websocket_request(&headers, authority));
+        }
+    }
 
     #[tokio::test]
     async fn sine_websocket_protocol_starts_with_stats_and_pcm_block() {
-        let args = ServeArgs {
+        let mut args = ServeArgs {
             source: Source::Sine,
             device: None,
             channels: 2,
@@ -736,18 +805,57 @@ mod tests {
             // The test binds its own ephemeral listener directly.
             port: 0,
         };
-        let (app, source_runtime) = build_app(args.clone()).expect("sine app should build");
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .expect("ephemeral listener should bind");
         let addr = listener.local_addr().expect("listener should have address");
+        args.port = addr.port();
+        let (app, source_runtime) = build_app(args.clone()).expect("sine app should build");
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
                 .expect("test server should run");
         });
 
-        let (mut socket, _) = connect_async(format!("ws://{addr}/ws"))
+        // Rejected handshakes cannot receive metadata or PCM. Nondefault bound port
+        // must be used rather than the default or a caller-controlled Host.
+        for origin in [
+            None,
+            Some("null"),
+            Some("https://foreign.example"),
+            Some("http://127.0.0.1:4545"),
+            Some("http://localhost:4545"),
+            Some("http://127.0.0.1:4545/path"),
+        ] {
+            let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+            if let Some(origin) = origin {
+                request
+                    .headers_mut()
+                    .insert(header::ORIGIN, origin.parse().unwrap());
+            }
+            match connect_async(request).await {
+                Err(WsError::Http(response)) => {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN)
+                }
+                other => panic!("expected forbidden handshake, got {other:?}"),
+            }
+        }
+        let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, format!("http://{addr}").parse().unwrap());
+        request
+            .headers_mut()
+            .insert(header::HOST, "foreign.example".parse().unwrap());
+        match connect_async(request).await {
+            Err(WsError::Http(response)) => assert_eq!(response.status(), StatusCode::FORBIDDEN),
+            other => panic!("expected forbidden Host, got {other:?}"),
+        }
+        let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, format!("http://{addr}").parse().unwrap());
+        let (mut socket, _) = connect_async(request)
             .await
             .expect("websocket should connect");
 
