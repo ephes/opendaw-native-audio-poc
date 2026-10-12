@@ -3,8 +3,9 @@ default:
 
 test:
     cargo fmt --check
-    cargo check
-    cargo test
+    cargo check --locked
+    cargo clippy --locked --all-targets
+    cargo test --locked
     node --test
     node --check public/app.js
     node --check public/audio-worker.js
