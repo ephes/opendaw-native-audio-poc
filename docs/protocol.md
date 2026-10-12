@@ -99,3 +99,17 @@ Browser recording artifacts are also outside the backend compatibility boundary.
 ## Compatibility Boundary
 
 The WebSocket protocol is the compatibility boundary. A later Swift backend should be able to emit the same messages and binary PCM blocks without changing the browser receiver.
+
+## WebSocket access boundary
+
+Before `/ws` upgrades, the bridge requires exactly one `Host: 127.0.0.1:<bound-port>`
+and one `Origin: http://127.0.0.1:<bound-port>`. Open the printed numeric loopback
+URL; `localhost`, other aliases, foreign origins, `null`, missing Origin,
+noncanonical values, and duplicate headers receive HTTP 403 with no stream.
+The bound port is used even with `--port 0`; for HTTP port 80, both
+headers omit `:80` to match browser serialization.
+
+Nonbrowser clients must explicitly send the same Origin header as the served
+page. There is no missing-Origin bypass. This protects against unrelated browser
+pages; it does not authenticate local programs, which can forge these headers.
+COOP/COEP response headers provide isolation, not WebSocket authorization.
