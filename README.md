@@ -72,7 +72,7 @@ just serve-sine
 just serve-l12
 ```
 
-`just test` runs `cargo fmt --check`, `cargo check`, `cargo test`, Node.js unit tests, and JavaScript syntax checks for the static browser modules and offline scripts. It does not run any browser smoke checks; run `just smoke-browser` for the sine path and `just smoke-l12` for the opt-in hardware path.
+`just test` runs `cargo fmt --check`, `cargo check --locked`, `cargo clippy --locked --all-targets`, `cargo test --locked`, Node.js unit tests, and JavaScript syntax checks for the static browser modules and offline scripts. It does not run any browser smoke checks; run `just smoke-browser` for the sine path and `just smoke-l12` for the opt-in hardware path.
 
 `just inspect-recording <manifest.json>` validates an exported or recovered recording manifest from disk without hardware, Chrome, OPFS access, browser automation, or raw `.f32` chunk files. The target defaults to the observed L-12 shape: 14 channels, 48 kHz, 960 frames per block, `f32-interleaved`, and zero native input drop deltas.
 For known-bad or exploratory artifacts where native drops are expected, run `node scripts/inspect-recording-manifest.mjs <manifest.json>` directly and choose only the expectations that apply.
@@ -208,19 +208,41 @@ Known limits:
 - Native input drop counters are cumulative observability counters, not recovery data. If they increase, audio was lost before browser delivery; the browser cannot reconstruct those missing frames.
 - The Rust cpal callback still allocates before queue backpressure can be observed; this is PoC-only.
 
+## Continuous integration
+
+The `Synthetic checks` GitHub Actions workflow runs `just test` on every push
+and pull request, using macOS, stable Rust with rustfmt/Clippy, and Node.js 24.
+Rust dependency resolution uses the committed `Cargo.lock` (`--locked`); Node
+fixtures use only built-in modules and require no npm install. The job has
+read-only repository permissions and does not publish artifacts or releases.
+
+A format, compilation, test, or JavaScript syntax failure fails the job and
+must be resolved before review approval and merging. Clippy errors also fail
+the job; its standard warnings are reported without failing the job. These checks use synthetic Rust PCM and Node fixtures;
+they require no microphone, recorded audio, Chrome, or OPFS access.
+Browser monitor smoke, real-device checks, and endurance/recording sessions
+remain separate manual checks. A passing CI job does not certify those paths.
+Run the same automated checks locally with `just test`.
+
 ## Verification
 
-Automated checks:
+Automated hardware-free checks (the same gate as CI):
 
 ```sh
-cargo fmt --check
-cargo check
-cargo clippy --all-targets
-cargo test
 just test
+```
+
+Opt-in local browser checks (require Chrome; run separately from CI):
+
+```sh
 just smoke-browser 1000
-cargo run -- list
-cargo run -- serve --source sine --channels 12 --sample-rate 48000
+```
+
+Local device enumeration and synthetic server for manual page checks:
+
+```sh
+cargo run --locked -- list
+cargo run --locked -- serve --source sine --channels 12 --sample-rate 48000
 ```
 
 Manual checks:
