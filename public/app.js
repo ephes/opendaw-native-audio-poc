@@ -323,7 +323,7 @@ function renderCounters() {
   }
   const write = Atomics.load(stateView, STATE.WRITE_FRAME);
   const read = Atomics.load(stateView, STATE.READ_FRAME);
-  const fill = Math.max(0, write - read);
+  const fill = Math.min((write - read) >>> 0, Atomics.load(stateView, STATE.CAPACITY_FRAMES));
   els.bufferFill.textContent = `${fill} frames`;
   els.underruns.textContent = String(Atomics.load(stateView, STATE.UNDERRUN_COUNT));
   els.overflows.textContent = String(Atomics.load(stateView, STATE.OVERFLOW_COUNT));
