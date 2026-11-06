@@ -2,6 +2,7 @@ import { decodePcmBlock } from "./pcm-block.js";
 import { PcmRecorder } from "./recorder.js";
 import {
   createRingBufferViews,
+  writePcmToRingBuffer,
   RING_BUFFER_BYTES_PER_SAMPLE,
   STATE,
   STATE_BYTES,
@@ -112,7 +113,11 @@ function handleSocketMessage(event) {
 
 function configureStream(info) {
   streamInfo = info;
-  const capacityFrames = Math.max(info.framesPerBlock * 8, info.sampleRate * CAPACITY_SECONDS);
+  // A power-of-two capacity divides the uint32 cursor period, preserving
+  // physical sample positions when the cursor wraps through zero.
+  const capacityFrames = 2 ** Math.ceil(Math.log2(
+    Math.max(info.framesPerBlock * 8, info.sampleRate * CAPACITY_SECONDS),
+  ));
   const sampleBytes = capacityFrames * info.channels * RING_BUFFER_BYTES_PER_SAMPLE;
   sharedBuffer = new SharedArrayBuffer(STATE_BYTES + sampleBytes);
   stateView = new Int32Array(sharedBuffer, 0, STATE_INTS);
@@ -153,26 +158,7 @@ function writePcmBlock(buffer) {
   const { frameStart, frameCount, channels, samples, dataBytes } = block;
   const receivedBlockIndex = Atomics.load(stateView, STATE.RECEIVED_BLOCKS);
   recorder.recordBlock({ frameStart, frameCount, channels, receivedBlockIndex, dataBytes });
-  const capacityFrames = Atomics.load(stateView, STATE.CAPACITY_FRAMES);
-  let writeFrame = Atomics.load(stateView, STATE.WRITE_FRAME);
-  let readFrame = Atomics.load(stateView, STATE.READ_FRAME);
-  const available = writeFrame - readFrame;
-
-  if (available + frameCount > capacityFrames) {
-    const newReadFrame = writeFrame + frameCount - capacityFrames;
-    Atomics.store(stateView, STATE.READ_FRAME, newReadFrame);
-    Atomics.add(stateView, STATE.OVERFLOW_COUNT, 1);
-    readFrame = newReadFrame;
-  }
-
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    const ringFrame = (writeFrame + frame) % capacityFrames;
-    const ringOffset = ringFrame * channels;
-    const inputOffset = frame * channels;
-    sampleView.set(samples.subarray(inputOffset, inputOffset + channels), ringOffset);
-  }
-
-  Atomics.store(stateView, STATE.WRITE_FRAME, writeFrame + frameCount);
+  writePcmToRingBuffer(stateView, sampleView, samples, frameCount);
   Atomics.add(stateView, STATE.RECEIVED_BLOCKS, 1);
   maybePostMeters(samples, frameCount, channels);
 }

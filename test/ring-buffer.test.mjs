@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   alignReadCursor,
+  writePcmToRingBuffer,
   createRingBufferViews,
   readStereoFromRingBuffer,
   RING_BUFFER_BYTES_PER_SAMPLE,
@@ -14,7 +15,7 @@ import {
 test("alignReadCursor places the read cursor three blocks behind the writer", () => {
   const { stateView } = createTestRingBuffer({
     channels: 2,
-    capacityFrames: 128,
+    capacityFrames: 4096,
     framesPerBlock: 100,
     writeFrame: 1_000,
   });
@@ -26,7 +27,7 @@ test("alignReadCursor places the read cursor three blocks behind the writer", ()
 test("alignReadCursor does not move before frame zero", () => {
   const { stateView } = createTestRingBuffer({
     channels: 2,
-    capacityFrames: 128,
+    capacityFrames: 4096,
     framesPerBlock: 100,
     writeFrame: 250,
   });
@@ -38,7 +39,7 @@ test("alignReadCursor does not move before frame zero", () => {
 test("alignReadCursor uses the default frames-per-block fallback when metadata is missing", () => {
   const { stateView } = createTestRingBuffer({
     channels: 2,
-    capacityFrames: 128,
+    capacityFrames: 4096,
     framesPerBlock: 0,
     writeFrame: 4_000,
   });
@@ -239,6 +240,7 @@ function createTestRingBuffer({
   );
   const stateView = new Int32Array(sharedBuffer, 0, STATE_INTS);
   Atomics.store(stateView, STATE.WRITE_FRAME, writeFrame);
+  Atomics.store(stateView, STATE.RESERVED_WRITE_FRAME, writeFrame);
   Atomics.store(stateView, STATE.READ_FRAME, readFrame);
   Atomics.store(stateView, STATE.OVERFLOW_COUNT, 0);
   Atomics.store(stateView, STATE.UNDERRUN_COUNT, 0);
@@ -254,3 +256,148 @@ function writeFrame(ring, absoluteFrame, samples) {
   const offset = ringFrame * ring.channels;
   ring.sampleView.set(samples, offset);
 }
+
+for (const boundary of [2 ** 31, 2 ** 32]) {
+  test(`stereo read and alignment survive cursor wrap at ${boundary}`, () => {
+    const ring = createTestRingBuffer({
+      channels: 2, capacityFrames: 16, framesPerBlock: 1,
+      readFrame: boundary - 2, writeFrame: boundary + 2,
+    });
+    for (let i = 0; i < 4; i++) writeFrame(ring, (boundary - 2 + i) >>> 0, [i + 1, -i - 1]);
+    assert.equal(alignReadCursor(ring.stateView, { targetBlocks: 4 }), (boundary - 2) >>> 0);
+    const left = new Float32Array(4);
+    const right = new Float32Array(4);
+    const result = readStereoFromRingBuffer(ring.stateView, ring.sampleView, left, right);
+    assert.deepEqual([...left], [1, 2, 3, 4]);
+    assert.deepEqual([...right], [-1, -2, -3, -4]);
+    assert.equal(result.underrun, false);
+    assert.equal(result.readFrame, (boundary + 2) >>> 0);
+  });
+}
+
+for (const boundary of [2 ** 31, 2 ** 32]) {
+  test(`producer and consumer preserve samples across ${boundary}`, () => {
+    const ring = createTestRingBuffer({ channels: 2, capacityFrames: 8,
+      readFrame: boundary - 2, writeFrame: boundary - 2 });
+    const input = new Float32Array([1, -1, 2, -2, 3, -3, 4, -4]);
+    writePcmToRingBuffer(ring.stateView, ring.sampleView, input, 4);
+    const left = new Float32Array(4), right = new Float32Array(4);
+    readStereoFromRingBuffer(ring.stateView, ring.sampleView, left, right);
+    assert.deepEqual([...left], [1, 2, 3, 4]);
+    assert.deepEqual([...right], [-1, -2, -3, -4]);
+    assert.equal(Atomics.load(ring.stateView, STATE.OVERFLOW_COUNT), 0);
+  });
+}
+
+test("overflow during rendering discards overwritten samples and never resurrects old frames", () => {
+  const ring = createTestRingBuffer({ channels: 2, capacityFrames: 4,
+    readFrame: 0, writeFrame: 4 });
+  let interleaved = false;
+  const samples = new Proxy(ring.sampleView, {
+    get(target, key) {
+      if (key === "0" && !interleaved) {
+        interleaved = true;
+        writePcmToRingBuffer(ring.stateView, target,
+          new Float32Array([5, -5, 6, -6, 7, -7, 8, -8]), 4);
+      }
+      return Reflect.get(target, key);
+    },
+  });
+  const left = new Float32Array(1), right = new Float32Array(1);
+  readStereoFromRingBuffer(ring.stateView, samples, left, right);
+  assert.equal(interleaved, true);
+  assert.deepEqual([...left, ...right], [0, 0]);
+  assert.equal(Atomics.load(ring.stateView, STATE.READ_FRAME), 0);
+  const resumedLeft = new Float32Array(4), resumedRight = new Float32Array(4);
+  readStereoFromRingBuffer(ring.stateView, ring.sampleView, resumedLeft, resumedRight);
+  assert.deepEqual([...resumedLeft], [5, 6, 7, 8]);
+  assert.deepEqual([...resumedRight], [-5, -6, -7, -8]);
+  assert.equal(Atomics.load(ring.stateView, STATE.READ_FRAME), 8);
+  assert.equal(Atomics.load(ring.stateView, STATE.OVERFLOW_COUNT), 1);
+});
+
+test("render during an in-progress non-overlapping write preserves committed audio", () => {
+  const ring = createTestRingBuffer({ channels: 2, capacityFrames: 4, writeFrame: 1 });
+  ring.sampleView.set([1, -1]);
+  const samples = new Proxy(ring.sampleView, {
+    get(target, key) {
+      if (key !== "set") return Reflect.get(target, key);
+      return (...args) => {
+        const left = new Float32Array([99]), right = new Float32Array([99]);
+        readStereoFromRingBuffer(ring.stateView, target, left, right);
+        assert.deepEqual([...left, ...right], [1, -1]);
+        assert.equal(Atomics.load(ring.stateView, STATE.READ_FRAME), 1);
+        return target.set(...args);
+      };
+    },
+  });
+  writePcmToRingBuffer(ring.stateView, samples, new Float32Array([2, -2]), 1);
+});
+
+test("overflow spanning uint32 wrap retains the newest capacity frames", () => {
+  const ring = createTestRingBuffer({ channels: 2, capacityFrames: 4,
+    readFrame: 2 ** 32 - 2, writeFrame: 2 ** 32 - 2 });
+  writePcmToRingBuffer(ring.stateView, ring.sampleView,
+    new Float32Array([1,-1,2,-2,3,-3,4,-4,5,-5,6,-6]), 6);
+  const left = new Float32Array(4), right = new Float32Array(4);
+  readStereoFromRingBuffer(ring.stateView, ring.sampleView, left, right);
+  assert.deepEqual([...left], [3,4,5,6]);
+  assert.deepEqual([...right], [-3,-4,-5,-6]);
+  assert.equal(Atomics.load(ring.stateView, STATE.READ_FRAME), 4);
+  assert.equal(Atomics.load(ring.stateView, STATE.OVERFLOW_COUNT), 1);
+});
+
+test("startup alignment never rewinds consumed audio or includes overwritten frames", () => {
+  const ring = createTestRingBuffer({ channels: 2, capacityFrames: 8,
+    framesPerBlock: 2, readFrame: 9, writeFrame: 10 });
+  assert.equal(alignReadCursor(ring.stateView), 9);
+  Atomics.store(ring.stateView, STATE.READ_FRAME, 0);
+  assert.equal(alignReadCursor(ring.stateView, { targetBlocks: 20 }), 2);
+});
+
+test("a non-overflowing write during render preserves audio and cursor progress", () => {
+  const ring = createTestRingBuffer({ channels: 2, capacityFrames: 8, writeFrame: 2 });
+  ring.sampleView.set([1, -1, 2, -2]);
+  let interleaved = false;
+  const samples = new Proxy(ring.sampleView, {
+    get(target, key) {
+      if (key === "0" && !interleaved) {
+        interleaved = true;
+        writePcmToRingBuffer(ring.stateView, target, new Float32Array([3, -3]), 1);
+      }
+      return Reflect.get(target, key);
+    },
+  });
+  const left = new Float32Array(2), right = new Float32Array(2);
+  readStereoFromRingBuffer(ring.stateView, samples, left, right);
+  assert.equal(interleaved, true);
+  assert.deepEqual([...left], [1, 2]);
+  assert.deepEqual([...right], [-1, -2]);
+  assert.equal(Atomics.load(ring.stateView, STATE.READ_FRAME), 2);
+  assert.equal(Atomics.load(ring.stateView, STATE.UNDERRUN_COUNT), 0);
+});
+
+test("render during an unfinished overwrite stays silent until the write commits", () => {
+  const ring = createTestRingBuffer({ channels: 2, capacityFrames: 4, writeFrame: 4 });
+  ring.sampleView.fill(99);
+  let renders = 0;
+  const samples = new Proxy(ring.sampleView, {
+    get(target, key) {
+      if (key !== "set") return Reflect.get(target, key);
+      return (...args) => {
+        renders++;
+        const left = new Float32Array([99]), right = new Float32Array([99]);
+        readStereoFromRingBuffer(ring.stateView, target, left, right);
+        assert.deepEqual([...left, ...right], [0, 0]);
+        assert.equal(Atomics.load(ring.stateView, STATE.READ_FRAME), 0);
+        return target.set(...args);
+      };
+    },
+  });
+  writePcmToRingBuffer(ring.stateView, samples, new Float32Array([5,-5,6,-6,7,-7,8,-8]), 4);
+  assert.equal(renders, 4);
+  const left = new Float32Array(4), right = new Float32Array(4);
+  readStereoFromRingBuffer(ring.stateView, ring.sampleView, left, right);
+  assert.deepEqual([...left], [5,6,7,8]);
+  assert.equal(Atomics.load(ring.stateView, STATE.READ_FRAME), 8);
+});
