@@ -375,6 +375,9 @@ function inspectChunks(manifest, errors, warnings) {
       fullBlockMetadata = false;
       continue;
     }
+    if (chunk.closeError) {
+      errors.push(`${prefix} failed to close; audio in this chunk is uncommitted.`);
+    }
     const frames = finiteNumberOrNull(chunk.frames);
     const bytes = finiteNumberOrNull(chunk.bytes);
     const blocksRecorded = finiteNumberOrNull(chunk.blocksRecorded);

@@ -18,6 +18,7 @@ export class PcmRecorder {
     this.currentChunk = null;
     this.state = "idle";
     this.writeChain = Promise.resolve();
+    this.lifecycleChain = Promise.resolve();
     this.pendingWriteBlocks = 0;
     this.pendingWriteBytes = 0;
     this.writeBacklogHighWaterBlocks = 0;
@@ -47,7 +48,40 @@ export class PcmRecorder {
     }
   }
 
-  async start(streamInfo) {
+  enqueueLifecycle(action) {
+    const result = this.lifecycleChain.then(action);
+    // A rejected action must not prevent later stop/reset/start requests.
+    this.lifecycleChain = result.catch(() => {});
+    return result;
+  }
+
+  start(streamInfo) {
+    return this.enqueueLifecycle(async () => {
+      try {
+        await this.startNow(streamInfo);
+      } catch (error) {
+        this.state = this.session ? "error" : "idle";
+        this.setError(`Failed to start recording: ${error.message}`);
+        if (this.session) {
+          this.session.state = "error";
+          await this.writeManifestToStorage().catch(() => {});
+          await this.updateIndexSession("error").catch(() => {});
+        }
+        this.postStatus(true);
+        throw error;
+      }
+    });
+  }
+
+  stop() {
+    return this.enqueueLifecycle(() => this.stopNow());
+  }
+
+  clear(options) {
+    return this.enqueueLifecycle(() => this.clearNow(options));
+  }
+
+  async startNow(streamInfo) {
     if (!streamInfo) {
       this.setError("Cannot start recording before the stream is configured");
       return;
@@ -56,13 +90,13 @@ export class PcmRecorder {
       return;
     }
 
-    await this.clear({ silent: true });
+    await this.clearNow({ silent: true });
     this.root = await this.openStorageRoot();
     const persisted = await requestPersistentStorage();
     const counters = this.readCounters();
     const nativeStats = this.currentNativeInputStats();
     const now = new Date().toISOString();
-    const sessionId = `native-pcm-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+    const sessionId = `native-pcm-${now.replace(/[:.]/g, "-")}-${crypto.randomUUID()}`;
 
     this.session = {
       type: "opendaw-native-audio-poc-recording",
@@ -131,7 +165,7 @@ export class PcmRecorder {
     this.postStatus(true);
   }
 
-  async stop() {
+  async stopNow() {
     if (this.state !== "recording") {
       return;
     }
@@ -149,7 +183,8 @@ export class PcmRecorder {
       }
       this.postStatus(true);
       await this.writeChain.catch(() => {});
-      await this.closeCurrentChunk({ allowCloseFailure: true });
+      if (this.state === "error") throw new Error(this.lastError);
+      await this.closeCurrentChunk();
       if (this.session) {
         this.session.state = "stopped";
         this.session.stoppedAt = new Date().toISOString();
@@ -162,6 +197,7 @@ export class PcmRecorder {
       this.state = "error";
       if (this.session) {
         this.session.state = "error";
+        this.session.stoppedAt = null;
         // Persist the terminal error state even if a previous stop manifest/index write partially succeeded.
         await this.writeManifestToStorage().catch(() => {});
         await this.updateIndexSession("error").catch(() => {});
@@ -170,9 +206,9 @@ export class PcmRecorder {
     this.postStatus(true);
   }
 
-  async clear({ silent = false } = {}) {
+  async clearNow({ silent = false } = {}) {
     if (this.state === "recording") {
-      await this.stop().catch((error) => {
+      await this.stopNow().catch((error) => {
         this.setError(`Failed to stop before clearing recording: ${error.message}`);
       });
     }
@@ -240,7 +276,7 @@ export class PcmRecorder {
       .then(() => this.writeBlockNow(block))
       .catch(async (error) => {
         this.setError(`Recording storage error: ${error.message}`);
-        if (this.state === "recording") {
+        if (this.state === "recording" || this.state === "stopping") {
           this.state = "error";
           if (this.session) {
             this.session.state = "error";
@@ -516,7 +552,11 @@ export class PcmRecorder {
     };
   }
 
-  async deleteRecoveredSession(sessionId) {
+  deleteRecoveredSession(sessionId) {
+    return this.enqueueLifecycle(() => this.deleteRecoveredSessionNow(sessionId));
+  }
+
+  async deleteRecoveredSessionNow(sessionId) {
     if (
       this.session?.sessionId === sessionId &&
       (this.state === "recording" || this.state === "stopping")
@@ -756,17 +796,18 @@ export class PcmRecorder {
       return;
     }
     const chunk = this.currentChunk;
-    this.currentChunk = null;
     try {
       await chunk.writable.close();
     } catch (error) {
+      chunk.closeError = error.message;
       this.setError(`Failed to close recording chunk ${chunk.fileName}: ${error.message}`);
-      if (!allowCloseFailure) {
-        this.currentChunk = chunk;
-        throw error;
-      }
+      // Keep the handle and incomplete metadata until explicit cleanup.
+      if (!allowCloseFailure) throw error;
+      return;
     }
+    this.currentChunk = null;
     chunk.completedAt = new Date().toISOString();
+    delete chunk.closeError;
     delete chunk.writable;
     if (chunk.frames === 0) {
       await removeEntry(this.root, chunk.fileName);
@@ -1176,7 +1217,7 @@ async function buildRecoveredSession({
   let state = "orphan";
   if (activeInMemory) {
     state = "active";
-  } else if (manifestParseError) {
+  } else if (manifestParseError || manifestState === "error") {
     state = "error";
   } else if (originalStoppedAt || manifestState === "stopped") {
     state = "stopped";
@@ -1192,7 +1233,7 @@ async function buildRecoveredSession({
     });
   }
 
-  const missingChunks = validatedChunks.filter((chunk) => !chunk.present);
+  const missingChunks = validatedChunks.filter((chunk) => !chunk.present && !chunk.ignoredForWav);
   const invalidChunks = validatedChunks.filter(
     (chunk) => chunk.present && !chunk.validForWav && !chunk.ignoredForWav,
   );
@@ -1264,6 +1305,14 @@ async function validateRecoveredChunk({ root, fileName, channels, manifestChunk,
     ignoredForWav: false,
     warnings: [],
   };
+
+  if (manifestChunk?.closeError) {
+    chunk.ignoredForWav = true;
+    addChunkWarning(chunk, warnings, "chunk-close-failed",
+      `Chunk ${fileName} did not close successfully; excluding uncommitted audio.`,
+      { fatal: false });
+    return chunk;
+  }
 
   try {
     const handle = await root.getFileHandle(fileName);
