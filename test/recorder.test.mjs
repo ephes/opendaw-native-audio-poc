@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 
 import { PcmRecorder } from "../public/recorder.js";
 
@@ -74,7 +74,7 @@ function createRecorder({ postMessage = () => {} } = {}) {
 }
 
 // Each fixture owns its OPFS map; no browser, storage, or device is used.
-import { barrier, memoryStorage, record, stream } from "./fixtures/opfs.mjs";
+import { barrier, memoryLocks, memoryStorage, record, stream } from "./fixtures/opfs.mjs";
 
 function storedRecorder(root = memoryStorage()) {
   const recorder = createRecorder();
@@ -292,3 +292,283 @@ test("start can retry after an initial manifest commit fails", async () => {
   assert.equal(recorder.state, "stopped");
   assert.equal(recorder.session.recordedBlocks, 1);
 });
+
+function navigatorProperty(t, key, value) {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, key);
+  Object.defineProperty(navigator, key, { configurable: true, value });
+  t.after(() => {
+    if (descriptor) Object.defineProperty(navigator, key, descriptor);
+    else delete navigator[key];
+  });
+}
+
+beforeEach((t) => navigatorProperty(t, "locks", memoryLocks()));
+
+function pauseIndexRead(recorder) {
+  const entered = barrier(), resume = barrier();
+  const read = recorder.readIndex.bind(recorder);
+  let paused = false;
+  recorder.readIndex = async () => {
+    const result = await read();
+    if (!paused) { paused = true; entered.release(); await resume.promise; }
+    return result;
+  };
+  return { entered, resume };
+}
+
+test("independent recorder index additions reload under an origin-wide lock", async () => {
+  const root = memoryStorage();
+  const a = storedRecorder(root).recorder, b = storedRecorder(root).recorder;
+  const { entered, resume } = pauseIndexRead(a);
+  const first = a.start(stream);
+  await entered.promise;
+  const second = b.start(stream);
+  await turn();
+  resume.release();
+  await Promise.all([first, second]);
+  const { index } = await a.readIndex();
+  assert.deepEqual(Object.keys(index.sessions).sort(), [a.session.sessionId, b.session.sessionId].sort());
+});
+
+test("an index update cannot resurrect a concurrently deleted entry", async () => {
+  const root = memoryStorage();
+  const a = storedRecorder(root).recorder, b = storedRecorder(root).recorder;
+  await a.start(stream); await a.stop();
+  await b.start(stream); await b.stop();
+  const { entered, resume } = pauseIndexRead(a);
+  const update = a.updateIndexSession("stopped");
+  await entered.promise;
+  const deletion = b.deleteIndexSession(b.session.sessionId);
+  await turn();
+  resume.release();
+  await Promise.all([update, deletion]);
+  const { index } = await a.readIndex();
+  assert.deepEqual(Object.keys(index.sessions), [a.session.sessionId]);
+});
+
+test("a failed index commit releases its lock for another recorder", async () => {
+  const root = memoryStorage();
+  const a = storedRecorder(root).recorder, b = storedRecorder(root).recorder;
+  await a.start(stream); await a.stop();
+  const original = root.beforeClose;
+  root.beforeClose = async (name) => {
+    if (name === "native-pcm-recordings-index.json") {
+      root.beforeClose = original;
+      throw new Error("synthetic index commit failure");
+    }
+  };
+  await assert.rejects(a.updateIndexSession("stopped"), /synthetic index commit failure/);
+  await b.start(stream);
+  const { index } = await b.readIndex();
+  assert.deepEqual(Object.keys(index.sessions).sort(), [a.session.sessionId, b.session.sessionId].sort());
+});
+
+test("missing Web Locks explicitly refuses an unprotected index mutation", async (t) => {
+  Object.defineProperty(navigator, "locks", { configurable: true, value: undefined });
+  const { recorder, root } = storedRecorder();
+  await assert.rejects(recorder.start(stream), /Web Locks.*unavailable/);
+  assert.equal(root.files.has("native-pcm-recordings-index.json"), false);
+});
+
+for (const transition of ["reset", "start", "delete"]) {
+  test(`WAV export retains its session while ${transition} waits for file reads`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    await recorder.start(stream); await record(recorder); await recorder.stop();
+    const oldId = recorder.session.sessionId;
+    const entered = barrier(), resume = barrier();
+    const getHandle = root.getFileHandle.bind(root);
+    let paused = false;
+    root.getFileHandle = async (name, options) => {
+      const handle = await getHandle(name, options);
+      if (name.endsWith(".f32") && !paused) {
+        const getFile = handle.getFile.bind(handle);
+        handle.getFile = async () => { paused = true; const file = await getFile(); entered.release(); await resume.promise; return file; };
+      }
+      return handle;
+    };
+    const exporting = recorder.exportSelectedChannelWav(0);
+    await entered.promise;
+    const action = transition === "reset" ? recorder.clear()
+      : transition === "start" ? recorder.start(stream) : recorder.deleteRecoveredSession(oldId);
+    let finished = false;
+    action.then(() => { finished = true; });
+    await turn();
+    try { assert.equal(finished, false); } finally { resume.release(); }
+    const [wav] = await Promise.all([exporting, action]);
+    assert.equal(wav.filename, `${oldId}-ch01.wav`);
+    const buffer = await wav.blob.arrayBuffer();
+    assert.equal(new DataView(buffer).getUint32(40, true), 8);
+    assert.deepEqual([...new Float32Array(buffer, 44)], [0.25, 0.75]);
+  });
+}
+
+test("manifest export holds its session until serialization finishes", async () => {
+  const { recorder, root } = storedRecorder();
+  await recorder.start(stream); await record(recorder); await recorder.stop();
+  const oldId = recorder.session.sessionId;
+  const entered = barrier(), resume = barrier();
+  root.beforeClose = async (name) => {
+    if (name.endsWith("-manifest.json")) { entered.release(); await resume.promise; }
+  };
+  const exporting = recorder.exportManifest();
+  await entered.promise;
+  const reset = recorder.clear();
+  let cleared = false;
+  reset.then(() => { cleared = true; });
+  await turn();
+  try { assert.equal(cleared, false); } finally { resume.release(); }
+  const [result] = await Promise.all([exporting, reset]);
+  assert.equal(result.filename, `${oldId}-manifest.json`);
+  const manifest = JSON.parse(await result.blob.text());
+  assert.equal(manifest.sessionId, oldId);
+  assert.equal(manifest.totalRecordedFrames, 2);
+});
+
+for (const format of ["wav", "manifest"]) {
+  test(`recovered ${format} export finishes before queued deletion`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    await recorder.start(stream); await record(recorder); await recorder.stop();
+    const oldId = recorder.session.sessionId;
+    const entered = barrier(), resume = barrier();
+    const getHandle = root.getFileHandle.bind(root);
+    let paused = false;
+    root.getFileHandle = async (name, options) => {
+      const handle = await getHandle(name, options);
+      if (name.endsWith("-manifest.json") && !paused) {
+        const getFile = handle.getFile.bind(handle);
+        handle.getFile = async () => {
+          paused = true; const file = await getFile(); entered.release(); await resume.promise; return file;
+        };
+      }
+      return handle;
+    };
+    const exporting = format === "wav" ? recorder.exportRecoveredSelectedChannelWav(oldId, 0)
+      : recorder.exportRecoveredManifest(oldId);
+    await entered.promise;
+    const deletion = recorder.deleteRecoveredSession(oldId);
+    let deleted = false;
+    deletion.then(() => { deleted = true; });
+    await turn();
+    try { assert.equal(deleted, false); } finally { resume.release(); }
+    const [result] = await Promise.all([exporting, deletion]);
+    assert.equal(result.filename, `${oldId}-recovered-${format === "wav" ? "ch01.wav" : "manifest.json"}`);
+    if (format === "wav") {
+      assert.deepEqual([...new Float32Array(await result.blob.arrayBuffer(), 44)], [0.25, 0.75]);
+    } else {
+      assert.equal(JSON.parse(await result.blob.text()).sessionId, oldId);
+    }
+  });
+}
+
+test("a rejected export releases the lifecycle queue for reset", async () => {
+  const { recorder } = storedRecorder();
+  await recorder.start(stream); await record(recorder); await recorder.stop();
+  await assert.rejects(recorder.exportSelectedChannelWav(99), /outside/);
+  await recorder.clear();
+  assert.equal(recorder.state, "idle");
+});
+
+for (const action of ["reset", "delete"]) {
+  test(`a corrupt discovery index does not strand ${action} or recreate deleted audio`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    await recorder.start(stream); await record(recorder); await recorder.stop();
+    const oldId = recorder.session.sessionId;
+    root.files.set("native-pcm-recordings-index.json", new TextEncoder().encode("synthetic invalid index"));
+    if (action === "reset") await recorder.clear();
+    else await recorder.deleteRecoveredSession(oldId);
+    assert.equal(recorder.state, "idle");
+    assert.equal([...root.files.keys()].some((name) => name.startsWith(oldId)), false);
+    await recorder.start(stream);
+    assert.equal(root.files.has(`${oldId}-manifest.json`), false);
+  });
+}
+
+for (const action of ["reset", "delete"]) {
+  test(`missing locks refuse ${action} before removing session artifacts`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    await recorder.start(stream); await record(recorder); await recorder.stop();
+    const files = new Map(root.files);
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined });
+    await assert.rejects(action === "reset" ? recorder.clear()
+      : recorder.deleteRecoveredSession(recorder.session.sessionId), /Web Locks.*unavailable/);
+    assert.equal(recorder.state, "stopped");
+    assert.deepEqual(root.files, files);
+  });
+}
+
+for (const format of ["wav", "manifest"]) {
+  test(`recovered ${format} export during recording refuses before IO and cannot delay Stop`, async (t) => {
+    const root = memoryStorage();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    const old = storedRecorder(root).recorder, active = storedRecorder(root).recorder;
+    await old.start(stream); await record(old); await old.stop();
+    await active.start(stream); await record(active);
+    const resume = barrier();
+    let reads = 0, error;
+    const find = active.findRecoveredSession.bind(active);
+    active.findRecoveredSession = async (id) => { reads++; await resume.promise; return find(id); };
+    const exporting = (format === "wav" ? active.exportRecoveredSelectedChannelWav(old.session.sessionId, 0)
+      : active.exportRecoveredManifest(old.session.sessionId)).catch((caught) => { error = caught; });
+    const stopping = active.stop();
+    await turn();
+    const stateBeforeReadReleased = active.state;
+    resume.release();
+    await Promise.all([exporting, stopping]);
+    assert.equal(stateBeforeReadReleased, "stopped");
+    assert.equal(reads, 0);
+    assert.match(error?.message ?? "", /Stop recording before exporting recovery artifacts/);
+    assert.equal(active.session.totalRecordedFrames, 2);
+  });
+}
+
+test("an index write error aborts the writable and another recorder can proceed", async () => {
+  const root = memoryStorage();
+  const a = storedRecorder(root).recorder, b = storedRecorder(root).recorder;
+  await a.start(stream); await a.stop();
+  const getHandle = root.getFileHandle.bind(root);
+  let fail = true, aborted = 0;
+  root.getFileHandle = async (name, options) => {
+    const handle = await getHandle(name, options);
+    if (name === "native-pcm-recordings-index.json" && fail) {
+      const create = handle.createWritable.bind(handle);
+      handle.createWritable = async () => ({
+        ...await create(),
+        async write() { fail = false; throw new Error("synthetic index write failure"); },
+        async abort() { aborted++; },
+      });
+    }
+    return handle;
+  };
+  await assert.rejects(a.updateIndexSession("stopped"), /synthetic index write failure/);
+  assert.equal(aborted, 1);
+  await b.start(stream);
+  assert.equal(Object.keys((await b.readIndex()).index.sessions).length, 2);
+});
+
+for (const failure of ["lock", "index"]) {
+  test(`a failed Start ${failure} step preserves the previous stopped recording`, async () => {
+    const { recorder, root } = storedRecorder();
+    await recorder.start(stream); await record(recorder); await recorder.stop();
+    const previousSession = recorder.session;
+    const files = new Map(root.files);
+    const locks = navigator.locks;
+    if (failure === "lock") Object.defineProperty(navigator, "locks", { configurable: true, value: undefined });
+    else root.beforeClose = async (name) => {
+      if (name === "native-pcm-recordings-index.json") throw new Error("synthetic index failure");
+    };
+    await assert.rejects(recorder.start(stream), /Web Locks|synthetic index failure/);
+    assert.equal(recorder.session, previousSession);
+    assert.equal(recorder.state, "stopped");
+    assert.equal(recorder.session.state, "stopped");
+    assert.deepEqual(root.files, files);
+    Object.defineProperty(navigator, "locks", { configurable: true, value: locks });
+    root.beforeClose = undefined;
+    await recorder.start(stream);
+    assert.equal(recorder.state, "recording");
+    assert.notEqual(recorder.session, previousSession);
+  });
+}

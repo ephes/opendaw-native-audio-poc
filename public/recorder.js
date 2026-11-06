@@ -57,12 +57,16 @@ export class PcmRecorder {
 
   start(streamInfo) {
     return this.enqueueLifecycle(async () => {
+      const previousSession = this.session;
       try {
         await this.startNow(streamInfo);
       } catch (error) {
-        this.state = this.session ? "error" : "idle";
+        const failedNewSession = this.session && this.session !== previousSession;
+        if (failedNewSession || !this.session) {
+          this.state = this.session ? "error" : "idle";
+        }
         this.setError(`Failed to start recording: ${error.message}`);
-        if (this.session) {
+        if (failedNewSession) {
           this.session.state = "error";
           await this.writeManifestToStorage().catch(() => {});
           await this.updateIndexSession("error").catch(() => {});
@@ -219,8 +223,8 @@ export class PcmRecorder {
     if (this.root && this.session) {
       const fileNames = this.session.chunks.map((chunk) => chunk.fileName);
       fileNames.push(this.manifestFileName());
-      await Promise.all(fileNames.map((fileName) => removeEntry(this.root, fileName)));
       await this.deleteIndexSession(this.session.sessionId);
+      await Promise.all(fileNames.map((fileName) => removeEntry(this.root, fileName)));
     }
     this.session = null;
     this.currentChunk = null;
@@ -355,7 +359,11 @@ export class PcmRecorder {
     this.postStatus(true);
   }
 
-  async exportManifest() {
+  exportManifest() {
+    return this.enqueueLifecycle(() => this.exportManifestNow());
+  }
+
+  async exportManifestNow() {
     if (!this.session) {
       throw new Error("No recording manifest is available");
     }
@@ -364,14 +372,19 @@ export class PcmRecorder {
     }
     await this.writeChain;
     await this.writeManifestToStorage();
-    const json = JSON.stringify(this.buildManifest(), null, 2);
+    const manifest = this.buildManifest();
+    const json = JSON.stringify(manifest, null, 2);
     return {
-      filename: `${this.session.sessionId}-manifest.json`,
+      filename: `${manifest.sessionId}-manifest.json`,
       blob: new Blob([json], { type: "application/json" }),
     };
   }
 
-  async exportSelectedChannelWav(channelIndex) {
+  exportSelectedChannelWav(channelIndex) {
+    return this.enqueueLifecycle(() => this.exportSelectedChannelWavNow(channelIndex));
+  }
+
+  async exportSelectedChannelWavNow(channelIndex) {
     if (!this.session) {
       throw new Error("No recording is available for WAV export");
     }
@@ -382,14 +395,16 @@ export class PcmRecorder {
       throw new Error(`Channel ${channelIndex + 1} is outside the recorded channel range`);
     }
     await this.writeChain;
+    const session = this.buildManifest();
+    const root = this.root;
 
     const channelParts = [];
-    for (const chunk of this.session.chunks) {
-      const fileHandle = await this.root.getFileHandle(chunk.fileName);
+    for (const chunk of session.chunks) {
+      const fileHandle = await root.getFileHandle(chunk.fileName);
       const file = await fileHandle.getFile();
       const buffer = await file.arrayBuffer();
       const samples = new Float32Array(buffer);
-      const expectedSamples = chunk.frames * this.session.channels;
+      const expectedSamples = chunk.frames * session.channels;
       if (samples.length !== expectedSamples) {
         throw new Error(
           `Chunk ${chunk.fileName} has ${samples.length} samples, expected ${expectedSamples}`,
@@ -398,19 +413,19 @@ export class PcmRecorder {
       const channelSamples = extractChannel(
         samples,
         channelIndex,
-        this.session.channels,
+        session.channels,
         chunk.frames,
       );
       channelParts.push(channelSamples);
     }
 
     const blob = createMonoFloat32WavBlob({
-      sampleRate: this.session.sampleRate,
-      totalFrames: this.session.totalRecordedFrames,
+      sampleRate: session.sampleRate,
+      totalFrames: session.totalRecordedFrames,
       channelParts,
     });
     return {
-      filename: `${this.session.sessionId}-ch${String(channelIndex + 1).padStart(2, "0")}.wav`,
+      filename: `${session.sessionId}-ch${String(channelIndex + 1).padStart(2, "0")}.wav`,
       blob,
     };
   }
@@ -464,7 +479,14 @@ export class PcmRecorder {
     };
   }
 
-  async exportRecoveredManifest(sessionId) {
+  exportRecoveredManifest(sessionId) {
+    return this.enqueueLifecycle(() => this.exportRecoveredManifestNow(sessionId));
+  }
+
+  async exportRecoveredManifestNow(sessionId) {
+    if (this.state === "recording" || this.state === "stopping") {
+      throw new Error("Stop recording before exporting recovery artifacts");
+    }
     const session = await this.findRecoveredSession(sessionId);
     if (session.activeInMemory || session.openInMemory) {
       throw new Error("Stop or reset the active recording before exporting recovery artifacts");
@@ -514,7 +536,14 @@ export class PcmRecorder {
     };
   }
 
-  async exportRecoveredSelectedChannelWav(sessionId, channelIndex) {
+  exportRecoveredSelectedChannelWav(sessionId, channelIndex) {
+    return this.enqueueLifecycle(() => this.exportRecoveredSelectedChannelWavNow(sessionId, channelIndex));
+  }
+
+  async exportRecoveredSelectedChannelWavNow(sessionId, channelIndex) {
+    if (this.state === "recording" || this.state === "stopping") {
+      throw new Error("Stop recording before exporting recovery artifacts");
+    }
     const session = await this.findRecoveredSession(sessionId);
     if (session.activeInMemory || session.openInMemory) {
       throw new Error("Stop or reset the active recording before exporting recovery artifacts");
@@ -526,9 +555,10 @@ export class PcmRecorder {
       throw new Error(`Channel ${channelIndex + 1} is outside the recovered channel range`);
     }
 
+    const root = this.root;
     const channelParts = [];
     for (const chunk of session.chunks.filter((entry) => entry.validForWav)) {
-      const fileHandle = await this.root.getFileHandle(chunk.fileName);
+      const fileHandle = await root.getFileHandle(chunk.fileName);
       const file = await fileHandle.getFile();
       if (file.size !== chunk.bytes) {
         throw new Error(`Chunk ${chunk.fileName} changed during export`);
@@ -591,8 +621,8 @@ export class PcmRecorder {
       }
     }
 
-    await Promise.all([...fileNames].map((fileName) => removeEntry(this.root, fileName)));
     await this.deleteIndexSession(sessionId);
+    await Promise.all([...fileNames].map((fileName) => removeEntry(this.root, fileName)));
     if (this.session?.sessionId === sessionId) {
       this.session = null;
       this.currentChunk = null;
@@ -950,6 +980,18 @@ export class PcmRecorder {
     }
   }
 
+  async mutateIndex(change) {
+    const locks = globalThis.navigator?.locks;
+    if (!locks?.request) {
+      throw new Error("Web Locks API is unavailable; cannot safely update the shared recording index");
+    }
+    return locks.request(INDEX_FILE_NAME, async () => {
+      const { index } = await this.readIndex();
+      change(index);
+      await this.writeIndex(index);
+    });
+  }
+
   async writeIndex(index) {
     if (!this.root) {
       return;
@@ -957,17 +999,22 @@ export class PcmRecorder {
     index.updatedAt = new Date().toISOString();
     const handle = await this.root.getFileHandle(INDEX_FILE_NAME, { create: true });
     const writable = await handle.createWritable();
-    await writable.write(JSON.stringify(index, null, 2));
-    await writable.close();
+    try {
+      await writable.write(JSON.stringify(index, null, 2));
+      await writable.close();
+    } catch (error) {
+      try { await writable.abort(); } catch { /* Preserve the original write failure. */ }
+      throw error;
+    }
   }
 
   async updateIndexSession(state) {
     if (!this.root || !this.session) {
       return;
     }
-    const { index } = await this.readIndex();
     const now = new Date().toISOString();
-    index.sessions[this.session.sessionId] = {
+    const sessionId = this.session.sessionId;
+    const entry = {
       sessionId: this.session.sessionId,
       state,
       startedAt: this.session.startedAt,
@@ -984,16 +1031,14 @@ export class PcmRecorder {
       totalRecordedBytes: this.session.chunks.reduce((total, chunk) => total + chunk.bytes, 0),
       updatedAt: now,
     };
-    await this.writeIndex(index);
+    await this.mutateIndex((index) => { index.sessions[sessionId] = entry; });
   }
 
   async deleteIndexSession(sessionId) {
     if (!this.root) {
       return;
     }
-    const { index } = await this.readIndex();
-    delete index.sessions[sessionId];
-    await this.writeIndex(index);
+    await this.mutateIndex((index) => { delete index.sessions[sessionId]; });
   }
 
   postStatus(force = false) {

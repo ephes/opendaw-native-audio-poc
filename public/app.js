@@ -398,6 +398,7 @@ function renderRecordingStatus() {
   els.exportWav.disabled = !canExport;
   els.wavChannel.disabled = !connected || !canExport;
   els.connect.disabled = recorderBusy || !window.crossOriginIsolated;
+  updateRecoveryControls();
 }
 
 function scanRecovery() {
@@ -443,26 +444,7 @@ function renderRecovery() {
         : "No recovery scan has run.";
   els.recoverySummary.textContent = scanState;
 
-  const canUseSelected = Boolean(session);
-  const selectedActive = session?.state === "active";
-  const selectedOpenInMemory = Boolean(session?.openInMemory);
-  els.recoverySession.disabled = sessions.length === 0 || recoveryScanPending;
-  els.recoveryRefresh.disabled = recoveryScanPending;
-  els.recoveryExportManifest.disabled =
-    !canUseSelected || selectedActive || selectedOpenInMemory || recoveryScanPending;
-  els.recoveryExportWav.disabled =
-    !canUseSelected ||
-    selectedActive ||
-    selectedOpenInMemory ||
-    !session.exportableWav ||
-    recoveryScanPending;
-  els.recoveryWavChannel.disabled =
-    !canUseSelected ||
-    selectedActive ||
-    selectedOpenInMemory ||
-    !session.exportableWav ||
-    recoveryScanPending;
-  els.recoveryDelete.disabled = !canUseSelected || selectedActive || recoveryScanPending;
+  updateRecoveryControls(session);
 
   if (!session) {
     els.recoveryDetails.replaceChildren();
@@ -512,6 +494,33 @@ function renderRecovery() {
   }
 
   els.recoveryDetails.replaceChildren(details, warnings);
+}
+
+function updateRecoveryControls(session = selectedRecoverySession()) {
+  const canUseSelected = Boolean(session);
+  const selectedActive = session?.state === "active";
+  const recordingActive = recordingStartPending ||
+    recordingStatus?.state === "recording" || recordingStatus?.state === "stopping";
+  const selectedOpenInMemory = Boolean(session?.openInMemory);
+  els.recoverySession.disabled = !(recoveryResult?.sessions?.length) || recoveryScanPending;
+  els.recoveryRefresh.disabled = recoveryScanPending;
+  els.recoveryExportManifest.disabled =
+    !canUseSelected || recordingActive || selectedActive || selectedOpenInMemory || recoveryScanPending;
+  els.recoveryExportWav.disabled =
+    !canUseSelected ||
+    recordingActive ||
+    selectedActive ||
+    selectedOpenInMemory ||
+    !session.exportableWav ||
+    recoveryScanPending;
+  els.recoveryWavChannel.disabled =
+    !canUseSelected ||
+    recordingActive ||
+    selectedActive ||
+    selectedOpenInMemory ||
+    !session.exportableWav ||
+    recoveryScanPending;
+  els.recoveryDelete.disabled = !canUseSelected || selectedActive || recoveryScanPending;
 }
 
 function recoveryMetric(label, value) {
