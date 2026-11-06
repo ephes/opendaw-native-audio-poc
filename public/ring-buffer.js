@@ -14,6 +14,7 @@ export const STATE = {
   SAMPLE_RATE: 7,
   FRAMES_PER_BLOCK: 8,
   RECEIVED_BLOCKS: 9,
+  RESERVED_WRITE_FRAME: 10,
 };
 
 export function createRingBufferViews(
@@ -35,9 +36,12 @@ export function alignReadCursor(
   stateView,
   { targetBlocks = 3, fallbackFramesPerBlock = DEFAULT_FRAMES_PER_BLOCK } = {},
 ) {
-  const writeFrame = Atomics.load(stateView, STATE.WRITE_FRAME);
+  const writeFrame = Atomics.load(stateView, STATE.WRITE_FRAME) >>> 0;
   const framesPerBlock = Atomics.load(stateView, STATE.FRAMES_PER_BLOCK) || fallbackFramesPerBlock;
-  const readFrame = Math.max(0, writeFrame - framesPerBlock * targetBlocks);
+  const capacity = Atomics.load(stateView, STATE.CAPACITY_FRAMES);
+  const currentRead = Atomics.load(stateView, STATE.READ_FRAME) >>> 0;
+  const behind = Math.min((writeFrame - currentRead) >>> 0, capacity, framesPerBlock * targetBlocks);
+  const readFrame = (writeFrame - behind) >>> 0;
   Atomics.store(stateView, STATE.READ_FRAME, readFrame);
   return readFrame;
 }
@@ -52,14 +56,22 @@ export function readStereoFromRingBuffer(
 ) {
   const channels = Atomics.load(stateView, STATE.CHANNELS);
   const capacityFrames = Atomics.load(stateView, STATE.CAPACITY_FRAMES);
-  let readFrame = Atomics.load(stateView, STATE.READ_FRAME);
-  const writeFrame = Atomics.load(stateView, STATE.WRITE_FRAME);
+  const originalRead = Atomics.load(stateView, STATE.READ_FRAME) >>> 0;
+  let readFrame = originalRead;
+  const writeFrame = Atomics.load(stateView, STATE.WRITE_FRAME) >>> 0;
   const clampedLeft = Math.min(leftChannel, channels - 1);
   const clampedRight = Math.min(rightChannel, channels - 1);
   let underrun = false;
 
+  // Only the consumer owns READ_FRAME. Catch up after overflow without
+  // allowing the producer to race a consumer cursor commit.
+  if (((writeFrame - readFrame) >>> 0) > capacityFrames) {
+    readFrame = (writeFrame - capacityFrames) >>> 0;
+  }
+
+  const firstRead = readFrame;
   for (let index = 0; index < leftOut.length; index += 1) {
-    if (readFrame >= writeFrame) {
+    if (readFrame === writeFrame) {
       leftOut[index] = 0;
       rightOut[index] = 0;
       underrun = true;
@@ -70,7 +82,18 @@ export function readStereoFromRingBuffer(
     const offset = ringFrame * channels;
     leftOut[index] = sampleView[offset + clampedLeft] || 0;
     rightOut[index] = sampleView[offset + clampedRight] || 0;
-    readFrame += 1;
+    readFrame = (readFrame + 1) >>> 0;
+  }
+
+  // The producer reserves its write range before touching PCM. Only
+  // overlapping writes invalidate copied audio; unrelated writes must not
+  // insert silence or delay cursor progress. Never retry on the realtime thread.
+  const reservedEnd = Atomics.load(stateView, STATE.RESERVED_WRITE_FRAME) >>> 0;
+  if (((reservedEnd - firstRead) >>> 0) > capacityFrames) {
+    leftOut.fill(0);
+    rightOut.fill(0);
+    readFrame = originalRead;
+    underrun = true;
   }
 
   if (underrun) {
@@ -83,4 +106,26 @@ export function readStereoFromRingBuffer(
     writeFrame,
     underrun,
   };
+}
+
+export function writePcmToRingBuffer(stateView, sampleView, samples, frameCount) {
+  const channels = Atomics.load(stateView, STATE.CHANNELS);
+  const capacityFrames = Atomics.load(stateView, STATE.CAPACITY_FRAMES);
+  const writeFrame = Atomics.load(stateView, STATE.WRITE_FRAME) >>> 0;
+  const readFrame = Atomics.load(stateView, STATE.READ_FRAME) >>> 0;
+  const available = (writeFrame - readFrame) >>> 0;
+
+  if (available + frameCount > capacityFrames) {
+    Atomics.add(stateView, STATE.OVERFLOW_COUNT, 1);
+  }
+
+  Atomics.store(stateView, STATE.RESERVED_WRITE_FRAME, writeFrame + frameCount);
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    const ringFrame = ((writeFrame + frame) >>> 0) % capacityFrames;
+    const ringOffset = ringFrame * channels;
+    const inputOffset = frame * channels;
+    sampleView.set(samples.subarray(inputOffset, inputOffset + channels), ringOffset);
+  }
+
+  Atomics.store(stateView, STATE.WRITE_FRAME, writeFrame + frameCount);
 }

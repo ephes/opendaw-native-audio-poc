@@ -306,7 +306,9 @@ sample rates: 48000..48000 Hz
 
 `--channels 12` correctly fails because cpal reports the device as exactly 14 input channels, not 12. `--channels 14 --sample-rate 48000` opens successfully and streams interleaved Float32 PCM to the browser test page.
 
-Manual browser check: connecting the page and starting monitor playback produced audible local microphone monitoring from the L-12 input. The monitor path intentionally starts near the current write cursor so it does not play back the whole buffer accumulated before monitoring starts.
+Manual browser check: connecting the page and starting monitor playback produced audible local microphone monitoring from the L-12 input. Monitor cursors use unsigned 32-bit modular distances and a power-of-two ring capacity, so signed and full-width cursor wrap preserve sample order. Only the AudioWorklet consumer advances the read cursor; overflow skips to the retained window on the next render. The producer publishes its reserved write range before copying PCM. The consumer silences a render quantum only if those writes could overwrite its samples; non-overlapping writes preserve playback and cursor progress. Overflow counts remain producer block events; a silenced or short quantum counts one underrun. Startup alignment stays within retained, unconsumed audio. Deterministic Node fixtures cover both wrap boundaries and writes interleaved with rendering; no endurance run is implied.
+
+The monitor path intentionally starts near the current write cursor so it does not play back the whole buffer accumulated before monitoring starts.
 
 15-minute browser soak check with the L-12 showed stable monitoring with `0` underruns, 14 meters active, and 23 overflows visible at the end of the run. Those overflows are consistent with ring-buffer fill before monitor playback starts, so monitor startup now resets underrun/overflow counters after aligning the read cursor.
 

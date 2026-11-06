@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { STATE, STATE_BYTES } from "../public/ring-buffer.js";
+import { readStereoFromRingBuffer, STATE, STATE_BYTES } from "../public/ring-buffer.js";
 
 // Exercise the actual worker message handler with synthetic sockets and PCM.
 test("superseded sockets cannot publish events or modify the current stream", async (t) => {
@@ -61,6 +61,20 @@ test("superseded sockets cannot publish events or modify the current stream", as
   assert.equal(state[STATE.RECEIVED_BLOCKS], 1);
   assert.equal(messages.length, count);
   assert.deepEqual([...samples.subarray(0, 4)], [0.25, -0.5, 0, 0]);
+  const capacity = state[STATE.CAPACITY_FRAMES];
+  assert.equal(2 ** 32 % capacity, 0);
+  for (const boundary of [2 ** 31, 2 ** 32]) {
+    Atomics.store(state, STATE.READ_FRAME, boundary - 1);
+    Atomics.store(state, STATE.WRITE_FRAME, boundary - 1);
+    Atomics.store(state, STATE.RESERVED_WRITE_FRAME, boundary - 1);
+    b.emit("message", pcm);
+    b.emit("message", pcm);
+    const left = new Float32Array(2), right = new Float32Array(2);
+    readStereoFromRingBuffer(state, samples, left, right);
+    assert.deepEqual([...left], [0.25, 0.25]);
+    assert.deepEqual([...right], [-0.5, -0.5]);
+    assert.equal(Atomics.load(state, STATE.READ_FRAME) >>> 0, (boundary + 1) >>> 0);
+  }
   b.emit("error");
   assert.deepEqual(messages.at(-1), { type: "socket-state", state: "error" });
   b.emit("close");
