@@ -146,7 +146,7 @@ The inspector checks the manifest stream shape, continuity arrays, chunk/block f
 
 WebSocket reconnects supersede the previous connection. Only the current socket may publish connection state, stream configuration, native input stats, errors, or PCM; delayed events from an old socket are ignored.
 
-Start, Stop, and Reset/Clear requests run in arrival order through one recorder lifecycle queue. Repeated Start while recording is a no-op; a failed request releases the queue so Reset or a later Start can proceed. PCM writes use a separate queue, which Stop drains before closing a chunk. A startup failure before session creation leaves the recorder idle so Start and Disconnect remain available. Once a session exists, startup failures persist an error manifest/index on a best-effort basis.
+Start, Stop, Reset/Clear, Delete Session, and all manifest/WAV exports run in arrival order through one recorder lifecycle queue per recorder. Exports hold that queue through file reads and serialization, using one session/root snapshot; subsequent reset/start/delete requests wait until the download Blob is complete. A failed export releases the queue. Independent tabs can still remove a session: file-read errors refuse export rather than constructing a partial WAV. Repeated Start while recording is a no-op; a failed request releases the queue so Reset or a later Start can proceed. PCM writes use a separate queue, which Stop drains before closing a chunk. A startup failure before session creation leaves the recorder idle so Start and Disconnect remain available. If the lock or index update fails during pre-start cleanup of a prior session, its state and manifest stay intact for retry and the error is reported. Artifact removal can still fail partway through cleanup; retry Reset/Clear or Start to finish removing that session. Once a session exists, startup failures persist an error manifest/index on a best-effort basis.
 
 Recording uses the Origin Private File System through `navigator.storage.getDirectory()`. Use a Chromium-class desktop browser for this slice. If OPFS is unavailable, recording refuses to arm and monitoring remains usable. The page asks the browser for persistent storage when recording starts, but the browser may still return `false`; long tests should be run in a profile with sufficient free disk space.
 
@@ -157,7 +157,7 @@ Raw size is substantial:
 20 minutes at 14 channels ~= 3.2 GB
 ```
 
-New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. The shared index is a discovery aid; recovery also scans artifact names directly.
+New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. Index read-modify-write operations use an origin-wide Web Locks API lock and reload the index while holding it, preserving unrelated sessions across tabs/workers. An unavailable Web Locks API refuses index mutations explicitly. Reset/Delete update the index before removing artifacts, so a lock or index-write failure preserves the session files for retry. As before, a malformed/unreadable discovery index produces scan warnings and uses an empty-index fallback on the next mutation; artifact scanning still discovers saved sessions. Failed writes abort their writable and release the lock for retry. The shared index is a discovery aid; recovery also scans artifact names directly.
 
 The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
 
@@ -200,7 +200,7 @@ Recovered manifests are explicit recovery artifacts. They include `recovered: tr
 
 Cleanly stopped prior sessions may also appear in OPFS Sessions after a reload. They can be exported through the recovery controls or deleted from OPFS. Delete only removes files whose names match the selected `native-pcm-*` session; it does not clear unrelated site data.
 
-While a recording is active or still has an open in-memory chunk, OPFS Sessions may list it for visibility but disables recovery manifest and WAV export until the recording is stopped or reset.
+While any recording is active or stopping, recovery manifest and WAV exports are refused in the recorder and disabled in the UI, including exports of older sessions. Stop therefore does not wait behind a large recovery export. A selected session with an open in-memory chunk also remains unavailable for recovery export until stopped or reset.
 
 For lower-latency browser monitoring, restart with a smaller block size, for example `just serve-l12 4545 240`. Smaller blocks reduce WebSocket aggregation and AudioWorklet target latency, but they increase message rate and should be re-tested for gaps, overflows, and backlog.
 
@@ -230,7 +230,7 @@ the job; its standard warnings are reported without failing the job. These check
 they require no microphone, recorded audio, Chrome, or OPFS access.
 Browser monitor smoke, real-device checks, and endurance/recording sessions
 remain separate manual checks. A passing CI job does not certify those paths.
-Run the same automated checks locally with `just test`.
+Run the same automated checks locally with `just test`. A synthetic page/Worker fixture checks that status updates preserve the selected recovery channel while updating export controls. In-memory OPFS and shared-lock fixtures exercise concurrent add/add and add/delete operations, lock release on write failure, and paused export reads with queued lifecycle actions; they use no persistent browser data.
 
 ## Verification
 

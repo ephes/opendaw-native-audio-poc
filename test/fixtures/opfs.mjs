@@ -47,3 +47,15 @@ export function record(recorder, frameStart = 0) {
   });
   return recorder.writeChain;
 }
+
+// Origin-shared exclusive lock fixture: rejected holders release the queue too.
+export function memoryLocks() {
+  const queues = new Map();
+  return {
+    request(name, callback) {
+      const result = (queues.get(name) ?? Promise.resolve()).then(() => callback({ name, mode: "exclusive" }));
+      queues.set(name, result.catch(() => {}));
+      return result;
+    },
+  };
+}
