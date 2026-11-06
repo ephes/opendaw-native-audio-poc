@@ -144,6 +144,10 @@ just inspect-recording ./native-pcm-...-manifest.json
 
 The inspector checks the manifest stream shape, continuity arrays, chunk/block frame and byte math, top-level frame/block totals, and native input drop deltas. It fails on gaps, overlaps, discontinuities, channel mismatches, invalid blocks, malformed chunk metadata, fatal recovery warnings, and native dropped callback buffers/frames/events when the zero-drop expectation is enabled. It reports monitor underruns/overflows, WebSocket lag events, monitor counter resets, and write-backlog high-water counters as warnings because those are browser/monitor observability signals rather than direct proof of native input loss.
 
+WebSocket reconnects supersede the previous connection. Only the current socket may publish connection state, stream configuration, native input stats, errors, or PCM; delayed events from an old socket are ignored.
+
+Start, Stop, and Reset/Clear requests run in arrival order through one recorder lifecycle queue. Repeated Start while recording is a no-op; a failed request releases the queue so Reset or a later Start can proceed. PCM writes use a separate queue, which Stop drains before closing a chunk. A startup failure before session creation leaves the recorder idle so Start and Disconnect remain available. Once a session exists, startup failures persist an error manifest/index on a best-effort basis.
+
 Recording uses the Origin Private File System through `navigator.storage.getDirectory()`. Use a Chromium-class desktop browser for this slice. If OPFS is unavailable, recording refuses to arm and monitoring remains usable. The page asks the browser for persistent storage when recording starts, but the browser may still return `false`; long tests should be run in a profile with sufficient free disk space.
 
 Raw size is substantial:
@@ -152,6 +156,8 @@ Raw size is substantial:
 14 channels * 48000 frames/s * 4 bytes = 2.688 MB/s
 20 minutes at 14 channels ~= 3.2 GB
 ```
+
+New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. The shared index is a discovery aid; recovery also scans artifact names directly.
 
 The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
 
@@ -187,6 +193,8 @@ After a reload, tab close, or browser failure before Stop Recording, reopen the 
 4. Export Recovery Manifest to download `<sessionId>-recovered-manifest.json`.
 5. Export Recovered WAV for one selected channel when the stream shape and required chunks validate.
 6. Delete Session to remove that session's OPFS manifest and chunks and its index entry.
+
+A failed chunk close ends the recording in `error` with no `stoppedAt`. The incomplete chunk keeps a null `completedAt`, a `closeError`, and its in-memory writable until explicit cleanup. The error manifest preserves earlier closed chunks. After reload, recovery excludes the failed chunk with a `chunk-close-failed` warning and can export the earlier committed chunks; it never labels the session a clean stop. The offline inspector rejects a live manifest containing `closeError` chunks.
 
 Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, native input stats from the original manifest when present, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing native input stats in an older manifest, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
 

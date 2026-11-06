@@ -473,3 +473,15 @@ function nativeStats() {
     receivedAt: "2026-05-03T10:00:00.000Z",
   };
 }
+
+
+test("inspectManifest rejects an uncommitted chunk after close failure", () => {
+  const manifest = createStoppedManifest();
+  manifest.state = "error";
+  manifest.stoppedAt = null;
+  manifest.chunks[0].completedAt = null;
+  manifest.chunks[0].closeError = "synthetic quota-close failure";
+  const result = inspectManifest(manifest, l12Options());
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join("\n"), /chunks\[0\].*failed to close.*uncommitted/);
+});

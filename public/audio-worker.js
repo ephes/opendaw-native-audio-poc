@@ -55,27 +55,35 @@ self.addEventListener("message", (event) => {
 
 function connect(url) {
   disconnect();
-  socket = new WebSocket(url);
+  const connection = new WebSocket(url);
+  socket = connection;
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
+    if (socket !== connection) return;
     postMessage({ type: "socket-state", state: "open" });
   });
   socket.addEventListener("close", () => {
+    if (socket !== connection) return;
     if (stateView) {
       Atomics.store(stateView, STATE.CONNECTED, 0);
     }
     postMessage({ type: "socket-state", state: "closed" });
   });
   socket.addEventListener("error", () => {
+    if (socket !== connection) return;
     postMessage({ type: "socket-state", state: "error" });
   });
-  socket.addEventListener("message", handleSocketMessage);
+  socket.addEventListener("message", (event) => {
+    if (socket !== connection) return;
+    handleSocketMessage(event);
+  });
 }
 
 function disconnect() {
   if (socket) {
-    socket.close();
+    const previous = socket;
     socket = null;
+    previous.close();
   }
   sharedBuffer = null;
   stateView = null;
