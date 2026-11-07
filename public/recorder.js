@@ -81,6 +81,22 @@ export class PcmRecorder {
     return this.enqueueLifecycle(() => this.stopNow());
   }
 
+  interrupt(reason) {
+    const sessionAtInterruption = this.session;
+    const counters = this.readCounters();
+    const nativeStats = this.currentNativeInputStats();
+    return this.enqueueLifecycle(() => {
+      const sameSession = this.session === sessionAtInterruption;
+      // A queued Start may create its session after transport loss. Its end
+      // counters equal its own baseline; pre-session traffic was never recorded.
+      return this.stopNow({
+        interruption: reason,
+        counters: sameSession ? counters : this.session?.counterBaselines,
+        nativeStats: sameSession ? nativeStats : this.session?.nativeInputStats.start,
+      });
+    });
+  }
+
   clear(options) {
     return this.enqueueLifecycle(() => this.clearNow(options));
   }
@@ -169,15 +185,15 @@ export class PcmRecorder {
     this.postStatus(true);
   }
 
-  async stopNow() {
+  async stopNow({ interruption = null, counters = null, nativeStats = null } = {}) {
     if (this.state !== "recording") {
       return;
     }
     try {
       this.state = "stopping";
-      const stopCounters = this.readCounters();
+      const stopCounters = counters ?? this.readCounters();
       if (this.session) {
-        const nativeStats = this.currentNativeInputStats();
+        nativeStats ??= this.currentNativeInputStats();
         this.session.state = "stopping";
         this.session.receivedBlocksAtStop = stopCounters.receivedBlocks;
         this.session.counterDeltasAtStop = this.counterDeltas(stopCounters);
@@ -190,12 +206,17 @@ export class PcmRecorder {
       if (this.state === "error") throw new Error(this.lastError);
       await this.closeCurrentChunk();
       if (this.session) {
-        this.session.state = "stopped";
-        this.session.stoppedAt = new Date().toISOString();
+        this.session.state = interruption ? "interrupted" : "stopped";
+        this.session.stoppedAt = interruption ? null : new Date().toISOString();
+        if (interruption) {
+          this.session.interruptedAt = new Date().toISOString();
+          this.session.interruption = interruption;
+          this.setError(interruption);
+        }
         await this.writeManifestToStorage();
-        await this.updateIndexSession("stopped");
+        await this.updateIndexSession(this.session.state);
       }
-      this.state = "stopped";
+      this.state = interruption ? "interrupted" : "stopped";
     } catch (error) {
       this.setError(`Failed to stop recording cleanly: ${error.message}`);
       this.state = "error";
@@ -323,7 +344,7 @@ export class PcmRecorder {
   }
 
   noteChannelMismatch({ frameStart, frameCount, expectedChannels, actualChannels }) {
-    if (!this.session) {
+    if (!this.session || (this.state !== "recording" && this.state !== "stopping")) {
       return;
     }
     this.session.integrity.channelMismatches.push({
@@ -337,7 +358,7 @@ export class PcmRecorder {
   }
 
   noteInvalidBlock(reason) {
-    if (!this.session) {
+    if (!this.session || (this.state !== "recording" && this.state !== "stopping")) {
       return;
     }
     this.session.integrity.invalidBlocks.push({
@@ -348,7 +369,7 @@ export class PcmRecorder {
   }
 
   noteWebSocketLag({ code, message }) {
-    if (!this.session) {
+    if (!this.session || (this.state !== "recording" && this.state !== "stopping")) {
       return;
     }
     this.session.integrity.websocketLagEvents.push({
@@ -678,7 +699,8 @@ export class PcmRecorder {
     }
 
     const started = Date.parse(this.session.startedAt);
-    const stopped = this.session.stoppedAt ? Date.parse(this.session.stoppedAt) : Date.now();
+    const endAt = this.session.stoppedAt ?? this.session.interruptedAt;
+    const stopped = endAt ? Date.parse(endAt) : Date.now();
     const bytes = this.session.chunks.reduce((total, chunk) => total + chunk.bytes, 0);
     const counterDeltas = this.session.counterDeltasAtStop ?? this.counterDeltas();
     const nativeInputDeltas = this.nativeInputDeltas();
@@ -1264,6 +1286,9 @@ async function buildRecoveredSession({
     state = "active";
   } else if (manifestParseError || manifestState === "error") {
     state = "error";
+  } else if (manifestState === "interrupted") {
+    state = "interrupted";
+    warnings.push({ code: "transport-interrupted", message: manifest?.interruption ?? "WebSocket transport interrupted recording." });
   } else if (originalStoppedAt || manifestState === "stopped") {
     state = "stopped";
   } else if (manifest || indexEntry) {
@@ -1302,6 +1327,7 @@ async function buildRecoveredSession({
     startedAt: manifest?.startedAt ?? indexEntry?.startedAt ?? null,
     updatedAt: latestTimestamp([
       manifest?.stoppedAt,
+      manifest?.interruptedAt,
       manifest?.startedAt,
       indexEntry?.updatedAt,
       ...presentChunks.map((chunk) => chunk.lastModifiedAt),

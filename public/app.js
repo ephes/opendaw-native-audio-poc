@@ -371,6 +371,15 @@ function setSocketState(state) {
   socketStateValue = state;
   els.socketState.textContent = state;
   els.connect.textContent = state === "connecting" || state === "open" ? "Disconnect" : "Connect";
+  if (state === "closed" || state === "error") {
+    stopMonitor();
+    sharedBuffer = null;
+    stateView = null;
+    streamInfo = null;
+    els.monitor.disabled = true;
+    els.streamSummary.textContent = `Transport ${state}; reconnect to receive audio.`;
+  }
+  renderRecordingStatus();
 }
 
 function renderRecordingStatus() {
@@ -398,7 +407,7 @@ function renderRecordingStatus() {
       storageMode: window.isSecureContext ? "opfs" : "unavailable",
       lastError: "",
   };
-  const connected = Boolean(worker && streamInfo);
+  const connected = Boolean(worker && streamInfo && socketStateValue === "open");
   const activeRecording = status.state === "recording" || status.state === "stopping";
   const recorderBusy = isRecorderBusy(status) || recordingStartPending;
   const hasRecording = Boolean(status.sessionId);
@@ -427,7 +436,7 @@ function renderRecordingStatus() {
   els.recordReset.disabled = !hasRecording || status.state === "recording" || status.state === "stopping";
   els.exportManifest.disabled = !canExport;
   els.exportWav.disabled = !canExport;
-  els.wavChannel.disabled = !connected || !canExport;
+  els.wavChannel.disabled = !canExport;
   els.connect.disabled = recorderBusy || !window.crossOriginIsolated;
   updateRecoveryControls();
 }

@@ -175,6 +175,17 @@ Export Selected WAV writes one mono 32-bit float WAV for the selected source cha
 
 The top status counters show cumulative native dropped cpal callback buffers, dropped frames, and drop events from the Rust backend. The recording status panel also shows native dropped callback buffers/frames/events during the active recording. These counters are separate from WebSocket PCM blocks, browser-side gaps/overlaps, WebSocket lag, and monitor underrun/overflow counters.
 
+Unexpected WebSocket close/error flushes queued OPFS writes and closes recoverable
+chunks through the recorder lifecycle queue. The manifest and session list show
+`interrupted`, `interruptedAt` and a transport reason, with no `stoppedAt`; this
+outcome never claims clean completion. Manifest/WAV export remains available for
+retained audio. Connection and monitor state clear separately so Connect can retry
+after flushing; duplicate or superseded transport callbacks cannot finish a newer
+session. A reconnect's stream configuration waits for the old recording to flush; its
+stats and lag events cannot enter the old session's history.
+A storage/close failure still produces an error manifest and preserves previously
+closed chunks for recovery.
+
 The Disconnect button is disabled while recording is active or the recorder is in an error state. Stop the recording first so the Worker can flush queued OPFS writes, close the current chunk, and write the final manifest. If recording enters an error state, use Reset/Clear Recording before disconnecting so OPFS chunks from the current session are removed. Starting monitor playback during a recording resets the existing monitor underrun/overflow counters; the recorder records that reset and rebases the recording deltas.
 
 ## OPFS Recovery

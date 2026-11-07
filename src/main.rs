@@ -25,12 +25,12 @@ use cpal::{
     SampleFormat, SampleRate, Stream, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream as MessageStream, StreamExt};
 use serde::Serialize;
 use tokio::{
     net::TcpListener,
     sync::broadcast,
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::{Instant, MissedTickBehavior},
 };
 use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
@@ -39,6 +39,7 @@ const DEFAULT_PORT: u16 = 4545;
 const DEFAULT_FRAMES_PER_BLOCK: u32 = 960;
 const PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS: usize = 256;
 const INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS: usize = 64;
+const CLIENT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 const NATIVE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
@@ -406,35 +407,57 @@ async fn ws_handler(
 }
 
 async fn websocket_stream(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut blocks = state.blocks.subscribe();
+    let (sender, receiver) = socket.split();
+    websocket_client(sender, receiver, state, CLIENT_SEND_DEADLINE).await;
+}
 
+async fn websocket_client<S, R, E>(sender: S, mut receiver: R, state: AppState, deadline: Duration)
+where
+    S: Sink<Message> + Unpin,
+    R: MessageStream<Item = std::result::Result<Message, E>> + Unpin + Send + 'static,
+    E: Send + 'static,
+{
+    let blocks = state.blocks.subscribe();
+    // JoinSet aborts its owned reader even if this connection future is cancelled.
+    let mut readers = JoinSet::new();
+    readers.spawn(async move {
+        while let Some(Ok(message)) = receiver.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = readers.join_next() => {},
+        _ = send_stream(sender, blocks, &state, deadline) => {},
+    }
+    // Abort and reap the drain on every producer exit; a reader exit is already reaped.
+    readers.shutdown().await;
+}
+
+async fn send_stream<S: Sink<Message> + Unpin>(
+    mut sender: S,
+    mut blocks: broadcast::Receiver<Arc<AudioBlock>>,
+    state: &AppState,
+    deadline: Duration,
+) {
     let Ok(started) = serde_json::to_string(&state.stream_info) else {
         return;
     };
-    if sender.send(Message::Text(started.into())).await.is_err() {
-        return;
-    }
-    if send_native_stats(&mut sender, &state.native_stats)
-        .await
-        .is_err()
+    if !send_with_deadline(&mut sender, Message::Text(started.into()), deadline).await
+        || !send_native_stats(&mut sender, &state.native_stats, deadline).await
     {
         return;
     }
-
-    let drain_client_messages =
-        tokio::spawn(async move { while receiver.next().await.is_some() {} });
-
     let mut stats_interval = tokio::time::interval_at(
         Instant::now() + NATIVE_STATS_INTERVAL,
         NATIVE_STATS_INTERVAL,
     );
     stats_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
     loop {
         tokio::select! {
             _ = stats_interval.tick() => {
-                if send_native_stats(&mut sender, &state.native_stats).await.is_err() {
+                if !send_native_stats(&mut sender, &state.native_stats, deadline).await {
                     break;
                 }
             }
@@ -442,7 +465,7 @@ async fn websocket_stream(socket: WebSocket, state: AppState) {
                 match result {
                     Ok(block) => {
                         let payload = encode_pcm_block(&block);
-                        if sender.send(Message::Binary(payload.into())).await.is_err() {
+                        if !send_with_deadline(&mut sender, Message::Binary(payload.into()), deadline).await {
                             break;
                         }
                     }
@@ -452,8 +475,9 @@ async fn websocket_stream(socket: WebSocket, state: AppState) {
                             code: "server-client-lagged",
                             message: format!("WebSocket client skipped {skipped} audio blocks"),
                         };
-                        if let Ok(json) = serde_json::to_string(&error) {
-                            let _ = sender.send(Message::Text(json.into())).await;
+                        let Ok(json) = serde_json::to_string(&error) else { break };
+                        if !send_with_deadline(&mut sender, Message::Text(json.into()), deadline).await {
+                            break;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -461,19 +485,29 @@ async fn websocket_stream(socket: WebSocket, state: AppState) {
             }
         }
     }
-
-    drain_client_messages.abort();
 }
 
-async fn send_native_stats(
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+async fn send_with_deadline<S: Sink<Message> + Unpin>(
+    sender: &mut S,
+    message: Message,
+    deadline: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(deadline, sender.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn send_native_stats<S: Sink<Message> + Unpin>(
+    sender: &mut S,
     stats: &NativeInputStats,
-) -> Result<(), axum::Error> {
+    deadline: Duration,
+) -> bool {
     match serde_json::to_string(&stats.snapshot()) {
-        Ok(json) => sender.send(Message::Text(json.into())).await,
+        Ok(json) => send_with_deadline(sender, Message::Text(json.into()), deadline).await,
         Err(error) => {
             eprintln!("Failed to serialize native input stats: {error}");
-            Ok(())
+            false
         }
     }
 }
@@ -761,6 +795,193 @@ mod tests {
         connect_async,
         tungstenite::{Error as WsError, Message as ClientMessage, client::IntoClientRequest},
     };
+
+    struct ReaderDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ReaderDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn client_fixture(
+        stall_at: usize,
+    ) -> (
+        impl Sink<Message, Error = std::io::Error> + Unpin + Send,
+        impl MessageStream<Item = std::result::Result<Message, ()>> + Unpin + Send,
+        tokio::sync::mpsc::UnboundedReceiver<Message>,
+        tokio::sync::oneshot::Sender<std::result::Result<Message, ()>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (sent, messages) = tokio::sync::mpsc::unbounded_channel();
+        let sender = Box::pin(futures_util::sink::unfold(0, move |count, message| {
+            let sent = sent.clone();
+            async move {
+                sent.send(message).unwrap();
+                let count = count + 1;
+                if count == stall_at {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, std::io::Error>(count)
+            }
+        }));
+        let (close, closed) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = ReaderDrop(dropped.clone());
+        let receiver = Box::pin(futures_util::stream::once(async move {
+            let _guard = guard;
+            closed.await.unwrap_or(Ok(Message::Close(None)))
+        }));
+        (sender, receiver, messages, close, dropped)
+    }
+
+    fn client_state() -> AppState {
+        AppState {
+            authority: "127.0.0.1:1".into(),
+            stream_info: StreamStarted {
+                event_type: "stream-started",
+                sample_rate: 48000,
+                channels: 2,
+                frames_per_block: 1,
+                sample_format: "f32-interleaved",
+            },
+            blocks: broadcast::channel(1).0,
+            native_stats: Arc::new(NativeInputStats::new(Source::Sine, 0)),
+        }
+    }
+
+    fn test_block() -> Arc<AudioBlock> {
+        Arc::new(AudioBlock {
+            frame_start: 0,
+            frame_count: 1,
+            channels: 2,
+            samples: vec![0.25, -0.5],
+        })
+    }
+
+    async fn fixture_message(
+        messages: &mut tokio::sync::mpsc::UnboundedReceiver<Message>,
+    ) -> Message {
+        tokio::time::timeout(Duration::from_secs(2), messages.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_client_send_has_a_deadline_and_reaps_reader() {
+        for kind in ["started", "initial-stats", "pcm", "periodic-stats", "lag"] {
+            let state = client_state();
+            let blocks = state.blocks.clone();
+            let stall_at = match kind {
+                "started" => 1,
+                "initial-stats" => 2,
+                _ => 3,
+            };
+            let (sink, reader, mut messages, _close, dropped) = client_fixture(stall_at);
+            let task = tokio::spawn(websocket_client(
+                sink,
+                reader,
+                state,
+                Duration::from_millis(10),
+            ));
+            for _ in 0..stall_at.min(2) {
+                fixture_message(&mut messages).await;
+            }
+            if kind == "pcm" {
+                blocks.send(test_block()).unwrap();
+            }
+            if kind == "lag" {
+                // Capacity one, no yield: the subscription must report Lagged.
+                for _ in 0..3 {
+                    blocks.send(test_block()).unwrap();
+                }
+            }
+            if stall_at == 3 {
+                let message = fixture_message(&mut messages).await;
+                match kind {
+                    "pcm" => assert!(matches!(message, Message::Binary(_))),
+                    "periodic-stats" => assert_eq!(
+                        serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap()["type"],
+                        "native-input-stats"
+                    ),
+                    "lag" => assert_eq!(
+                        serde_json::from_str::<Value>(message.to_text().unwrap()).unwrap()["code"],
+                        "server-client-lagged"
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect(kind)
+                .unwrap();
+            assert!(dropped.load(Ordering::SeqCst), "reader not reaped: {kind}");
+            assert_eq!(blocks.receiver_count(), 0, "subscription retained: {kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_close_or_error_cancels_even_an_initial_stalled_send() {
+        for outcome in [Ok(Message::Close(None)), Err(())] {
+            let state = client_state();
+            let blocks = state.blocks.clone();
+            let (sink, reader, mut messages, close, dropped) = client_fixture(1);
+            let task = tokio::spawn(websocket_client(
+                sink,
+                reader,
+                state,
+                Duration::from_secs(30),
+            ));
+            fixture_message(&mut messages).await;
+            close.send(outcome).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(blocks.receiver_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_client_does_not_disrupt_a_second_healthy_client() {
+        let state = client_state();
+        let (slow_sink, slow_reader, mut slow_messages, _slow_close, slow_drop) = client_fixture(1);
+        let slow = tokio::spawn(websocket_client(
+            slow_sink,
+            slow_reader,
+            state.clone(),
+            Duration::from_millis(10),
+        ));
+        fixture_message(&mut slow_messages).await;
+        let (sink, reader, mut messages, close, dropped) = client_fixture(0);
+        let healthy = tokio::spawn(websocket_client(
+            sink,
+            reader,
+            state.clone(),
+            Duration::from_secs(1),
+        ));
+        fixture_message(&mut messages).await;
+        fixture_message(&mut messages).await;
+        tokio::time::timeout(Duration::from_secs(1), slow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slow_drop.load(Ordering::SeqCst));
+        assert_eq!(state.blocks.receiver_count(), 1);
+        state.blocks.send(test_block()).unwrap();
+        let Message::Binary(payload) = fixture_message(&mut messages).await else {
+            panic!("expected PCM")
+        };
+        assert_pcm_block(&payload, 1, 2);
+        close.send(Ok(Message::Close(None))).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), healthy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(state.blocks.receiver_count(), 0);
+    }
 
     #[test]
     fn websocket_guard_rejects_ambiguous_headers_and_aliases() {
