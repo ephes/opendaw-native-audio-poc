@@ -59,6 +59,13 @@ geometry changes are refused during recording or queued recording startup,
 recorded in manifest integrity errors, and block further PCM until Stop followed
 by reconfiguration or reconnect.
 
+Each local client send (stream metadata, stats, lag control and PCM) has a two-second
+deadline. A stalled send, sink failure or receive-side close/error ends that client
+and releases its subscription; the owned receive task is aborted and reaped when
+the producer exits. This per-client transport limit does not change capture queues
+or buffering and does not interrupt other clients. The browser records unexpected
+transport loss as an interrupted session, retaining flushed recoverable audio.
+
 ## PCM Blocks
 
 PCM blocks should be binary WebSocket messages.

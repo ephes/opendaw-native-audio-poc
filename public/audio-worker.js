@@ -74,24 +74,27 @@ function connect(url) {
     if (socket !== connection) return;
     postMessage({ type: "socket-state", state: "open" });
   });
-  socket.addEventListener("close", () => {
-    if (socket !== connection) return;
-    if (stateView) {
-      Atomics.store(stateView, STATE.CONNECTED, 0);
-    }
-    postMessage({ type: "socket-state", state: "closed" });
-  });
-  socket.addEventListener("error", () => {
-    if (socket !== connection) return;
-    postMessage({ type: "socket-state", state: "error" });
-  });
+  socket.addEventListener("close", () => terminateConnection(connection, "closed"));
+  socket.addEventListener("error", () => terminateConnection(connection, "error"));
   socket.addEventListener("message", (event) => {
     if (socket !== connection) return;
     handleSocketMessage(event);
   });
 }
 
-function disconnect() {
+function terminateConnection(connection, state) {
+  if (socket !== connection) return;
+  // Capture counters before disconnect clears this stream; the lifecycle queue
+  // also covers a Start that has not finished creating its session yet.
+  disconnect(state);
+  postMessage({ type: "socket-state", state });
+}
+
+function disconnect(reason = "disconnected") {
+  if (socket) {
+    runRecorderAction(() => recorder.interrupt(`WebSocket transport ${reason}; recording interrupted`));
+  }
+  if (stateView) Atomics.store(stateView, STATE.CONNECTED, 0);
   if (socket) {
     const previous = socket;
     socket = null;
@@ -118,16 +121,23 @@ function handleSocketMessage(event) {
     }
     if (message.type === "stream-started") {
       try {
+        if (!streamInfo && (recordingStartsPending || recorder.state === "recording" || recorder.state === "stopping")) {
+          const connection = socket;
+          runRecorderAction(() => recorder.enqueueLifecycle(() => {
+            if (socket === connection) configureStream(message);
+          }));
+          return;
+        }
         configureStream(message);
       } catch {
         postMessage({ type: "error", code: "invalid-control", message: "Stream configuration refused" });
       }
     } else if (message.type === "native-input-stats") {
       nativeInputStats = message;
-      recorder.setNativeInputStats(message);
+      if (streamInfo) recorder.setNativeInputStats(message);
       postMessage({ type: "native-input-stats", stats: nativeInputStats });
     } else if (message.type === "stream-error") {
-      recorder.noteWebSocketLag({ code: message.code, message: message.message });
+      if (streamInfo) recorder.noteWebSocketLag({ code: message.code, message: message.message });
       postMessage({ type: "error", message: message.message, code: message.code });
     }
     return;
@@ -200,6 +210,7 @@ function configureStream(info) {
   Atomics.store(stateView, STATE.FRAMES_PER_BLOCK, info.framesPerBlock);
   Atomics.store(stateView, STATE.RECEIVED_BLOCKS, 0);
   sampleView = createRingBufferViews(sharedBuffer, stateView).sampleView;
+  if (nativeInputStats) recorder.setNativeInputStats(nativeInputStats);
   postMessage({ type: "shared-buffer", sharedBuffer, stream: info });
 }
 

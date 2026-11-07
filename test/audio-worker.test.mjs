@@ -77,9 +77,10 @@ test("superseded sockets cannot publish events or modify the current stream", as
   }
   b.emit("error");
   assert.deepEqual(messages.at(-1), { type: "socket-state", state: "error" });
+  const terminatedCount = messages.length;
   b.emit("close");
   assert.equal(state[STATE.CONNECTED], 0);
-  assert.deepEqual(messages.at(-1), { type: "socket-state", state: "closed" });
+  assert.equal(messages.length, terminatedCount);
   send("disconnect");
   const disconnectedCount = messages.length;
   b.emit("message", JSON.stringify(stream));
