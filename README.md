@@ -72,7 +72,7 @@ just serve-sine
 just serve-l12
 ```
 
-`just test` runs `cargo fmt --check`, `cargo check --locked`, `cargo clippy --locked --all-targets`, `cargo test --locked`, Node.js unit tests, and JavaScript syntax checks for the static browser modules and offline scripts. It does not run any browser smoke checks; run `just smoke-browser` for the sine path and `just smoke-l12` for the opt-in hardware path.
+`just test` runs `cargo fmt --check`, `cargo check --locked`, `cargo clippy --locked --all-targets`, `cargo test --locked`, Node.js unit tests, and JavaScript syntax checks for the static browser modules and offline scripts. Rust channel tests also check callback partitioning, final-tail discard and native loss accounting under queue saturation/disconnection with synthetic samples and no audio device. It does not run any browser smoke checks; run `just smoke-browser` for the sine path and `just smoke-l12` for the opt-in hardware path.
 
 `just inspect-recording <manifest.json>` validates an exported or recovered recording manifest from disk without hardware, Chrome, OPFS access, browser automation, or raw `.f32` chunk files. The target defaults to the observed L-12 shape: 14 channels, 48 kHz, 960 frames per block, `f32-interleaved`, and zero native input drop deltas.
 For known-bad or exploratory artifacts where native drops are expected, run `node scripts/inspect-recording-manifest.mjs <manifest.json>` directly and choose only the expectations that apply.
