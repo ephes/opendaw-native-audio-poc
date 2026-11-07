@@ -47,6 +47,18 @@ The current Rust server sends `stream-started` when a WebSocket client connects,
 - `bridgeQueueCapacityBlocks`: capacity of the Rust callback-to-aggregation queue for `source: "input"`; `0` for `source: "sine"`.
 - `atFrame`: latest backend source frame cursor. For `source: "input"` this advances in the cpal callback timeline, including dropped frames. It does not necessarily equal the latest emitted PCM `frameStart + frameCount` because aggregation can hold pending frames and dropped callback buffers still advance the source cursor. For `source: "sine"` this advances in the synthetic source timeline.
 
+The Worker accepts only the three control types above. Stream geometry must use
+positive integers: at most 64 channels, 384,000 Hz and 65,536 frames/block,
+with `sampleFormat: "f32-interleaved"`. The rounded power-of-two monitor ring,
+including metadata, must fit in 64 MiB. Control text is limited to 4,096 UTF-16
+code units; stats counters must be nonnegative safe integers and error messages
+at most 1,024 code units with one of the documented error codes. Invalid JSON,
+unsupported controls and excessive geometry produce a bounded error without
+replacing the last valid configuration. Duplicate configuration is a no-op;
+geometry changes are refused during recording or queued recording startup,
+recorded in manifest integrity errors, and block further PCM until Stop followed
+by reconfiguration or reconnect.
+
 ## PCM Blocks
 
 PCM blocks should be binary WebSocket messages.

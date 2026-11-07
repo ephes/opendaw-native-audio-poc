@@ -144,6 +144,8 @@ just inspect-recording ./native-pcm-...-manifest.json
 
 The inspector checks the manifest stream shape, continuity arrays, chunk/block frame and byte math, top-level frame/block totals, and native input drop deltas. It fails on gaps, overlaps, discontinuities, channel mismatches, invalid blocks, malformed chunk metadata, fatal recovery warnings, and native dropped callback buffers/frames/events when the zero-drop expectation is enabled. It reports monitor underruns/overflows, WebSocket lag events, monitor counter resets, and write-backlog high-water counters as warnings because those are browser/monitor observability signals rather than direct proof of native input loss.
 
+Monitor startup shares one owned attempt while the worklet module loads and audio resumes. Disconnect or stream replacement cancels publication and closes that attempt; load/resume failures show an error and enable Start Monitor for retry.
+
 WebSocket reconnects supersede the previous connection. Only the current socket may publish connection state, stream configuration, native input stats, errors, or PCM; delayed events from an old socket are ignored.
 
 Start, Stop, Reset/Clear, Delete Session, and all manifest/WAV exports run in arrival order through one recorder lifecycle queue per recorder. Exports hold that queue through file reads and serialization, using one session/root snapshot; subsequent reset/start/delete requests wait until the download Blob is complete. A failed export releases the queue. Independent tabs can still remove a session: file-read errors refuse export rather than constructing a partial WAV. Repeated Start while recording is a no-op; a failed request releases the queue so Reset or a later Start can proceed. PCM writes use a separate queue, which Stop drains before closing a chunk. A startup failure before session creation leaves the recorder idle so Start and Disconnect remain available. If the lock or index update fails during pre-start cleanup of a prior session, its state and manifest stay intact for retry and the error is reported. Artifact removal can still fail partway through cleanup; retry Reset/Clear or Start to finish removing that session. Once a session exists, startup failures persist an error manifest/index on a best-effort basis.
@@ -218,33 +220,36 @@ Known limits:
 
 ## Continuous integration
 
-The `Synthetic checks` GitHub Actions workflow runs `just test` on every push
-and pull request, using macOS, stable Rust with rustfmt/Clippy, and Node.js 24.
+The `Synthetic checks` GitHub Actions workflow runs `just test` and the one-second
+synthetic sine browser monitor smoke on every push
+and pull request, using macOS with headless Chrome, stable Rust with
+rustfmt/Clippy, and Node.js 24. The browser step runs `just smoke-browser 1000`
+after `just test`; Chrome is preinstalled on the macOS runner.
 Rust dependency resolution uses the committed `Cargo.lock` (`--locked`); Node
 fixtures use only built-in modules and require no npm install. The job has
 read-only repository permissions and does not publish artifacts or releases.
 
 A format, compilation, test, or JavaScript syntax failure fails the job and
 must be resolved before review approval and merging. Clippy errors also fail
-the job; its standard warnings are reported without failing the job. These checks use synthetic Rust PCM and Node fixtures;
-they require no microphone, recorded audio, Chrome, or OPFS access.
-Browser monitor smoke, real-device checks, and endurance/recording sessions
+the job; its standard warnings are reported without failing the job. `just test`
+uses synthetic Rust PCM and Node fixtures and requires no Chrome or OPFS access.
+The browser step requires Chrome and exercises the sine monitor path. Neither
+step requires a microphone or recorded audio.
+Longer browser monitor smoke, real-device checks, and endurance/recording sessions
 remain separate manual checks. A passing CI job does not certify those paths.
-Run the same automated checks locally with `just test`. A synthetic page/Worker fixture checks that status updates preserve the selected recovery channel while updating export controls. In-memory OPFS and shared-lock fixtures exercise concurrent add/add and add/delete operations, lock release on write failure, and paused export reads with queued lifecycle actions; they use no persistent browser data.
+Run the same automated checks locally with `just test` followed by
+`just smoke-browser 1000`. A synthetic page/Worker fixture checks that status updates preserve the selected recovery channel while updating export controls. In-memory OPFS and shared-lock fixtures exercise concurrent add/add and add/delete operations, lock release on write failure, and paused export reads with queued lifecycle actions; they use no persistent browser data.
 
 ## Verification
 
-Automated hardware-free checks (the same gate as CI):
+Hardware-free checks matching CI (the second command requires Chrome):
 
 ```sh
 just test
-```
-
-Opt-in local browser checks (require Chrome; run separately from CI):
-
-```sh
 just smoke-browser 1000
 ```
+
+For a longer optional local browser check, run `just smoke-browser` (30 seconds).
 
 Local device enumeration and synthetic server for manual page checks:
 

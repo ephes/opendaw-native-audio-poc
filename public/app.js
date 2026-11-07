@@ -46,6 +46,7 @@ const els = {
 let worker = null;
 let audioContext = null;
 let workletNode = null;
+let monitorAttempt = null;
 let sharedBuffer = null;
 let stateView = null;
 let streamInfo = null;
@@ -150,13 +151,7 @@ function disconnect() {
     return;
   }
   worker?.postMessage({ type: "disconnect" });
-  workletNode?.disconnect();
-  workletNode = null;
-  const closingContext = audioContext;
-  audioContext = null;
-  if (closingContext && closingContext.state !== "closed") {
-    closingContext.close().catch(() => {});
-  }
+  stopMonitor();
   sharedBuffer = null;
   stateView = null;
   streamInfo = null;
@@ -186,36 +181,74 @@ function ensureWorker() {
   worker.addEventListener("message", handleWorkerMessage);
 }
 
-async function startMonitor() {
-  if (!sharedBuffer) {
-    return;
+function releaseMonitor(attempt) {
+  if (!attempt || attempt.closed) return;
+  attempt.closed = true;
+  attempt.node?.disconnect();
+  if (attempt.context && attempt.context.state !== "closed") {
+    attempt.context.close().catch(() => {});
   }
-  if (!audioContext) {
-    audioContext = new AudioContext({ sampleRate: streamInfo?.sampleRate });
-    await audioContext.audioWorklet.addModule("/bridge-processor.js");
-  }
-  if (!workletNode) {
-    workletNode = new AudioWorkletNode(audioContext, "native-bridge-processor", {
-      numberOfInputs: 0,
-      numberOfOutputs: 1,
-      outputChannelCount: [2],
-    });
-    workletNode.port.addEventListener("message", handleWorkletMessage);
-    workletNode.port.start();
-    workletNode.connect(audioContext.destination);
-    workletNode.port.postMessage({
-      type: "configure",
-      sharedBuffer,
-      left: Number(els.leftChannel.value),
-      right: Number(els.rightChannel.value),
-    });
-  }
-  await audioContext.resume();
-  els.monitor.textContent = "Monitoring";
+}
+
+function stopMonitor() {
+  const previous = monitorAttempt;
+  monitorAttempt = null;
+  releaseMonitor(previous);
+  audioContext = null;
+  workletNode = null;
+  els.monitor.textContent = "Start Monitor";
+}
+
+function startMonitor() {
+  if (!sharedBuffer) return Promise.resolve();
+  if (monitorAttempt) return monitorAttempt.promise;
+  const attempt = { buffer: sharedBuffer, info: streamInfo, context: null, node: null };
+  monitorAttempt = attempt;
+  els.monitor.disabled = true;
+  attempt.promise = (async () => {
+    const current = () => monitorAttempt === attempt && sharedBuffer === attempt.buffer;
+    try {
+      const context = new AudioContext({ sampleRate: attempt.info.sampleRate });
+      attempt.context = context;
+      await context.audioWorklet.addModule("/bridge-processor.js");
+      if (!current()) return;
+      const node = new AudioWorkletNode(context, "native-bridge-processor", {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      attempt.node = node;
+      node.port.addEventListener("message", handleWorkletMessage);
+      node.port.start();
+      node.connect(context.destination);
+      node.port.postMessage({
+        type: "configure", sharedBuffer: attempt.buffer,
+        left: Number(els.leftChannel.value), right: Number(els.rightChannel.value),
+      });
+      await context.resume();
+      if (!current()) return;
+      audioContext = context;
+      workletNode = node;
+      els.monitor.textContent = "Monitoring";
+    } catch (error) {
+      if (current()) {
+        monitorAttempt = null;
+        els.monitor.textContent = "Start Monitor";
+        els.streamSummary.textContent = `Monitor failed: ${error.message}`;
+      }
+      releaseMonitor(attempt);
+    } finally {
+      if (!current()) releaseMonitor(attempt);
+      if (!monitorAttempt || monitorAttempt === attempt) {
+        els.monitor.disabled = !sharedBuffer || Boolean(workletNode);
+      }
+    }
+  })();
+  return attempt.promise;
 }
 
 function updateMonitorChannels() {
-  workletNode?.port.postMessage({
+  (workletNode ?? monitorAttempt?.node)?.port.postMessage({
     type: "channels",
     left: Number(els.leftChannel.value),
     right: Number(els.rightChannel.value),
@@ -227,14 +260,12 @@ function handleWorkerMessage(event) {
   if (message.type === "socket-state") {
     setSocketState(message.state);
   } else if (message.type === "shared-buffer") {
+    stopMonitor();
     sharedBuffer = message.sharedBuffer;
     streamInfo = message.stream;
     stateView = new Int32Array(sharedBuffer, 0, STATE_INTS);
     setupStreamUi(streamInfo);
     els.monitor.disabled = false;
-    if (workletNode) {
-      workletNode.port.postMessage({ type: "configure", sharedBuffer });
-    }
   } else if (message.type === "meters") {
     renderMeters(message.peak);
     renderCounters();
