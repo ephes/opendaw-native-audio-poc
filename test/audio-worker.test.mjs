@@ -27,7 +27,7 @@ test("superseded sockets cannot publish events or modify the current stream", as
   }
   await import("../public/audio-worker.js");
   const send = (type) => receive({ data: { type, url: "ws://synthetic.invalid/ws" } });
-  const stream = { type: "stream-started", channels: 2, sampleRate: 48000, framesPerBlock: 1 };
+  const stream = { type: "stream-started", channels: 2, sampleRate: 48000, framesPerBlock: 1, sampleFormat: "f32-interleaved" };
   send("connect");
   const a = sockets[0];
   a.emit("message", JSON.stringify(stream));

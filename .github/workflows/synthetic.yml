@@ -25,3 +25,7 @@ jobs:
           brew install just
       - name: Run hardware-free checks
         run: just test
+      - name: Run synthetic browser monitor smoke
+        env:
+          SMOKE_SERVER_TIMEOUT_MS: '120000'
+        run: just smoke-browser 1000

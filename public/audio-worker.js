@@ -10,6 +10,8 @@ import {
 } from "./ring-buffer.js";
 
 const CAPACITY_SECONDS = 2;
+const MAX_CONTROL_CHARS = 4096;
+const MAX_RING_BYTES = 64 * 1024 * 1024;
 
 let socket = null;
 let sharedBuffer = null;
@@ -18,6 +20,8 @@ let sampleView = null;
 let streamInfo = null;
 let lastMeterPost = 0;
 let nativeInputStats = null;
+let recordingStartsPending = 0;
+let pcmRefused = false;
 let recorder = new PcmRecorder({
   readCounters,
   postMessage: (message) => postMessage(message),
@@ -30,7 +34,14 @@ self.addEventListener("message", (event) => {
   } else if (message.type === "disconnect") {
     disconnect();
   } else if (message.type === "recording-start") {
-    runRecorderAction(() => recorder.start(streamInfo));
+    if (pcmRefused) {
+      postMessage({ type: "recording-status", status: recorder.status() });
+      postMessage({ type: "recording-error", message: "Reconfigure or reconnect before recording after a geometry change" });
+      return;
+    }
+    const info = streamInfo;
+    recordingStartsPending++;
+    runRecorderAction(() => recorder.start(info).finally(() => { recordingStartsPending--; }));
   } else if (message.type === "recording-stop") {
     runRecorderAction(() => recorder.stop());
   } else if (message.type === "recording-reset") {
@@ -91,13 +102,26 @@ function disconnect() {
   sampleView = null;
   streamInfo = null;
   nativeInputStats = null;
+  pcmRefused = false;
 }
 
 function handleSocketMessage(event) {
   if (typeof event.data === "string") {
-    const message = JSON.parse(event.data);
+    let message;
+    try {
+      if (event.data.length > MAX_CONTROL_CHARS) throw new Error();
+      message = JSON.parse(event.data);
+      validateControl(message);
+    } catch {
+      postMessage({ type: "error", code: "invalid-control", message: "Invalid or unsupported stream control" });
+      return;
+    }
     if (message.type === "stream-started") {
-      configureStream(message);
+      try {
+        configureStream(message);
+      } catch {
+        postMessage({ type: "error", code: "invalid-control", message: "Stream configuration refused" });
+      }
     } else if (message.type === "native-input-stats") {
       nativeInputStats = message;
       recorder.setNativeInputStats(message);
@@ -111,16 +135,60 @@ function handleSocketMessage(event) {
   writePcmBlock(event.data);
 }
 
-function configureStream(info) {
-  streamInfo = info;
-  // A power-of-two capacity divides the uint32 cursor period, preserving
-  // physical sample positions when the cursor wraps through zero.
-  const capacityFrames = 2 ** Math.ceil(Math.log2(
+function validateControl(message) {
+  if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error();
+  const integer = (value, max, min = 0) => Number.isSafeInteger(value) && value >= min && value <= max;
+  if (message.type === "stream-started") {
+    if (!integer(message.channels, 64, 1) || !integer(message.sampleRate, 384000, 1) ||
+        !integer(message.framesPerBlock, 65536, 1) || message.sampleFormat !== "f32-interleaved" ||
+        ringCapacity(message) * message.channels * RING_BUFFER_BYTES_PER_SAMPLE + STATE_BYTES > MAX_RING_BYTES) {
+      throw new Error();
+    }
+  } else if (message.type === "native-input-stats") {
+    if (!["sine", "input"].includes(message.source) ||
+        !["nativeDroppedBlocks", "nativeDroppedFrames", "nativeDropEvents", "bridgeQueueCapacityBlocks", "atFrame"]
+          .every((key) => integer(message[key], Number.MAX_SAFE_INTEGER))) throw new Error();
+  } else if (message.type === "stream-error") {
+    if (!["server-client-lagged", "device-lost"].includes(message.code) ||
+        typeof message.message !== "string" || message.message.length > 1024) throw new Error();
+  } else {
+    throw new Error();
+  }
+}
+
+function ringCapacity(info) {
+  // A power of two divides the uint32 cursor period, preserving sample
+  // positions across cursor wrap. Geometry is checked before allocation.
+  return 2 ** Math.ceil(Math.log2(
     Math.max(info.framesPerBlock * 8, info.sampleRate * CAPACITY_SECONDS),
   ));
+}
+
+function configureStream(info) {
+  const recordingBusy = recordingStartsPending || recorder.state === "recording" || recorder.state === "stopping";
+  if (streamInfo && ["sampleRate", "channels", "framesPerBlock", "sampleFormat"]
+    .every((key) => streamInfo[key] === info[key])) {
+    if (!recordingBusy) pcmRefused = false;
+    return;
+  }
+  if (recordingBusy) {
+    pcmRefused = true;
+    // Queue the integrity event after any pending Start, before later Stop/Reset.
+    runRecorderAction(() => recorder.enqueueLifecycle(() => {
+      if (recorder.state === "recording" || recorder.state === "stopping") {
+        recorder.noteInvalidBlock("Stream geometry changed during recording; further PCM refused until Stop and reconfiguration/reconnect");
+      }
+    }));
+    throw new Error("Cannot change stream geometry during recording");
+  }
+  const capacityFrames = ringCapacity(info);
   const sampleBytes = capacityFrames * info.channels * RING_BUFFER_BYTES_PER_SAMPLE;
-  sharedBuffer = new SharedArrayBuffer(STATE_BYTES + sampleBytes);
-  stateView = new Int32Array(sharedBuffer, 0, STATE_INTS);
+  const buffer = new SharedArrayBuffer(STATE_BYTES + sampleBytes);
+  const state = new Int32Array(buffer, 0, STATE_INTS);
+  pcmRefused = false;
+  streamInfo = info;
+  sharedBuffer = buffer;
+  stateView = state;
   Atomics.store(stateView, STATE.WRITE_FRAME, 0);
   Atomics.store(stateView, STATE.READ_FRAME, 0);
   Atomics.store(stateView, STATE.OVERFLOW_COUNT, 0);
@@ -136,7 +204,7 @@ function configureStream(info) {
 }
 
 function writePcmBlock(buffer) {
-  if (!stateView || !sampleView || !streamInfo) {
+  if (pcmRefused || !stateView || !sampleView || !streamInfo) {
     return;
   }
   const block = decodePcmBlock(buffer, { expectedChannels: streamInfo.channels });
