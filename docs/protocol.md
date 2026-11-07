@@ -113,6 +113,30 @@ Cross-Origin-Resource-Policy: same-origin
 
 The current in-page ring buffer state is an implementation detail, not part of the backend compatibility boundary. It uses a 256-byte metadata prefix with atomic Int32 counters followed by interleaved Float32 ring-buffer samples.
 
+### Monitor worklet controls and output
+
+The worklet supports one stereo output (as configured by the page); a mono
+source can feed both output channels. Before configuration it renders silence.
+`configure` takes a `sharedBuffer` and optional zero-based `left`/`right` source
+indices. The buffer must be shared, at most 64 MiB, and exactly match its
+256-byte metadata prefix plus `capacityFrames * channels * 4` sample bytes.
+Metadata requires 1–64 channels, a positive power-of-two capacity, 1–384,000 Hz,
+and 1–65,536 frames per block. These geometry fields stay fixed for the buffer's
+lifetime. Configuration validates all fields before publishing any new state.
+Omitted channels retain the previous selection, clamped to the new source count
+(initially 0/1, or 0/0 for mono). `channels` requires both indices and an existing
+configuration. Explicit indices must be finite integers in the source range.
+
+Malformed or unsupported messages produce one fixed-size `control-error`
+diagnostic notification (currently not displayed by the page), without echoing
+input or changing the last valid configuration,
+routing, cursors or counters. Each accepted configure aligns to at most three
+blocks of retained, unconsumed audio, resets overflow/underrun counters, and
+emits one `counters-reset`. Channel rerouting does not reset counters. Short
+renders zero-fill missing frames and increment underruns once per quantum.
+`status` is emitted on the first configured render and every 20 configured
+render quanta afterward; reconfiguration preserves this cadence.
+
 Browser recording artifacts are also outside the backend compatibility boundary. This includes `native-pcm-recordings-index.json`, `native-pcm-*-manifest.json`, `native-pcm-*-recovered-manifest.json`, `native-pcm-*-chunk-*.f32`, and exported `native-pcm-*.wav` files. The current OPFS chunk, manifest, and recovery artifact formats are documented in the README's Browser Recording Mode and OPFS Recovery sections.
 
 ## Compatibility Boundary
