@@ -25,6 +25,7 @@ export function inspectManifest(manifest, options = {}) {
   const errors = [];
   const warnings = [];
   const summary = {
+    finalAcceptance: options.finalAcceptance === true,
     recovered: false,
     recoveryWarnings: 0,
     fatalRecoveryWarnings: 0,
@@ -59,8 +60,15 @@ export function inspectManifest(manifest, options = {}) {
   validateStreamShape(manifest, options, errors, summary);
   inspectRecovery(manifest, errors, warnings, summary);
   inspectIntegrity(manifest, errors, warnings, summary);
+  validateGeometryFields(manifest, "manifest", [
+    "totalRecordedFrames", "recordedBlocks",
+  ], errors, { nullable: summary.recovered });
+  validateGeometryFields(manifest, "manifest", ["firstFrameStart", "expectedNextFrame"], errors, { nullable: true });
+  if (isObject(manifest.reconstructed)) {
+    validateGeometryFields(manifest.reconstructed, "reconstructed", ["frames", "bytes", "chunks"], errors);
+  }
 
-  const chunkResult = inspectChunks(manifest, errors, warnings);
+  const chunkResult = inspectChunks(manifest, errors, warnings, summary.recovered);
   summary.chunks = chunkResult.chunkCount;
   summary.frames = chunkResult.totalFrames;
   summary.blocks = chunkResult.totalBlocks;
@@ -69,6 +77,7 @@ export function inspectManifest(manifest, options = {}) {
   validateManifestTotals(manifest, chunkResult, errors, warnings, summary);
   inspectCounterSummaries(manifest, warnings, summary);
   inspectNativeDrops(manifest, options, errors, warnings, summary);
+  if (summary.finalAcceptance) inspectFinalAcceptance(manifest, chunkResult, errors, summary);
 
   if (Number.isFinite(summary.sampleRate) && summary.sampleRate > 0) {
     summary.durationSeconds = summary.frames / summary.sampleRate;
@@ -86,6 +95,7 @@ export function formatInspectionReport(result) {
   const lines = [];
   const { summary } = result;
   lines.push(`Recording manifest inspection: ${result.ok ? "PASS" : "FAIL"}`);
+  lines.push(`Mode: ${summary.finalAcceptance ? "final acceptance" : "exploratory"}`);
   lines.push(`Session: ${summary.sessionId ?? "<unknown>"}`);
   lines.push(`Type: ${summary.type ?? "<unknown>"}${summary.recovered ? " (recovered)" : ""}`);
   lines.push(`State: ${summary.state ?? "<unknown>"}`);
@@ -155,6 +165,10 @@ export function parseCliArgs(argv) {
       options.expectNativeDropsZero = true;
       continue;
     }
+    if (arg === "--final") {
+      options.finalAcceptance = true;
+      continue;
+    }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) {
       throw new Error(`${arg} requires a value`);
@@ -215,8 +229,8 @@ function validateManifestIdentity(manifest, errors, summary) {
   if (summary.type !== expectedType) {
     errors.push(`type must be ${expectedType} when recovered is ${summary.recovered}`);
   }
-  if (typeof manifest.version !== "number") {
-    errors.push("version must be a number");
+  if (manifest.version !== 1) {
+    errors.push("version must be 1 (the supported manifest version)");
   }
 }
 
@@ -228,6 +242,29 @@ function inspectManifestState(warnings, summary) {
   if (!summary.recovered && summary.state !== "stopped") {
     warnings.push(`Manifest state is ${summary.state}; inspect a stopped manifest for final recording proof.`);
   }
+}
+
+function inspectFinalAcceptance(manifest, chunkResult, errors, summary) {
+  if (summary.recovered) {
+    errors.push("Final acceptance requires a normal recording; inspect recovery artifacts in exploratory mode.");
+    return;
+  }
+  if (summary.state !== "stopped" || !validTimestamp(manifest.stoppedAt)) {
+    errors.push("Final acceptance requires state stopped and a valid stoppedAt timestamp.");
+  }
+  if (!chunkResult.fullBlockMetadata || chunkResult.totalBlocks === 0) {
+    errors.push("Final acceptance requires complete, nonempty block metadata for every chunk.");
+  }
+  for (const [index, chunk] of (Array.isArray(manifest.chunks) ? manifest.chunks : []).entries()) {
+    if (!isObject(chunk)) continue; // Already reported by inspectChunks.
+    if (!validTimestamp(chunk.completedAt) || !Array.isArray(chunk.blocks) || chunk.blocks.length === 0) {
+      errors.push(`Final acceptance requires chunks[${index}] to be closed with nonempty block metadata.`);
+    }
+  }
+}
+
+function validTimestamp(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
 function validateStreamShape(manifest, options, errors, summary) {
@@ -341,7 +378,7 @@ function inspectIntegrity(manifest, errors, warnings, summary) {
   }
 }
 
-function inspectChunks(manifest, errors, warnings) {
+function inspectChunks(manifest, errors, warnings, recovered) {
   if (!Array.isArray(manifest.chunks)) {
     errors.push("chunks must be an array");
     return {
@@ -356,7 +393,7 @@ function inspectChunks(manifest, errors, warnings) {
   }
 
   const channels = finiteNumberOrNull(manifest.channels);
-  const bytesPerFrame = channels === null ? null : channels * BYTES_PER_SAMPLE;
+  const bytesPerFrame = channels === null ? null : checkedGeometry(channels * BYTES_PER_SAMPLE, "bytes per frame", errors);
   let totalFrames = 0;
   let totalBlocks = 0;
   let totalBytes = 0;
@@ -381,17 +418,26 @@ function inspectChunks(manifest, errors, warnings) {
     const frames = finiteNumberOrNull(chunk.frames);
     const bytes = finiteNumberOrNull(chunk.bytes);
     const blocksRecorded = finiteNumberOrNull(chunk.blocksRecorded);
-    totalFrames += frames ?? 0;
-    totalBytes += bytes ?? 0;
-    if (blocksRecorded !== null) {
-      totalBlocks += blocksRecorded;
+    requireNonNegativeNumber(`${prefix}.bytes`, bytes, errors);
+    if (!recovered || chunk.frames !== null) {
+      requireNonNegativeNumber(`${prefix}.frames`, frames, errors);
     }
+    if (!recovered || chunk.blocksRecorded !== null) {
+      requireNonNegativeNumber(`${prefix}.blocksRecorded`, blocksRecorded, errors);
+    }
+    validateGeometryFields(chunk, prefix, [
+      "index", "channels", "expectedBytes", "manifestFrames",
+    ], errors, { nullable: recovered });
+    validateGeometryFields(chunk, prefix, ["firstFrameStart", "lastFrameStart", "lastFrameEnd"], errors, { nullable: true });
+    totalFrames = checkedGeometry(totalFrames + (frames ?? 0), "total frames", errors);
+    totalBytes = checkedGeometry(totalBytes + (bytes ?? 0), "total bytes", errors);
+    totalBlocks = checkedGeometry(totalBlocks + (Array.isArray(chunk.blocks) ? chunk.blocks.length : blocksRecorded ?? 0), "total blocks", errors);
     if (typeof chunk.validForWav === "boolean") {
       hasRecoveredValidity = true;
       if (chunk.validForWav) {
         validRecoveredChunks += 1;
-        validRecoveredFrames += frames ?? 0;
-        validRecoveredBytes += bytes ?? 0;
+        validRecoveredFrames = checkedGeometry(validRecoveredFrames + (frames ?? 0), "recovered frames", errors);
+        validRecoveredBytes = checkedGeometry(validRecoveredBytes + (bytes ?? 0), "recovered bytes", errors);
       }
     }
 
@@ -401,8 +447,9 @@ function inspectChunks(manifest, errors, warnings) {
     if (channels !== null && finiteNumberOrNull(chunk.channels) !== null && chunk.channels !== channels) {
       errors.push(`${prefix}.channels expected ${channels}, got ${chunk.channels}`);
     }
-    if (bytesPerFrame !== null && frames !== null && bytes !== null && bytes !== frames * bytesPerFrame) {
-      errors.push(`${prefix}.bytes expected ${frames * bytesPerFrame}, got ${bytes}`);
+    if (bytesPerFrame !== null && frames !== null && bytes !== null) {
+      const expectedBytes = checkedGeometry(frames * bytesPerFrame, `${prefix} frame bytes`, errors);
+      if (bytes !== expectedBytes) errors.push(`${prefix}.bytes expected ${expectedBytes}, got ${bytes}`);
     }
 
     if (!Array.isArray(chunk.blocks)) {
@@ -422,7 +469,6 @@ function inspectChunks(manifest, errors, warnings) {
       errors.push(`${prefix}.bytes expected block byte sum ${blockResult.bytes}, got ${bytes}`);
     }
     if (blockResult.blockCount > 0) {
-      totalBlocks = totalBlocks - (blocksRecorded ?? 0) + blockResult.blockCount;
       const blockFirstFrameStart = blockResult.firstFrameStart;
       const blockLastFrameStart = blockResult.lastFrameStart;
       const blockLastFrameEnd = blockResult.lastFrameEnd;
@@ -480,30 +526,30 @@ function inspectChunkBlocks(chunk, prefix, bytesPerFrame, errors) {
     requirePositiveNumber(`${blockPrefix}.frameCount`, frameCount, errors);
     requireNonNegativeNumber(`${blockPrefix}.chunkOffsetBytes`, chunkOffsetBytes, errors);
     requireNonNegativeNumber(`${blockPrefix}.byteLength`, byteLength, errors);
+    validateGeometryFields(block, blockPrefix, ["receivedBlockIndex"], errors);
 
     if (frameStart !== null && frameCount !== null) {
+      if (lastFrameEnd !== null && frameStart !== lastFrameEnd) {
+        errors.push(`${blockPrefix}.frameStart expected ${lastFrameEnd} after previous block, got ${frameStart}`);
+      }
       firstFrameStart ??= frameStart;
       lastFrameStart = frameStart;
-      lastFrameEnd = frameStart + frameCount;
+      lastFrameEnd = checkedGeometry(frameStart + frameCount, `${blockPrefix} frame end`, errors);
     }
     if (frameCount !== null) {
-      frames += frameCount;
+      frames = checkedGeometry(frames + frameCount, `${prefix} block frame sum`, errors);
     }
     if (byteLength !== null) {
-      bytes += byteLength;
+      bytes = checkedGeometry(bytes + byteLength, `${prefix} block byte sum`, errors);
     }
     if (chunkOffsetBytes !== null && chunkOffsetBytes !== expectedOffset) {
       errors.push(`${blockPrefix}.chunkOffsetBytes expected ${expectedOffset}, got ${chunkOffsetBytes}`);
     }
-    if (
-      bytesPerFrame !== null &&
-      frameCount !== null &&
-      byteLength !== null &&
-      byteLength !== frameCount * bytesPerFrame
-    ) {
-      errors.push(`${blockPrefix}.byteLength expected ${frameCount * bytesPerFrame}, got ${byteLength}`);
+    if (bytesPerFrame !== null && frameCount !== null && byteLength !== null) {
+      const expectedBytes = checkedGeometry(frameCount * bytesPerFrame, `${blockPrefix} frame bytes`, errors);
+      if (byteLength !== expectedBytes) errors.push(`${blockPrefix}.byteLength expected ${expectedBytes}, got ${byteLength}`);
     }
-    expectedOffset += byteLength ?? 0;
+    expectedOffset = bytes;
   }
 
   return {
@@ -688,15 +734,27 @@ function checkEqual(label, actual, expected, errors, { optional = false } = {}) 
 }
 
 function requirePositiveNumber(label, value, errors) {
-  if (value === null || value <= 0) {
-    errors.push(`${label} must be a positive number`);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    errors.push(`${label} must be a positive safe integer`);
   }
 }
 
 function requireNonNegativeNumber(label, value, errors) {
-  if (value === null || value < 0) {
-    errors.push(`${label} must be a non-negative number`);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    errors.push(`${label} must be a non-negative safe integer`);
   }
+}
+
+function validateGeometryFields(object, prefix, fields, errors, { nullable = false } = {}) {
+  for (const field of fields) {
+    if (object[field] === undefined || (nullable && object[field] === null)) continue;
+    requireNonNegativeNumber(`${prefix}.${field}`, object[field], errors);
+  }
+}
+
+function checkedGeometry(value, label, errors) {
+  requireNonNegativeNumber(label, value, errors);
+  return value;
 }
 
 function parsePositiveIntOption(name, raw) {
@@ -745,6 +803,7 @@ function usage() {
   return `Usage: node scripts/inspect-recording-manifest.mjs <manifest.json> [options]
 
 Options:
+  --final                         Require a stopped normal recording with complete block evidence
   --expect-channels <n>            Require channel count
   --expect-sample-rate <n>         Require sample rate
   --expect-frames-per-block <n>    Require frames per block

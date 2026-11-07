@@ -74,8 +74,8 @@ just serve-l12
 
 `just test` runs `cargo fmt --check`, `cargo check --locked`, `cargo clippy --locked --all-targets`, `cargo test --locked`, Node.js unit tests, and JavaScript syntax checks for the static browser modules and offline scripts. It does not run any browser smoke checks; run `just smoke-browser` for the sine path and `just smoke-l12` for the opt-in hardware path.
 
-`just inspect-recording <manifest.json>` validates an exported or recovered recording manifest from disk without hardware, Chrome, OPFS access, browser automation, or raw `.f32` chunk files. The target defaults to the observed L-12 shape: 14 channels, 48 kHz, 960 frames per block, `f32-interleaved`, and zero native input drop deltas.
-For known-bad or exploratory artifacts where native drops are expected, run `node scripts/inspect-recording-manifest.mjs <manifest.json>` directly and choose only the expectations that apply.
+`just inspect-recording <manifest.json>` runs final acceptance on an exported normal recording manifest from disk without hardware, Chrome, OPFS access, browser automation, or raw `.f32` chunk files. It requires version 1, state `stopped`, a valid `stoppedAt`, and closed chunks with complete, nonempty block records. The target defaults to the observed L-12 shape: 14 channels, 48 kHz, 960 frames per block, `f32-interleaved`, and zero native input drop deltas.
+For exploratory or recovered artifacts, run `node scripts/inspect-recording-manifest.mjs <manifest.json>` directly and choose only the expectations that apply. Without `--final`, live state and missing block records remain warnings; an exploratory PASS does not establish a complete recording. Add `--final` to use final acceptance with custom expectations.
 
 `just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling.
 
@@ -142,7 +142,9 @@ For the observed L-12 path, inspect the exported manifest with:
 just inspect-recording ./native-pcm-...-manifest.json
 ```
 
-The inspector checks the manifest stream shape, continuity arrays, chunk/block frame and byte math, top-level frame/block totals, and native input drop deltas. It fails on gaps, overlaps, discontinuities, channel mismatches, invalid blocks, malformed chunk metadata, fatal recovery warnings, and native dropped callback buffers/frames/events when the zero-drop expectation is enabled. It reports monitor underruns/overflows, WebSocket lag events, monitor counter resets, and write-backlog high-water counters as warnings because those are browser/monitor observability signals rather than direct proof of native input loss.
+The inspector checks the manifest stream shape, continuity arrays, chunk/block frame and byte math, top-level frame/block totals, and native input drop deltas. It derives frame adjacency from consecutive block records both within and across chunks, independently of the integrity arrays; a nonzero initial frame offset is allowed. Version 1 is the supported manifest version. Sample rate, channels and frames per block must be positive safe integers; frame positions, frame/byte counts, offsets and supplied discrete summaries must be nonnegative safe integers. Derived geometry sums/products must also stay within JavaScript's exact integer range (0–9,007,199,254,740,991). Derived durations can be fractional. Nullable recovery fields remain supported when evidence is unavailable.
+
+It fails on gaps, overlaps, discontinuities, channel mismatches, invalid blocks, malformed chunk metadata, fatal recovery warnings, and native dropped callback buffers/frames/events when the zero-drop expectation is enabled. It reports monitor underruns/overflows, WebSocket lag events, monitor counter resets, and write-backlog high-water counters as warnings because those are browser/monitor observability signals rather than direct proof of native input loss. A final-acceptance PASS validates manifest evidence only; it does not verify raw audio content or channel mapping.
 
 Monitor startup shares one owned attempt while the worklet module loads and audio resumes. Disconnect or stream replacement cancels publication and closes that attempt; load/resume failures show an error and enable Start Monitor for retry.
 
@@ -210,6 +212,8 @@ After a reload, tab close, or browser failure before Stop Recording, reopen the 
 A failed chunk close ends the recording in `error` with no `stoppedAt`. The incomplete chunk keeps a null `completedAt`, a `closeError`, and its in-memory writable until explicit cleanup. The error manifest preserves earlier closed chunks. After reload, recovery excludes the failed chunk with a `chunk-close-failed` warning and can export the earlier committed chunks; it never labels the session a clean stop. The offline inspector rejects a live manifest containing `closeError` chunks.
 
 Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, native input stats from the original manifest when present, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing native input stats in an older manifest, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
+
+Inspect recovered manifests with `node scripts/inspect-recording-manifest.mjs <recovered-manifest.json>` (optionally add stream expectations and `--expect-native-drops-zero` when those snapshots exist). Recovery summaries do not contain block lists, so offline inspection checks their reported geometry and recovery warnings and explicitly warns that raw files and internal continuity were not inspected. Final acceptance rejects recovered artifacts, including recovery exports of stopped sessions. Keep recovery reports and WAV/import checks as separate salvage evidence; they do not prove normal recording completion.
 
 Cleanly stopped prior sessions may also appear in OPFS Sessions after a reload. They can be exported through the recovery controls or deleted from OPFS. Delete only removes files whose names match the selected `native-pcm-*` session; it does not clear unrelated site data.
 
@@ -288,7 +292,7 @@ Short recording check with the sine source:
 6. Click Stop Recording.
 7. Confirm the manifest counters report 12 channels, 48 kHz, plausible duration/frames, no unexpected gaps, and `nativeInputStats` with zero native drops.
 8. Export the manifest.
-9. Run `node scripts/inspect-recording-manifest.mjs <manifest.json> --expect-channels 12 --expect-sample-rate 48000 --expect-frames-per-block 960 --expect-native-drops-zero`.
+9. Run `node scripts/inspect-recording-manifest.mjs <manifest.json> --final --expect-channels 12 --expect-sample-rate 48000 --expect-frames-per-block 960 --expect-native-drops-zero`.
 10. Choose a source channel and export the selected-channel WAV.
 11. Import or inspect the WAV as 32-bit float mono audio.
 

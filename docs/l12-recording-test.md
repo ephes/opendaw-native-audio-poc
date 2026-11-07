@@ -10,7 +10,9 @@ After exporting a manifest, run the offline manifest inspector and keep its repo
 just inspect-recording <manifest.json>
 ```
 
-The command does not use the L-12, Chrome, OPFS, browser automation, DAW import, or raw `.f32` chunk files. It fails on stream-shape mismatches, gaps, overlaps, discontinuities, channel mismatches, invalid blocks, chunk/block frame or byte inconsistencies, fatal recovery warnings, and native dropped callback buffers/frames/events. It reports monitor underruns/overflows, WebSocket lag, counter resets, and write-backlog high-water counters as warnings.
+The command enables `--final`: it requires a version-1 normal recording in state `stopped`, a valid stop timestamp, and closed chunks with complete, nonempty block records. It derives continuity within and across chunks from those records, checks safe-integer frame/byte geometry, and fails on stream-shape mismatches, gaps, overlaps, discontinuities, channel mismatches, invalid blocks, chunk/block frame or byte inconsistencies, and native dropped callback buffers/frames/events. It reports monitor underruns/overflows, WebSocket lag, counter resets, and write-backlog high-water counters as warnings. It does not use the L-12, Chrome, OPFS, browser automation, DAW import, or raw `.f32` chunk files; keep the audio/import checks below as separate evidence.
+
+For recovery tests, use `node scripts/inspect-recording-manifest.mjs <recovered-manifest.json>` instead. This exploratory mode preserves warnings for missing block lists and does not establish normal completion; fatal recovery warnings still fail. Recovered artifacts are rejected by `--final`, even when exported from a previously stopped session. Keep recovery reports and recovered WAV/import results separately from final acceptance.
 
 Before a longer recording run, the opt-in monitor smoke can check the real-device path quickly:
 

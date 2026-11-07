@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { inspectManifest, parseCliArgs } from "../scripts/inspect-recording-manifest.mjs";
 
@@ -78,6 +83,43 @@ test("inspectManifest fails cross-chunk frame continuity mismatches", () => {
   assert.match(result.errors.join("\n"), /chunks\[1\]\.firstFrameStart expected 960 after previous chunk, got 1920/);
 });
 
+for (const shift of [960, -480, -1920]) {
+  test(`inspectManifest derives intra-chunk continuity with a middle block shift of ${shift}`, () => {
+    const manifest = createThreeBlockManifest(1920);
+    manifest.chunks[0].blocks[1].frameStart += shift;
+    const result = inspectManifest(manifest);
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /blocks\[1\]\.frameStart expected 2880/);
+  });
+}
+
+test("inspectManifest accepts contiguous blocks starting at a nonzero frame", () => {
+  assert.equal(inspectManifest(createThreeBlockManifest(1920)).ok, true);
+});
+
+test("inspectManifest accepts contiguous chunks with a nonzero initial frame", () => {
+  const manifest = createTwoChunkManifestWithGap();
+  manifest.firstFrameStart = manifest.chunks[0].firstFrameStart = 960;
+  manifest.chunks[0].lastFrameStart = manifest.chunks[0].blocks[0].frameStart = 960;
+  manifest.chunks[0].lastFrameEnd = 1920;
+  assert.equal(inspectManifest(manifest, { finalAcceptance: true }).ok, true);
+});
+
+function createThreeBlockManifest(firstFrameStart = 0) {
+  const manifest = createStoppedManifest();
+  const chunk = manifest.chunks[0];
+  const blockBytes = chunk.blocks[0].byteLength;
+  chunk.blocks.push({ ...chunk.blocks[1], frameStart: 1920, chunkOffsetBytes: blockBytes * 2 });
+  for (const block of chunk.blocks) block.frameStart += firstFrameStart;
+  chunk.firstFrameStart = manifest.firstFrameStart = firstFrameStart;
+  chunk.lastFrameStart = firstFrameStart + 1920;
+  chunk.lastFrameEnd = manifest.expectedNextFrame = firstFrameStart + 2880;
+  chunk.frames = manifest.totalRecordedFrames = 2880;
+  chunk.blocksRecorded = manifest.recordedBlocks = 3;
+  chunk.bytes = blockBytes * 3;
+  return manifest;
+}
+
 test("inspectManifest fails native drops when zero drops are expected", () => {
   const manifest = createStoppedManifest();
   manifest.nativeInputStats.stop.nativeDroppedBlocks = 1;
@@ -148,6 +190,80 @@ test("inspectManifest warns but does not fail for non-stopped live manifests", (
   assert.match(result.warnings.join("\n"), /Manifest state is recording/);
 });
 
+test("final acceptance accepts a complete stopped recording", () => {
+  assert.equal(inspectManifest(createStoppedManifest(), { finalAcceptance: true }).ok, true);
+});
+
+for (const [label, mutate] of [
+  ["active state", (m) => { m.state = "recording"; }],
+  ["interrupted state", (m) => { m.state = "interrupted"; }],
+  ["missing state", (m) => { delete m.state; }],
+  ["missing stop timestamp", (m) => { m.stoppedAt = null; }],
+  ["invalid stop timestamp", (m) => { m.stoppedAt = "invalid"; }],
+  ["missing block evidence", (m) => { delete m.chunks[0].blocks; }],
+  ["unclosed chunk", (m) => { m.chunks[0].completedAt = null; }],
+  ["empty recording", (m) => {
+    m.chunks = []; m.totalRecordedFrames = 0; m.recordedBlocks = 0;
+    m.firstFrameStart = null; m.expectedNextFrame = null;
+  }],
+]) {
+  test(`final acceptance rejects ${label}`, () => {
+    const manifest = createStoppedManifest();
+    mutate(manifest);
+    assert.equal(inspectManifest(manifest, { finalAcceptance: true }).ok, false);
+  });
+}
+
+test("exploratory inspection preserves missing-block and recovery warnings", () => {
+  const manifest = createStoppedManifest();
+  delete manifest.chunks[0].blocks;
+  const result = inspectManifest(manifest);
+  assert.equal(result.ok, true);
+  assert.match(result.warnings.join("\n"), /internal block continuity was not validated/);
+
+  const recovered = createPartialRecoveredManifest();
+  recovered.chunks.pop();
+  recovered.recoveryWarnings = [];
+  recovered.exportableWav = true;
+  assert.equal(inspectManifest(recovered).ok, true);
+  assert.equal(inspectManifest(recovered, { finalAcceptance: true }).ok, false);
+});
+
+test("empty recorder manifests remain inspectable but cannot pass final acceptance", () => {
+  const manifest = createStoppedManifest();
+  manifest.chunks = [];
+  manifest.firstFrameStart = manifest.expectedNextFrame = null;
+  manifest.totalRecordedFrames = manifest.recordedBlocks = 0;
+  assert.equal(inspectManifest(manifest).ok, true);
+  const result = inspectManifest(manifest, { finalAcceptance: true });
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join("\n"), /requires complete, nonempty block metadata/);
+});
+
+test("documented acceptance recipe runs the strict CLI on synthetic manifests", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "manifest-inspector-"));
+  const fileName = path.join(directory, "manifest.json");
+  const cwd = fileURLToPath(new URL("..", import.meta.url));
+  try {
+    for (const kind of ["stopped", "active", "missing-blocks"]) {
+      const manifest = createStoppedManifest();
+      if (kind === "active") manifest.state = "recording";
+      if (kind === "missing-blocks") delete manifest.chunks[0].blocks;
+      await writeFile(fileName, JSON.stringify(manifest));
+      const result = spawnSync("just", ["inspect-recording", fileName], { cwd, encoding: "utf8" });
+      assert.ifError(result.error);
+      assert.equal(result.status, kind === "stopped" ? 0 : 1, result.stdout + result.stderr);
+      assert.match(result.stdout, /Mode: final acceptance/);
+    }
+    const result = spawnSync(process.execPath, ["scripts/inspect-recording-manifest.mjs", fileName],
+      { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /Mode: exploratory/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("inspectManifest reports monitor and write-backlog counters as warnings", () => {
   const manifest = createStoppedManifest();
   manifest.counterDeltasAtStop.underrunsDuringRecording = 2;
@@ -182,6 +298,7 @@ test("parseCliArgs parses inspector options", () => {
       "--expect-frames-per-block",
       "960",
       "--expect-native-drops-zero",
+      "--final",
     ]),
     {
       help: false,
@@ -191,6 +308,7 @@ test("parseCliArgs parses inspector options", () => {
         expectSampleRate: 48000,
         expectFramesPerBlock: 960,
         expectNativeDropsZero: true,
+        finalAcceptance: true,
       },
     },
   );
@@ -215,6 +333,84 @@ function l12Options() {
     expectNativeDropsZero: true,
   };
 }
+
+const geometryPaths = [
+  ["sampleRate"], ["channels"], ["framesPerBlock"], ["version"],
+  ["firstFrameStart"], ["expectedNextFrame"], ["recordedBlocks"], ["totalRecordedFrames"],
+  ["chunks", 0, "frames"], ["chunks", 0, "bytes"], ["chunks", 0, "blocksRecorded"],
+  ["chunks", 0, "channels"], ["chunks", 0, "index"],
+  ["chunks", 0, "firstFrameStart"], ["chunks", 0, "lastFrameStart"], ["chunks", 0, "lastFrameEnd"],
+  ...["frameStart", "frameCount", "chunkOffsetBytes", "byteLength", "receivedBlockIndex"]
+    .map((key) => ["chunks", 0, "blocks", 0, key]),
+];
+for (const keys of geometryPaths) {
+  for (const value of [0.5, Number.MAX_SAFE_INTEGER + 1, -1, "960", null]) {
+    test(`inspectManifest rejects ${keys.join(".")} = ${JSON.stringify(value)}`, () => {
+      const manifest = createStoppedManifest();
+      const parent = keys.slice(0, -1).reduce((object, key) => object[key], manifest);
+      parent[keys.at(-1)] = value;
+      assert.equal(inspectManifest(manifest).ok, false);
+    });
+  }
+}
+
+test("inspectManifest only supports manifest version 1", () => {
+  const manifest = createStoppedManifest();
+  manifest.version = 2;
+  assert.equal(inspectManifest(manifest).ok, false);
+});
+
+test("inspectManifest checks frame-end addition before comparing rounded summaries", () => {
+  const manifest = createThreeBlockManifest(Number.MAX_SAFE_INTEGER - 1000);
+  const result = inspectManifest(manifest);
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join("\n"), /frame end.*safe integer/);
+});
+
+test("inspectManifest checks byte products and accumulated totals for overflow", () => {
+  const manifest = createStoppedManifest();
+  const frames = 2 ** 46;
+  const bytes = frames * 14 * 4;
+  const chunk = manifest.chunks[0];
+  chunk.blocks = [{ frameStart: 0, frameCount: frames, chunkOffsetBytes: 0, byteLength: bytes }];
+  chunk.frames = chunk.lastFrameEnd = frames;
+  chunk.bytes = bytes;
+  chunk.lastFrameStart = 0;
+  chunk.blocksRecorded = 1;
+  manifest.chunks = [chunk, { ...chunk, firstFrameStart: frames, lastFrameStart: frames,
+    lastFrameEnd: frames * 2, blocks: [{ ...chunk.blocks[0], frameStart: frames }] },
+    { ...chunk, firstFrameStart: frames * 2, lastFrameStart: frames * 2,
+      lastFrameEnd: frames * 3, blocks: [{ ...chunk.blocks[0], frameStart: frames * 2 }] }];
+  manifest.totalRecordedFrames = manifest.expectedNextFrame = frames * 3;
+  manifest.recordedBlocks = 3;
+  const result = inspectManifest(manifest);
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join("\n"), /total bytes.*safe integer/);
+
+  manifest.channels = 2 ** 51;
+  const productResult = inspectManifest(manifest);
+  assert.equal(productResult.ok, false);
+  assert.match(productResult.errors.join("\n"), /bytes per frame.*safe integer/);
+});
+
+test("inspectManifest validates optional recovered geometry and keeps fractional duration", () => {
+  const manifest = createPartialRecoveredManifest();
+  manifest.chunks.pop();
+  manifest.recoveryWarnings = [];
+  manifest.exportableWav = true;
+  assert.equal(inspectManifest(manifest).ok, true);
+  assert.equal(inspectManifest(manifest).summary.durationSeconds, 0.02);
+  for (const [object, key] of [[manifest.reconstructed, "frames"], [manifest.reconstructed, "bytes"],
+    [manifest.reconstructed, "chunks"], [manifest.chunks[0], "expectedBytes"],
+    [manifest.chunks[0], "manifestFrames"]]) {
+    const previous = object[key];
+    object[key] = 0.5;
+    const result = inspectManifest(manifest);
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /safe integer/);
+    object[key] = previous;
+  }
+});
 
 function createTwoChunkManifestWithGap() {
   const manifest = createStoppedManifest();
