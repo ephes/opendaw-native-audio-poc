@@ -50,7 +50,12 @@ The current Rust server sends `stream-started` when a WebSocket client connects,
 The Worker accepts only the three control types above. Stream geometry must use
 positive integers: at most 64 channels, 384,000 Hz and 65,536 frames/block,
 with `sampleFormat: "f32-interleaved"`. The rounded power-of-two monitor ring,
-including metadata, must fit in 64 MiB. Control text is limited to 4,096 UTF-16
+including its 256-byte metadata, must fit in 64 MiB:
+`nextPowerOfTwo(max(framesPerBlock * 8, sampleRate * 2)) * channels * 4 + 256`.
+The Rust CLI applies the same ranges and combined byte ceiling with checked
+arithmetic before listener/source startup for both sine and input sources.
+For example, 31 channels at 262,144 Hz and 65,536 frames/block fit; 32 do not.
+The per-field maxima are not jointly admissible. Control text is limited to 4,096 UTF-16
 code units; stats counters must be nonnegative safe integers and error messages
 at most 1,024 code units with one of the documented error codes. Invalid JSON,
 unsupported controls and excessive geometry produce a bounded error without
@@ -80,7 +85,23 @@ bytes 14..16  reserved
 bytes 16..N   Float32 little-endian interleaved PCM
 ```
 
-`frameStart` is the first frame index in the backend stream timeline. `frameCount * channelCount` Float32 samples follow the 16-byte header.
+`frameStart` is the first frame index in the backend stream timeline. Both the
+u64 cursor and its exclusive end (`frameStart + frameCount`) must be at most
+`Number.MAX_SAFE_INTEGER` (9,007,199,254,740,991). The decoder checks these as
+BigInts before conversion; unsafe positions are invalid blocks, never rounded.
+`frameCount` must be 1–65,536 and `channelCount` 1–64, matching the stream's
+channel count. Reserved bytes must be zero. Exactly `frameCount * channelCount`
+Float32 samples follow the 16-byte header; no trailing or missing bytes are
+accepted. Unsupported headers fail before sample views are exposed.
+Every sample must be a finite Float32 value. NaN and either infinity invalidate
+the whole block before publication; finite PCM bytes (including signed zero and
+subnormals) are preserved exactly, with no clamping or zero substitution.
+
+Invalid blocks produce an error and, during recording, an `integrity.invalidBlocks`
+event (a supported but unexpected channel count uses `channelMismatches`). They
+never enter OPFS, the monitor ring, received-block counters or meters. The next
+valid block is accepted; recording continuity compares it with the last accepted
+exclusive end, preserving any gap or overlap evidence.
 
 ### Native callback queue and aggregation
 

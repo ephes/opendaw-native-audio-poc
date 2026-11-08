@@ -112,3 +112,62 @@ function createPcmBlock({ frameStart, frameCount, channels, samples }) {
   }
   return buffer;
 }
+
+import { pcmBlock } from "./fixtures/pcm.mjs";
+
+test("PCM cursor and exclusive end must both be exact JS integers", () => {
+  const max = BigInt(Number.MAX_SAFE_INTEGER);
+  const last = decodePcmBlock(pcmBlock({ frameStart: max - 2n }));
+  assert.equal(last.ok, true);
+  assert.equal(last.frameStart + last.frameCount, Number.MAX_SAFE_INTEGER);
+  for (const frameStart of [max - 1n, max, max + 1n, max + 2n, 2n ** 64n - 1n]) {
+    const block = decodePcmBlock(pcmBlock({ frameStart }));
+    assert.equal(block.ok, false, String(frameStart));
+    assert.equal(block.kind, "unsafe-frame-index");
+    assert.equal(block.samples, undefined);
+    assert.equal(block.frameStart, undefined); // Never publish a rounded identity.
+  }
+});
+
+test("PCM header requires supported positive bounded geometry and reserved zero", () => {
+  for (const header of [
+    { frameCount: 0, channels: 0 }, { frameCount: 0 }, { channels: 0 },
+    { frameCount: 65537 }, { frameCount: 0xffffffff }, { channels: 65 },
+    { channels: 65535 }, { reserved: 1 }, { reserved: 0xffff },
+  ]) {
+    const block = decodePcmBlock(pcmBlock({ ...header, samples: [] }));
+    assert.equal(block.ok, false, JSON.stringify(header));
+    assert.equal(block.kind, header.reserved ? "unsupported-reserved" : "invalid-geometry");
+    assert.equal(block.samples, undefined);
+  }
+  for (const [frameCount, channels] of [[65536, 1], [1, 64]]) {
+    assert.equal(decodePcmBlock(pcmBlock({ frameCount, channels,
+      samples: Array(frameCount * channels).fill(0.25) })).ok, true);
+  }
+});
+
+test("PCM rejects nonfinite samples at every channel before exposing payloads", () => {
+  for (const value of [NaN, Infinity, -Infinity]) {
+    for (let channel = 0; channel < 2; channel++) {
+      const samples = [0.25, -0.5, 0.75, -1];
+      samples[2 + channel] = value;
+      const block = decodePcmBlock(pcmBlock({ samples }));
+      assert.equal(block.ok, false, `${value}, channel ${channel}`);
+      assert.equal(block.kind, "nonfinite-sample");
+      assert.equal(block.samples, undefined);
+      assert.equal(block.dataBytes, undefined);
+    }
+  }
+});
+
+test("finite PCM retains exact payload bits including signed zero and subnormals", () => {
+  const buffer = pcmBlock();
+  const view = new DataView(buffer);
+  [0x80000000, 0x00000001, 0x7f7fffff, 0xff7fffff]
+    .forEach((bits, i) => view.setUint32(16 + i * 4, bits, true));
+  const original = new Uint8Array(buffer).slice(16);
+  const block = decodePcmBlock(buffer);
+  assert.equal(block.ok, true);
+  assert.deepEqual(block.dataBytes, original);
+  assert.ok(Object.is(block.samples[0], -0));
+});

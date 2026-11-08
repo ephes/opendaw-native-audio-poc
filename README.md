@@ -57,6 +57,14 @@ cargo run -- serve --source input --device "ZOOM" --channels 14 --sample-rate 48
 
 `--device` is a case-insensitive substring match against the cpal input device name. It is ignored for `--source sine`.
 
+For both sources, CLI geometry is limited to `--channels 1..64`,
+`--sample-rate 1..384000`, and `--frames-per-block 1..65536`. Combinations must
+also fit the browser's 64 MiB monitor ring, including its 256-byte metadata:
+`nextPowerOfTwo(max(framesPerBlock * 8, sampleRate * 2)) * channels * 4 + 256`.
+The CLI checks geometry and byte arithmetic before binding a listener or opening
+a source/device. The individual maxima cannot all be used together; for example,
+31 channels at 262144 Hz with 65536 frames/block fits, while 32 channels does not.
+
 The server defaults to `http://127.0.0.1:4545` and exposes its PCM WebSocket at `/ws`. Use `--port` to choose another port and `--frames-per-block` to change the WebSocket block size. The page is served with COOP/COEP headers so `SharedArrayBuffer` is available.
 
 Development shorthand:
@@ -160,6 +168,16 @@ Raw size is substantial:
 ```
 
 New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. Index read-modify-write operations use an origin-wide Web Locks API lock and reload the index while holding it, preserving unrelated sessions across tabs/workers. An unavailable Web Locks API refuses index mutations explicitly. Reset/Delete update the index before removing artifacts, so a lock or index-write failure preserves the session files for retry. As before, a malformed/unreadable discovery index produces scan warnings and uses an empty-index fallback on the next mutation; artifact scanning still discovers saved sessions. Failed writes abort their writable and release the lock for retry. The shared index is a discovery aid; recovery also scans artifact names directly.
+
+PCM admission requires 1–65,536 frames, 1–64 channels matching the stream, zero
+reserved header bytes, and an exact payload length. The cursor and exclusive
+frame end must both fit JavaScript's safe integer range; larger u64 positions
+are refused before conversion. Every Float32 sample must be finite; NaN and
+positive/negative infinity reject the entire block without replacing values.
+Finite samples, including signed zero and subnormals, retain their exact bytes.
+Invalid blocks are reported in recording integrity
+and do not reach OPFS, monitoring or meters. The next valid block is compared
+with the last accepted end for gap/overlap detection. See [the binary contract](docs/protocol.md#pcm-blocks).
 
 The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
 

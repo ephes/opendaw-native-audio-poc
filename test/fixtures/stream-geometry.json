@@ -1,0 +1,21 @@
+[
+  {"channels": 1, "sampleRate": 1, "framesPerBlock": 1, "accepted": true},
+  {"channels": 12, "sampleRate": 48000, "framesPerBlock": 960, "accepted": true},
+  {"channels": 14, "sampleRate": 48000, "framesPerBlock": 960, "accepted": true},
+  {"channels": 64, "sampleRate": 65536, "framesPerBlock": 16384, "accepted": true},
+  {"channels": 31, "sampleRate": 262144, "framesPerBlock": 65536, "accepted": true},
+  {"channels": 15, "sampleRate": 384000, "framesPerBlock": 65536, "accepted": true},
+  {"channels": 0, "sampleRate": 48000, "framesPerBlock": 960, "accepted": false},
+  {"channels": 65, "sampleRate": 48000, "framesPerBlock": 960, "accepted": false},
+  {"channels": 65535, "sampleRate": 4294967295, "framesPerBlock": 4294967295, "accepted": false},
+  {"channels": 2, "sampleRate": 0, "framesPerBlock": 960, "accepted": false},
+  {"channels": 2, "sampleRate": 384001, "framesPerBlock": 960, "accepted": false},
+  {"channels": 2, "sampleRate": 4294967295, "framesPerBlock": 960, "accepted": false},
+  {"channels": 2, "sampleRate": 48000, "framesPerBlock": 0, "accepted": false},
+  {"channels": 2, "sampleRate": 48000, "framesPerBlock": 65537, "accepted": false},
+  {"channels": 2, "sampleRate": 48000, "framesPerBlock": 4294967295, "accepted": false},
+  {"channels": 64, "sampleRate": 65537, "framesPerBlock": 16384, "accepted": false},
+  {"channels": 64, "sampleRate": 65536, "framesPerBlock": 16385, "accepted": false},
+  {"channels": 32, "sampleRate": 262144, "framesPerBlock": 65536, "accepted": false},
+  {"channels": 16, "sampleRate": 384000, "framesPerBlock": 65536, "accepted": false}
+]
