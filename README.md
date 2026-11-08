@@ -181,6 +181,19 @@ with the last accepted end for gap/overlap detection. See [the binary contract](
 
 The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
 
+On chunk close, immutable block metadata is saved once as `<chunk-file>.f32.json`
+before a compact manifest checkpoint publishes `chunkMetadata: {format:
+"per-chunk-v1", count: N}`. These checkpoints omit `chunks`; the index also
+uses a chunk count and naming pattern instead of a growing file-name list.
+Checkpoint serialization therefore visits each block once across the recording,
+rather than rewriting earlier block lists. Stop/error manifests and downloaded
+manifests still contain the full `chunks` array. Recovery loads checkpoint
+metadata in chunk order (up to 10,000 chunks) and retains the complete block
+evidence in the recovered manifest. Missing or mismatched metadata produces a
+fatal recovery warning and refuses WAV export; other sessions remain accessible.
+Historical manifests with inline chunk metadata remain readable. Reset and
+Delete Session remove both PCM files and their metadata sidecars.
+
 The manifest includes:
 
 - session id, start/stop wall-clock timestamps, sample rate, channel count, frames per block, and sample format
@@ -215,6 +228,7 @@ Recovery scan looks only at this PoC's `native-pcm-*` OPFS artifacts:
 - `native-pcm-recordings-index.json`
 - `native-pcm-*-manifest.json`
 - `native-pcm-*-chunk-*.f32`
+- `native-pcm-*-chunk-*.f32.json` (immutable checkpoint metadata)
 
 After a reload, tab close, or browser failure before Stop Recording, reopen the page and use OPFS Sessions:
 
