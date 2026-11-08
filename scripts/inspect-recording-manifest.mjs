@@ -324,7 +324,7 @@ function inspectIntegrity(manifest, errors, warnings, summary) {
     const count = integrityEventCount(manifest.integrity, name, entries, errors);
     summary.continuity[name] = count;
     if (count > 0) {
-      errors.push(`integrity.${name} has ${count} entr${entries.length === 1 ? "y" : "ies"}`);
+      errors.push(`integrity.${name} has ${count} entr${count === 1 ? "y" : "ies"}`);
     }
   }
 
@@ -338,7 +338,7 @@ function inspectIntegrity(manifest, errors, warnings, summary) {
     const count = integrityEventCount(manifest.integrity, name, entries, errors);
     summary.counters[name] = count;
     if (count > 0) {
-      warnings.push(`integrity.${name} has ${count} entr${entries.length === 1 ? "y" : "ies"}`);
+      warnings.push(`integrity.${name} has ${count} entr${count === 1 ? "y" : "ies"}`);
     }
   }
 }

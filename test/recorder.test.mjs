@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 
 import { PcmRecorder } from "../public/recorder.js";
+import { inspectManifest } from "../scripts/inspect-recording-manifest.mjs";
 
 test("PcmRecorder starts with explicit unavailable native input stats", () => {
   const recorder = createRecorder();
@@ -572,8 +573,6 @@ for (const failure of ["lock", "index"]) {
     assert.notEqual(recorder.session, previousSession);
   });
 }
-
-import { inspectManifest } from "../scripts/inspect-recording-manifest.mjs";
 
 test("pending PCM ceiling refuses overflow and drains admitted audio as incomplete", async () => {
   const { recorder, root } = storedRecorder();
