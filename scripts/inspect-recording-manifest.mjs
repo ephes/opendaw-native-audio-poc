@@ -321,9 +321,10 @@ function inspectIntegrity(manifest, errors, warnings, summary) {
       summary.continuity[name] = "unknown";
       continue;
     }
-    summary.continuity[name] = entries.length;
-    if (entries.length > 0) {
-      errors.push(`integrity.${name} has ${entries.length} entr${entries.length === 1 ? "y" : "ies"}`);
+    const count = integrityEventCount(manifest.integrity, name, entries, errors);
+    summary.continuity[name] = count;
+    if (count > 0) {
+      errors.push(`integrity.${name} has ${count} entr${count === 1 ? "y" : "ies"}`);
     }
   }
 
@@ -334,11 +335,24 @@ function inspectIntegrity(manifest, errors, warnings, summary) {
       summary.counters[name] = "unknown";
       continue;
     }
-    summary.counters[name] = entries.length;
-    if (entries.length > 0) {
-      warnings.push(`integrity.${name} has ${entries.length} entr${entries.length === 1 ? "y" : "ies"}`);
+    const count = integrityEventCount(manifest.integrity, name, entries, errors);
+    summary.counters[name] = count;
+    if (count > 0) {
+      warnings.push(`integrity.${name} has ${count} entr${count === 1 ? "y" : "ies"}`);
     }
   }
+}
+
+function integrityEventCount(integrity, name, entries, errors) {
+  if (integrity.eventCounts?.[name] === undefined) return entries.length; // Legacy manifest.
+  const count = integrity.eventCounts[name];
+  const omitted = integrity.omittedCounts?.[name];
+  if (!Number.isSafeInteger(count) || count < entries.length ||
+      !Number.isSafeInteger(omitted) || omitted !== count - entries.length) {
+    errors.push(`integrity.${name} has inconsistent event/omitted counts`);
+    return entries.length;
+  }
+  return count;
 }
 
 function inspectChunks(manifest, errors, warnings) {
