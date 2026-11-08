@@ -359,3 +359,18 @@ Nonbrowser clients must explicitly send the same Origin header as the served
 page. There is no missing-Origin bypass. This protects against unrelated browser
 pages; it does not authenticate local programs, which can forge these headers.
 COOP/COEP response headers provide isolation, not WebSocket authorization.
+
+### Bounded recorder admission and diagnostics
+
+Pending PCM, including the write in progress, is limited to 64 MiB. A block
+that would exceed this ceiling is refused before enqueue; admission stops
+immediately and queued audio drains and closes through the lifecycle queue.
+The manifest ends in `error`, with `admissionError` and no `stoppedAt`, preserving
+committed audio for export/recovery without claiming complete capture.
+
+Integrity arrays and native-input `events` retain at most 32 samples: the first
+16 and most recent 16. Each owning object has `eventCounts` and `omittedCounts`
+maps keyed by array name; totals remain exact and omissions equal total minus
+retained samples. Status and offline inspection use totals. Historical manifests
+without these maps still use array lengths. Recovery exports preserve integrity
+samples and totals; any retained integrity failure still fails inspection.

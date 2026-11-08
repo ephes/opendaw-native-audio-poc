@@ -4,6 +4,8 @@ const CHUNK_TARGET_BYTES = 64 * 1024 * 1024;
 const BYTES_PER_SAMPLE = 4;
 const STATUS_INTERVAL_MS = 500;
 const BACKLOG_WARNING_BYTES = 64 * 1024 * 1024;
+const PENDING_PCM_CEILING_BYTES = 64 * 1024 * 1024;
+const EVENT_SAMPLE_LIMIT = 32;
 const INDEX_FILE_NAME = "native-pcm-recordings-index.json";
 const ARTIFACT_PREFIX = "native-pcm-";
 const MANIFEST_SUFFIX = "-manifest.json";
@@ -40,7 +42,7 @@ export class PcmRecorder {
       const previousSessionStats = this.session.nativeInputStats.latest;
       this.session.nativeInputStats.latest = { ...normalized };
       if (nativeCountersIncreased(previousSessionStats, normalized)) {
-        this.session.nativeInputStats.events.push({ ...normalized });
+        appendEvent(this.session.nativeInputStats, "events", { ...normalized });
         this.postStatus(true);
       }
     } else if (nativeCountersIncreased(previous, normalized)) {
@@ -136,6 +138,7 @@ export class PcmRecorder {
         mode: "opfs",
         chunkTargetBytes: CHUNK_TARGET_BYTES,
         writeBacklogWarningBytes: BACKLOG_WARNING_BYTES,
+        pendingPcmCeilingBytes: PENDING_PCM_CEILING_BYTES,
         persisted,
         note: "Chunk files are interleaved Float32 little-endian PCM without per-file headers.",
       },
@@ -186,7 +189,7 @@ export class PcmRecorder {
   }
 
   async stopNow({ interruption = null, counters = null, nativeStats = null } = {}) {
-    if (this.state !== "recording") {
+    if (this.state !== "recording" && !(this.state === "stopping" && this.session?.admissionError)) {
       return;
     }
     try {
@@ -206,8 +209,8 @@ export class PcmRecorder {
       if (this.state === "error") throw new Error(this.lastError);
       await this.closeCurrentChunk();
       if (this.session) {
-        this.session.state = interruption ? "interrupted" : "stopped";
-        this.session.stoppedAt = interruption ? null : new Date().toISOString();
+        this.session.state = this.session.admissionError ? "error" : interruption ? "interrupted" : "stopped";
+        this.session.stoppedAt = interruption || this.session.admissionError ? null : new Date().toISOString();
         if (interruption) {
           this.session.interruptedAt = new Date().toISOString();
           this.session.interruption = interruption;
@@ -216,7 +219,7 @@ export class PcmRecorder {
         await this.writeManifestToStorage();
         await this.updateIndexSession(this.session.state);
       }
-      this.state = interruption ? "interrupted" : "stopped";
+      this.state = this.session?.admissionError ? "error" : interruption ? "interrupted" : "stopped";
     } catch (error) {
       this.setError(`Failed to stop recording cleanly: ${error.message}`);
       this.state = "error";
@@ -266,6 +269,15 @@ export class PcmRecorder {
     if (this.state !== "recording" || !this.session) {
       return;
     }
+    if (dataBytes.byteLength > PENDING_PCM_CEILING_BYTES - this.pendingWriteBytes) {
+      this.session.admissionError = "Recording pending PCM byte ceiling exceeded; recording is incomplete";
+      this.setError(this.session.admissionError);
+      this.state = "stopping";
+      this.session.state = "stopping";
+      this.enqueueLifecycle(() => this.stopNow());
+      this.postStatus(true);
+      return;
+    }
     const block = { frameStart, frameCount, channels, receivedBlockIndex, dataBytes };
     this.pendingWriteBlocks += 1;
     this.pendingWriteBytes += dataBytes.byteLength;
@@ -286,7 +298,7 @@ export class PcmRecorder {
       this.writeBacklogHighWaterBytes,
     );
     while (this.pendingWriteBytes >= this.nextBacklogWarningBytes) {
-      this.session.integrity.writeBacklogEvents.push({
+      appendEvent(this.session.integrity, "writeBacklogEvents", {
         pendingBlocks: this.pendingWriteBlocks,
         pendingBytes: this.pendingWriteBytes,
         highWaterBlocks: this.writeBacklogHighWaterBlocks,
@@ -328,7 +340,7 @@ export class PcmRecorder {
       return;
     }
     const counters = this.readCounters();
-    this.session.integrity.counterResets.push({
+    appendEvent(this.session.integrity, "counterResets", {
       reason,
       previousBaseline: { ...this.session.counterBaselines },
       newBaseline: {
@@ -347,7 +359,7 @@ export class PcmRecorder {
     if (!this.session || (this.state !== "recording" && this.state !== "stopping")) {
       return;
     }
-    this.session.integrity.channelMismatches.push({
+    appendEvent(this.session.integrity, "channelMismatches", {
       frameStart,
       frameCount,
       expectedChannels,
@@ -361,7 +373,7 @@ export class PcmRecorder {
     if (!this.session || (this.state !== "recording" && this.state !== "stopping")) {
       return;
     }
-    this.session.integrity.invalidBlocks.push({
+    appendEvent(this.session.integrity, "invalidBlocks", {
       reason,
       at: new Date().toISOString(),
     });
@@ -372,7 +384,7 @@ export class PcmRecorder {
     if (!this.session || (this.state !== "recording" && this.state !== "stopping")) {
       return;
     }
-    this.session.integrity.websocketLagEvents.push({
+    appendEvent(this.session.integrity, "websocketLagEvents", {
       code,
       message,
       at: new Date().toISOString(),
@@ -535,6 +547,7 @@ export class PcmRecorder {
       manifestFileName: session.manifestFileName,
       chunkFilePrefix: session.chunkFilePrefix,
       nativeInputStats: session.nativeInputStats ?? null,
+      integrity: session.originalManifest?.integrity,
       manifestPresent: session.manifestPresent,
       indexPresent: session.indexPresent,
       exportableWav: session.exportableWav,
@@ -717,14 +730,14 @@ export class PcmRecorder {
       expectedNextFrame: this.session.expectedNextFrame,
       chunks: this.session.chunks.length,
       bytes,
-      gaps: this.session.integrity.gaps.length,
-      overlaps: this.session.integrity.overlaps.length,
-      discontinuities: this.session.integrity.discontinuities.length,
-      channelMismatches: this.session.integrity.channelMismatches.length,
-      invalidBlocks: this.session.integrity.invalidBlocks.length,
-      websocketLagEvents: this.session.integrity.websocketLagEvents.length,
-      counterResets: this.session.integrity.counterResets.length,
-      writeBacklogEvents: this.session.integrity.writeBacklogEvents.length,
+      gaps: eventCount(this.session.integrity, "gaps"),
+      overlaps: eventCount(this.session.integrity, "overlaps"),
+      discontinuities: eventCount(this.session.integrity, "discontinuities"),
+      channelMismatches: eventCount(this.session.integrity, "channelMismatches"),
+      invalidBlocks: eventCount(this.session.integrity, "invalidBlocks"),
+      websocketLagEvents: eventCount(this.session.integrity, "websocketLagEvents"),
+      counterResets: eventCount(this.session.integrity, "counterResets"),
+      writeBacklogEvents: eventCount(this.session.integrity, "writeBacklogEvents"),
       pendingWriteBlocks: this.pendingWriteBlocks,
       pendingWriteBytes: this.pendingWriteBytes,
       writeBacklogHighWaterBlocks: this.session.writeBacklogHighWaterBlocks,
@@ -800,8 +813,8 @@ export class PcmRecorder {
         missingFrames: block.frameStart - expected,
         recordedBlockIndex: this.session.recordedBlocks,
       };
-      this.session.integrity.gaps.push(gap);
-      this.session.integrity.discontinuities.push({ type: "gap", ...gap });
+      appendEvent(this.session.integrity, "gaps", gap);
+      appendEvent(this.session.integrity, "discontinuities", { type: "gap", ...gap });
     } else if (block.frameStart < expected) {
       const overlap = {
         expectedFrameStart: expected,
@@ -809,8 +822,8 @@ export class PcmRecorder {
         overlappingFrames: expected - block.frameStart,
         recordedBlockIndex: this.session.recordedBlocks,
       };
-      this.session.integrity.overlaps.push(overlap);
-      this.session.integrity.discontinuities.push({ type: "overlap", ...overlap });
+      appendEvent(this.session.integrity, "overlaps", overlap);
+      appendEvent(this.session.integrity, "discontinuities", { type: "overlap", ...overlap });
     }
 
     this.session.expectedNextFrame = Math.max(expected, block.frameStart + block.frameCount);
@@ -894,6 +907,8 @@ export class PcmRecorder {
         : null,
       nativeInputStats,
       integrity: {
+        eventCounts: { ...this.session.integrity.eventCounts },
+        omittedCounts: { ...this.session.integrity.omittedCounts },
         gaps: this.session.integrity.gaps.map((entry) => ({ ...entry })),
         overlaps: this.session.integrity.overlaps.map((entry) => ({ ...entry })),
         discontinuities: this.session.integrity.discontinuities.map((entry) => ({ ...entry })),
@@ -1131,6 +1146,8 @@ function cloneNativeInputStatsRecord(record) {
     start: record.start ? { ...record.start } : null,
     latest: record.latest ? { ...record.latest } : null,
     stop: record.stop ? { ...record.stop } : null,
+    eventCounts: { ...record.eventCounts },
+    omittedCounts: { ...record.omittedCounts },
     events: Array.isArray(record.events) ? record.events.map((entry) => ({ ...entry })) : [],
   };
 }
@@ -1488,4 +1505,19 @@ function latestTimestamp(values) {
   return values
     .filter(Boolean)
     .sort((a, b) => Date.parse(b) - Date.parse(a))[0] ?? null;
+}
+
+// Preserve the first half and rolling most recent half of each diagnostic stream.
+function appendEvent(record, name, event) {
+  record.eventCounts ??= {};
+  record.omittedCounts ??= {};
+  const entries = record[name];
+  record.eventCounts[name] = eventCount(record, name) + 1;
+  if (entries.length === EVENT_SAMPLE_LIMIT) entries.splice(EVENT_SAMPLE_LIMIT / 2, 1);
+  entries.push(event);
+  record.omittedCounts[name] = record.eventCounts[name] - entries.length;
+}
+
+function eventCount(record, name) {
+  return record.eventCounts?.[name] ?? record[name].length;
 }

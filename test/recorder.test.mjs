@@ -572,3 +572,83 @@ for (const failure of ["lock", "index"]) {
     assert.notEqual(recorder.session, previousSession);
   });
 }
+
+import { inspectManifest } from "../scripts/inspect-recording-manifest.mjs";
+
+test("pending PCM ceiling refuses overflow and drains admitted audio as incomplete", async () => {
+  const { recorder, root } = storedRecorder();
+  await recorder.start({ ...stream, channels: 64, framesPerBlock: 65536 });
+  recorder.recordBlock({ frameStart: 0, frameCount: 2, channels: 64, receivedBlockIndex: 0,
+    dataBytes: new Uint8Array(2 * 64 * 4) });
+  await recorder.writeChain;
+  await recorder.closeCurrentChunk();
+  const committed = root.files.get(recorder.session.chunks[0].fileName).slice();
+  const gate = barrier();
+  const entered = barrier();
+  const getHandle = root.getFileHandle.bind(root);
+  root.getFileHandle = async (name, options) => {
+    const handle = await getHandle(name, options);
+    if (name.endsWith(".f32")) {
+      const create = handle.createWritable;
+      handle.createWritable = async () => {
+        const writer = await create();
+        return { ...writer, async write(data) { entered.release(); await gate.promise; await writer.write(data); } };
+      };
+    }
+    return handle;
+  };
+  const dataBytes = new Uint8Array(65536 * 64 * 4);
+  // Valid maximum-size blocks; four fill the 64 MiB pending budget exactly.
+  for (let i = 0; i < 4; i++) recorder.recordBlock({ frameStart: 2 + i * 65536,
+    frameCount: 65536, channels: 64, receivedBlockIndex: i + 1, dataBytes: dataBytes.slice() });
+  await entered.promise;
+  assert.equal(recorder.pendingWriteBytes, 64 * 1024 * 1024);
+  for (let i = 0; i < 50; i++) recorder.recordBlock({ frameStart: 262146,
+    frameCount: 65536, channels: 64, receivedBlockIndex: 5, dataBytes });
+  assert.equal(recorder.pendingWriteBytes, 64 * 1024 * 1024);
+  assert.notEqual(recorder.state, "recording");
+  gate.release();
+  await recorder.lifecycleChain;
+  await recorder.stop();
+  assert.equal(recorder.pendingWriteBytes, 0);
+  assert.equal(recorder.pendingWriteBlocks, 0);
+  assert.equal(recorder.state, "error");
+  assert.equal(recorder.session.stoppedAt, null);
+  assert.equal(recorder.currentChunk, null);
+  assert.equal(recorder.session.recordedBlocks, 5);
+  assert.match(recorder.lastError, /pending PCM.*ceiling/i);
+  assert.deepEqual(root.files.get(recorder.session.chunks[0].fileName), committed);
+  const saved = JSON.parse(await (await getHandle(recorder.manifestFileName())).getFile().then(f => f.text()));
+  assert.equal(saved.state, "error");
+  assert.equal(saved.stoppedAt, null);
+});
+
+test("integrity diagnostics retain first and recent samples with exact totals", async () => {
+  const { recorder } = storedRecorder();
+  await recorder.start(stream);
+  for (let i = 0; i < 1000; i++) {
+    recorder.noteInvalidBlock(`invalid-${i}`);
+    recorder.noteChannelMismatch({ frameStart: i, expectedChannels: 2, actualChannels: 3 });
+    recorder.noteWebSocketLag({ code: "lag", message: `lag-${i}` });
+    recorder.auditTimeline({ frameStart: i * 4, frameCount: 2 });
+    recorder.setNativeInputStats({ nativeDroppedBlocks: i + 1 });
+  }
+  await record(recorder, 4000);
+  await recorder.stop();
+  const manifest = recorder.buildManifest();
+  for (const name of ["invalidBlocks", "channelMismatches", "websocketLagEvents", "gaps", "discontinuities"]) {
+    const total = 1000;
+    assert.equal(manifest.integrity[name].length, 32);
+    assert.equal(manifest.integrity.eventCounts[name], total);
+    assert.equal(manifest.integrity.omittedCounts[name], total - 32);
+    assert.equal(recorder.status()[name], total);
+  }
+  assert.equal(manifest.integrity.invalidBlocks[0].reason, "invalid-0");
+  assert.equal(manifest.integrity.invalidBlocks.at(-1).reason, "invalid-999");
+  assert.equal(manifest.nativeInputStats.events.length, 32);
+  assert.equal(manifest.nativeInputStats.eventCounts.events, 1000);
+  assert.equal(manifest.nativeInputStats.omittedCounts.events, 968);
+  const inspection = inspectManifest(manifest);
+  assert.equal(inspection.ok, false);
+  assert.equal(inspection.summary.continuity.invalidBlocks, 1000);
+});
