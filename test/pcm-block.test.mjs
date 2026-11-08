@@ -112,3 +112,36 @@ function createPcmBlock({ frameStart, frameCount, channels, samples }) {
   }
   return buffer;
 }
+
+import { pcmBlock } from "./fixtures/pcm.mjs";
+
+test("PCM cursor and exclusive end must both be exact JS integers", () => {
+  const max = BigInt(Number.MAX_SAFE_INTEGER);
+  const last = decodePcmBlock(pcmBlock({ frameStart: max - 2n }));
+  assert.equal(last.ok, true);
+  assert.equal(last.frameStart + last.frameCount, Number.MAX_SAFE_INTEGER);
+  for (const frameStart of [max - 1n, max, max + 1n, max + 2n, 2n ** 64n - 1n]) {
+    const block = decodePcmBlock(pcmBlock({ frameStart }));
+    assert.equal(block.ok, false, String(frameStart));
+    assert.equal(block.kind, "unsafe-frame-index");
+    assert.equal(block.samples, undefined);
+    assert.equal(block.frameStart, undefined); // Never publish a rounded identity.
+  }
+});
+
+test("PCM header requires supported positive bounded geometry and reserved zero", () => {
+  for (const header of [
+    { frameCount: 0, channels: 0 }, { frameCount: 0 }, { channels: 0 },
+    { frameCount: 65537 }, { frameCount: 0xffffffff }, { channels: 65 },
+    { channels: 65535 }, { reserved: 1 }, { reserved: 0xffff },
+  ]) {
+    const block = decodePcmBlock(pcmBlock({ ...header, samples: [] }));
+    assert.equal(block.ok, false, JSON.stringify(header));
+    assert.equal(block.kind, header.reserved ? "unsupported-reserved" : "invalid-geometry");
+    assert.equal(block.samples, undefined);
+  }
+  for (const [frameCount, channels] of [[65536, 1], [1, 64]]) {
+    assert.equal(decodePcmBlock(pcmBlock({ frameCount, channels,
+      samples: Array(frameCount * channels).fill(0.25) })).ok, true);
+  }
+});

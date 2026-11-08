@@ -80,7 +80,20 @@ bytes 14..16  reserved
 bytes 16..N   Float32 little-endian interleaved PCM
 ```
 
-`frameStart` is the first frame index in the backend stream timeline. `frameCount * channelCount` Float32 samples follow the 16-byte header.
+`frameStart` is the first frame index in the backend stream timeline. Both the
+u64 cursor and its exclusive end (`frameStart + frameCount`) must be at most
+`Number.MAX_SAFE_INTEGER` (9,007,199,254,740,991). The decoder checks these as
+BigInts before conversion; unsafe positions are invalid blocks, never rounded.
+`frameCount` must be 1–65,536 and `channelCount` 1–64, matching the stream's
+channel count. Reserved bytes must be zero. Exactly `frameCount * channelCount`
+Float32 samples follow the 16-byte header; no trailing or missing bytes are
+accepted. Unsupported headers fail before sample views are exposed.
+
+Invalid blocks produce an error and, during recording, an `integrity.invalidBlocks`
+event (a supported but unexpected channel count uses `channelMismatches`). They
+never enter OPFS, the monitor ring, received-block counters or meters. The next
+valid block is accepted; recording continuity compares it with the last accepted
+exclusive end, preserving any gap or overlap evidence.
 
 ### Native callback queue and aggregation
 

@@ -161,6 +161,13 @@ Raw size is substantial:
 
 New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. Index read-modify-write operations use an origin-wide Web Locks API lock and reload the index while holding it, preserving unrelated sessions across tabs/workers. An unavailable Web Locks API refuses index mutations explicitly. Reset/Delete update the index before removing artifacts, so a lock or index-write failure preserves the session files for retry. As before, a malformed/unreadable discovery index produces scan warnings and uses an empty-index fallback on the next mutation; artifact scanning still discovers saved sessions. Failed writes abort their writable and release the lock for retry. The shared index is a discovery aid; recovery also scans artifact names directly.
 
+PCM admission requires 1–65,536 frames, 1–64 channels matching the stream, zero
+reserved header bytes, and an exact payload length. The cursor and exclusive
+frame end must both fit JavaScript's safe integer range; larger u64 positions
+are refused before conversion. Invalid blocks are reported in recording integrity
+and do not reach OPFS, monitoring or meters. The next valid block is compared
+with the last accepted end for gap/overlap detection. See [the binary contract](docs/protocol.md#pcm-blocks).
+
 The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
 
 The manifest includes:
