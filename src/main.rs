@@ -37,6 +37,12 @@ use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
 const DEFAULT_PORT: u16 = 4545;
 const DEFAULT_FRAMES_PER_BLOCK: u32 = 960;
+// Keep these aligned with public/audio-worker.js and docs/protocol.md.
+const MAX_CHANNELS: u16 = 64;
+const MAX_SAMPLE_RATE: u32 = 384_000;
+const MAX_FRAMES_PER_BLOCK: u32 = 65_536;
+const MAX_RING_BYTES: u64 = 64 * 1024 * 1024;
+const RING_STATE_BYTES: u64 = 256;
 const PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS: usize = 256;
 const INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS: usize = 64;
 const CLIENT_SEND_DEADLINE: Duration = Duration::from_secs(2);
@@ -359,14 +365,40 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
 }
 
 fn validate_serve_args(args: &ServeArgs) -> Result<()> {
-    if args.channels == 0 {
-        bail!("--channels must be greater than zero");
+    if !(1..=MAX_CHANNELS).contains(&args.channels) {
+        bail!("--channels must be in 1..={MAX_CHANNELS}");
     }
-    if args.sample_rate == 0 {
-        bail!("--sample-rate must be greater than zero");
+    if !(1..=MAX_SAMPLE_RATE).contains(&args.sample_rate) {
+        bail!("--sample-rate must be in 1..={MAX_SAMPLE_RATE}");
     }
-    if args.frames_per_block == 0 {
-        bail!("--frames-per-block must be greater than zero");
+    if !(1..=MAX_FRAMES_PER_BLOCK).contains(&args.frames_per_block) {
+        bail!("--frames-per-block must be in 1..={MAX_FRAMES_PER_BLOCK}");
+    }
+    let frames = u64::from(args.frames_per_block);
+    let channels = u64::from(args.channels);
+    let block_bytes = frames
+        .checked_mul(channels)
+        .and_then(|samples| samples.checked_mul(4))
+        .and_then(|bytes| bytes.checked_add(16))
+        .context("PCM block byte size overflow")?;
+    // Same power-of-two capacity as the worker: eight blocks or two seconds.
+    let capacity = frames
+        .checked_mul(8)
+        .context("monitor block capacity overflow")?
+        .max(
+            u64::from(args.sample_rate)
+                .checked_mul(2)
+                .context("monitor sample capacity overflow")?,
+        )
+        .checked_next_power_of_two()
+        .context("monitor ring capacity overflow")?;
+    let ring_bytes = capacity
+        .checked_mul(channels)
+        .and_then(|samples| samples.checked_mul(4))
+        .and_then(|bytes| bytes.checked_add(RING_STATE_BYTES))
+        .context("monitor ring byte size overflow")?;
+    if block_bytes > MAX_RING_BYTES || ring_bytes > MAX_RING_BYTES {
+        bail!("stream geometry exceeds the 64 MiB monitor ring byte limit (including metadata)");
     }
     Ok(())
 }
@@ -795,6 +827,57 @@ mod tests {
         connect_async,
         tungstenite::{Error as WsError, Message as ClientMessage, client::IntoClientRequest},
     };
+
+    #[test]
+    fn cli_geometry_matches_worker_admission() {
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../test/fixtures/stream-geometry.json")).unwrap();
+        for case in cases {
+            for source in ["sine", "input"] {
+                let args = ServeArgs::try_parse_from([
+                    "serve",
+                    "--source",
+                    source,
+                    "--channels",
+                    &case["channels"].to_string(),
+                    "--sample-rate",
+                    &case["sampleRate"].to_string(),
+                    "--frames-per-block",
+                    &case["framesPerBlock"].to_string(),
+                ])
+                .unwrap();
+                assert_eq!(
+                    validate_serve_args(&args).is_ok(),
+                    case["accepted"].as_bool().unwrap(),
+                    "{source}: {case}"
+                );
+            }
+        }
+        for (flag, value) in [
+            ("--channels", "65536"),
+            ("--sample-rate", "4294967296"),
+            ("--frames-per-block", "4294967296"),
+        ] {
+            assert!(ServeArgs::try_parse_from(["serve", "--source", "sine", flag, value]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_geometry_precedes_listener_and_input_device_access() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        for source in [Source::Sine, Source::Input] {
+            let args = ServeArgs {
+                source,
+                device: Some("synthetic-missing-device".to_owned()),
+                channels: 65,
+                sample_rate: 48000,
+                frames_per_block: 960,
+                port: listener.local_addr().unwrap().port(),
+            };
+            let error = serve(args).await.unwrap_err().to_string();
+            assert!(error.contains("--channels"), "{error}");
+        }
+    }
 
     #[test]
     fn callback_partitions_match_concatenation_oracle() {

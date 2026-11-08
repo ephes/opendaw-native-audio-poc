@@ -57,6 +57,14 @@ cargo run -- serve --source input --device "ZOOM" --channels 14 --sample-rate 48
 
 `--device` is a case-insensitive substring match against the cpal input device name. It is ignored for `--source sine`.
 
+For both sources, CLI geometry is limited to `--channels 1..64`,
+`--sample-rate 1..384000`, and `--frames-per-block 1..65536`. Combinations must
+also fit the browser's 64 MiB monitor ring, including its 256-byte metadata:
+`nextPowerOfTwo(max(framesPerBlock * 8, sampleRate * 2)) * channels * 4 + 256`.
+The CLI checks geometry and byte arithmetic before binding a listener or opening
+a source/device. The individual maxima cannot all be used together; for example,
+31 channels at 262144 Hz with 65536 frames/block fits, while 32 channels does not.
+
 The server defaults to `http://127.0.0.1:4545` and exposes its PCM WebSocket at `/ws`. Use `--port` to choose another port and `--frames-per-block` to change the WebSocket block size. The page is served with COOP/COEP headers so `SharedArrayBuffer` is available.
 
 Development shorthand:
@@ -164,7 +172,10 @@ New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<crypt
 PCM admission requires 1–65,536 frames, 1–64 channels matching the stream, zero
 reserved header bytes, and an exact payload length. The cursor and exclusive
 frame end must both fit JavaScript's safe integer range; larger u64 positions
-are refused before conversion. Invalid blocks are reported in recording integrity
+are refused before conversion. Every Float32 sample must be finite; NaN and
+positive/negative infinity reject the entire block without replacing values.
+Finite samples, including signed zero and subnormals, retain their exact bytes.
+Invalid blocks are reported in recording integrity
 and do not reach OPFS, monitoring or meters. The next valid block is compared
 with the last accepted end for gap/overlap detection. See [the binary contract](docs/protocol.md#pcm-blocks).
 

@@ -14,6 +14,11 @@ for (const [name, first, invalid, next] of [
     [{ frameCount: 0, channels: 0, samples: [] }, { frameCount: 0, samples: [] },
       { channels: 0, samples: [] }, { frameCount: 65537, samples: [] },
       { channels: 65, samples: [] }, { reserved: 1 }, { reserved: 65535 }], 2n],
+  ...[NaN, Infinity, -Infinity].flatMap((value) => [0, 1].map((channel) => {
+    const samples = [0.25, -0.5, 0.75, -1];
+    samples[2 + channel] = value;
+    return [`nonfinite ${value} in channel ${channel}`, 0n, [{ frameStart: 2n, samples }], 4n];
+  })),
 ]) {
   test(`${name} never reaches recording or monitor publication`, async (t) => {
     const root = memoryStorage();
@@ -42,7 +47,14 @@ for (const [name, first, invalid, next] of [
     const manifest = JSON.parse(await f.messages.filter((m) => m.type === "download").at(-1).blob.text());
     assert.equal(manifest.integrity.invalidBlocks.length, invalid.length);
     assert.deepEqual(manifest.integrity.channelMismatches, []);
-    assert.deepEqual(manifest.integrity.gaps, []);
+    if (next === first + 2n) {
+      assert.deepEqual(manifest.integrity.gaps, []);
+    } else {
+      assert.equal(manifest.integrity.gaps.length, 1);
+      assert.equal(manifest.integrity.gaps[0].missingFrames, 2);
+      assert.equal(manifest.integrity.gaps[0].expectedFrameStart, 2);
+      assert.equal(manifest.integrity.gaps[0].actualFrameStart, 4);
+    }
     assert.deepEqual(manifest.integrity.overlaps, []);
     assert.equal(manifest.firstFrameStart, Number(first));
     assert.equal(manifest.expectedNextFrame, Number(next + 2n));

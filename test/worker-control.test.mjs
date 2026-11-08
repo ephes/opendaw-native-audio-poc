@@ -85,3 +85,26 @@ for (const pending of [false, true]) {
     assert.equal(manifest.totalRecordedFrames, pending ? 0 : 2);
   });
 }
+
+import { readFileSync } from "node:fs";
+import { pcmBlock } from "./fixtures/pcm.mjs";
+const geometryCases = JSON.parse(readFileSync(new URL("./fixtures/stream-geometry.json", import.meta.url)));
+
+test("producer and worker share geometry limits including rounded ring byte ceiling", async (t) => {
+  const f = await workerFixture(t);
+  for (const { accepted, ...geometry } of geometryCases) {
+    const start = f.messages.length;
+    f.socket.emit("message", JSON.stringify({ type: "stream-started", ...geometry, sampleFormat: "f32-interleaved" }));
+    const result = f.messages.slice(start);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].type, accepted ? "shared-buffer" : "error", JSON.stringify(geometry));
+    if (accepted) {
+      assert.ok(result[0].sharedBuffer.byteLength <= 64 * 1024 * 1024);
+      // Exercise full maximum block geometry with synthetic finite samples.
+      const samples = Array(geometry.channels * geometry.framesPerBlock).fill(0.25);
+      f.socket.emit("message", pcmBlock({ frameCount: geometry.framesPerBlock,
+        channels: geometry.channels, samples }));
+      assert.equal(new Int32Array(result[0].sharedBuffer)[STATE.RECEIVED_BLOCKS], 1);
+    }
+  }
+});

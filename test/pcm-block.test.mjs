@@ -145,3 +145,29 @@ test("PCM header requires supported positive bounded geometry and reserved zero"
       samples: Array(frameCount * channels).fill(0.25) })).ok, true);
   }
 });
+
+test("PCM rejects nonfinite samples at every channel before exposing payloads", () => {
+  for (const value of [NaN, Infinity, -Infinity]) {
+    for (let channel = 0; channel < 2; channel++) {
+      const samples = [0.25, -0.5, 0.75, -1];
+      samples[2 + channel] = value;
+      const block = decodePcmBlock(pcmBlock({ samples }));
+      assert.equal(block.ok, false, `${value}, channel ${channel}`);
+      assert.equal(block.kind, "nonfinite-sample");
+      assert.equal(block.samples, undefined);
+      assert.equal(block.dataBytes, undefined);
+    }
+  }
+});
+
+test("finite PCM retains exact payload bits including signed zero and subnormals", () => {
+  const buffer = pcmBlock();
+  const view = new DataView(buffer);
+  [0x80000000, 0x00000001, 0x7f7fffff, 0xff7fffff]
+    .forEach((bits, i) => view.setUint32(16 + i * 4, bits, true));
+  const original = new Uint8Array(buffer).slice(16);
+  const block = decodePcmBlock(buffer);
+  assert.equal(block.ok, true);
+  assert.deepEqual(block.dataBytes, original);
+  assert.ok(Object.is(block.samples[0], -0));
+});

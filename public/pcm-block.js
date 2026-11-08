@@ -70,6 +70,15 @@ export function decodePcmBlock(buffer, { expectedChannels } = {}) {
   }
 
   const samples = new Float32Array(buffer, PCM_BLOCK_HEADER_BYTES, sampleCount);
+  for (let index = 0; index < samples.length; index++) {
+    if (!Number.isFinite(samples[index])) {
+      return {
+        ok: false,
+        kind: "nonfinite-sample",
+        message: `PCM block contains a nonfinite sample at index ${index}`,
+      };
+    }
+  }
   const dataBytes = new Uint8Array(buffer, PCM_BLOCK_HEADER_BYTES, samples.byteLength);
 
   return {
