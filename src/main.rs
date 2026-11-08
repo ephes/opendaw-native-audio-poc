@@ -796,6 +796,191 @@ mod tests {
         tungstenite::{Error as WsError, Message as ClientMessage, client::IntoClientRequest},
     };
 
+    #[test]
+    fn callback_partitions_match_concatenation_oracle() {
+        let frames_per_block = 4;
+        for channels in [1_u16, 2, 5] {
+            for partitions in [
+                vec![],
+                vec![0],
+                vec![1, 1, 1, 1, 1, 1, 1, 1, 1],
+                vec![3, 7, 0, 2, 6, 1],
+                vec![12],
+                vec![4, 4],
+                vec![2, 1],
+            ] {
+                let total_samples = partitions.iter().sum::<usize>() * usize::from(channels);
+                let source: Vec<f32> = (0..total_samples)
+                    .map(|index| (index as f32 - 17.0) / 8.0)
+                    .collect();
+                let block_samples = frames_per_block as usize * usize::from(channels);
+                let expected: Vec<_> = source.chunks_exact(block_samples).collect();
+                let (sample_tx, sample_rx) = std::sync::mpsc::channel();
+                let mut offset = 0;
+                for frames in &partitions {
+                    let end = offset + frames * usize::from(channels);
+                    sample_tx.send(source[offset..end].to_vec()).unwrap();
+                    offset = end;
+                }
+                drop(sample_tx);
+                let (blocks, mut output) = broadcast::channel(expected.len() + 1);
+                aggregate_input_blocks(sample_rx, blocks, channels, frames_per_block);
+                for (index, samples) in expected.iter().enumerate() {
+                    let block = output.try_recv().expect("every full block is broadcast");
+                    assert_eq!(
+                        block.frame_start,
+                        index as u64 * u64::from(frames_per_block)
+                    );
+                    assert_eq!(block.frame_count, frames_per_block);
+                    assert_eq!(block.channels, channels);
+                    assert_eq!(
+                        block.samples, *samples,
+                        "callback partitions: {partitions:?}"
+                    );
+                }
+                // Closure discards the incomplete tail, including an all-tail stream.
+                assert!(matches!(
+                    output.try_recv(),
+                    Err(broadcast::error::TryRecvError::Closed)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn callback_aggregation_keeps_draining_without_listeners() {
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            let (sample_tx, sample_rx) = std::sync::mpsc::sync_channel(0);
+            let (blocks, output) = broadcast::channel(1);
+            drop(output);
+            let aggregator = std::thread::spawn(move || {
+                aggregate_input_blocks(sample_rx, blocks, 3, 4);
+            });
+            // Rendezvous sends prove the receiver continues past a failed broadcast.
+            let delivered = [vec![0.25; 36], vec![-0.5; 6], vec![0.75; 9]]
+                .into_iter()
+                .all(|samples| sample_tx.send(samples).is_ok());
+            drop(sample_tx);
+            let completed = aggregator.join().is_ok();
+            let _ = finished_tx.send((delivered, completed));
+        });
+        assert_eq!(
+            finished_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (true, true)
+        );
+        producer.join().unwrap();
+    }
+
+    // A watchdog proves full/closed queues return without draining first. It
+    // avoids timing throughput assertions and fails if try_send becomes send.
+    fn submit_callback(
+        sample_tx: SyncSender<Vec<f32>>,
+        samples: Vec<f32>,
+        channels: u16,
+        stats: Arc<NativeInputStats>,
+    ) -> SyncSender<Vec<f32>> {
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let callback = std::thread::spawn(move || {
+            send_input_samples(&sample_tx, samples, channels, &stats);
+            let _ = returned_tx.send(sample_tx);
+        });
+        let sample_tx = returned_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("native callback must not block on queue capacity or disconnection");
+        callback.join().unwrap();
+        sample_tx
+    }
+
+    fn assert_native_stats(stats: &NativeInputStats, at: u64, buffers: u64, frames: u64) {
+        let event = stats.snapshot();
+        assert_eq!(event.event_type, "native-input-stats");
+        assert_eq!(event.source, "input");
+        assert_eq!(event.bridge_queue_capacity_blocks, 1);
+        assert_eq!(event.at_frame, at);
+        assert_eq!(event.native_dropped_blocks, buffers);
+        assert_eq!(event.native_dropped_frames, frames);
+        assert_eq!(event.native_drop_events, buffers);
+    }
+
+    #[test]
+    fn callback_queue_accounts_for_full_disconnected_and_recovered_sends() {
+        for channels in [1_u16, 2, 5] {
+            let stats = Arc::new(NativeInputStats::new(Source::Input, 1));
+            let (sample_tx, sample_rx) = std::sync::mpsc::sync_channel(1);
+            let first: Vec<f32> = (0..2 * usize::from(channels))
+                .map(|index| index as f32 / 8.0)
+                .collect();
+            let resumed: Vec<f32> = (0..6 * usize::from(channels))
+                .map(|index| -(index as f32 + 1.0) / 8.0)
+                .collect();
+            assert_native_stats(&stats, 0, 0, 0);
+            let sample_tx = submit_callback(sample_tx, first.clone(), channels, stats.clone());
+            assert_native_stats(&stats, 2, 0, 0);
+            let sample_tx = submit_callback(
+                sample_tx,
+                vec![99.0; 3 * usize::from(channels)],
+                channels,
+                stats.clone(),
+            );
+            assert_native_stats(&stats, 5, 1, 3);
+            let sample_tx = submit_callback(
+                sample_tx,
+                vec![88.0; 5 * usize::from(channels)],
+                channels,
+                stats.clone(),
+            );
+            assert_native_stats(&stats, 10, 2, 8);
+            let delivered = sample_rx.try_recv().unwrap();
+            assert_eq!(delivered, first);
+            assert!(matches!(
+                sample_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            let sample_tx = submit_callback(sample_tx, resumed.clone(), channels, stats.clone());
+            assert_native_stats(&stats, 16, 2, 8);
+            let recovered = sample_rx.try_recv().unwrap();
+            assert_eq!(recovered, resumed);
+            drop(sample_rx);
+            let sample_tx = submit_callback(
+                sample_tx,
+                vec![77.0; 4 * usize::from(channels)],
+                channels,
+                stats.clone(),
+            );
+            assert_native_stats(&stats, 20, 3, 12);
+            drop(submit_callback(
+                sample_tx,
+                vec![66.0; usize::from(channels)],
+                channels,
+                stats.clone(),
+            ));
+            assert_native_stats(&stats, 21, 4, 13);
+
+            // Native drops do not become samples or gaps in the accepted PCM
+            // timeline. Feed only successfully delivered callbacks to the real aggregator.
+            let expected: Vec<_> = first.into_iter().chain(resumed).collect();
+            let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+            accepted_tx.send(delivered).unwrap();
+            accepted_tx.send(recovered).unwrap();
+            drop(accepted_tx);
+            let (blocks, mut output) = broadcast::channel(3);
+            aggregate_input_blocks(accepted_rx, blocks, channels, 4);
+            for (index, samples) in expected.chunks_exact(4 * usize::from(channels)).enumerate() {
+                let block = output.try_recv().unwrap();
+                assert_eq!(block.frame_start, index as u64 * 4);
+                assert_eq!(block.frame_count, 4);
+                assert_eq!(block.channels, channels);
+                assert_eq!(block.samples, samples);
+            }
+            assert!(matches!(
+                output.try_recv(),
+                Err(broadcast::error::TryRecvError::Closed)
+            ));
+            assert_native_stats(&stats, 21, 4, 13);
+        }
+    }
+
     struct ReaderDrop(Arc<std::sync::atomic::AtomicBool>);
     impl Drop for ReaderDrop {
         fn drop(&mut self) {

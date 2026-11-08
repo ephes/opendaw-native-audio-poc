@@ -82,6 +82,26 @@ bytes 16..N   Float32 little-endian interleaved PCM
 
 `frameStart` is the first frame index in the backend stream timeline. `frameCount * channelCount` Float32 samples follow the 16-byte header.
 
+### Native callback queue and aggregation
+
+The native callback advances `atFrame` by the callback's frame count before
+attempting a nonblocking enqueue. A full or disconnected bridge queue rejects
+the entire callback buffer and increments `nativeDroppedBlocks` and
+`nativeDropEvents` once, plus `nativeDroppedFrames` by that buffer's frame count.
+A later successful enqueue advances the source cursor without resetting the
+cumulative loss counters. These counters describe capture-bridge loss separately
+from WebSocket client lag and monitor underruns/overflows.
+
+The aggregator concatenates accepted interleaved callback samples in arrival
+order and emits only complete `framesPerBlock` blocks. Callback boundaries need
+not match block boundaries; one callback can produce several blocks. On queue
+closure any final incomplete block is discarded, without zero-padding or a
+partial broadcast. Aggregation keeps draining when there are no subscribers.
+For native input, PCM `frameStart` starts at zero and advances by the size of
+each emitted full block in the **accepted-sample** timeline. Rejected callback
+buffers therefore do not create PCM frame-index gaps; native loss must be read
+from the stats counters and source `atFrame`, not inferred from PCM continuity.
+
 For 12 channels at 48 kHz, raw throughput is modest:
 
 ```text
