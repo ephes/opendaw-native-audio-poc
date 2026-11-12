@@ -29,9 +29,18 @@ export function createMonoFloat32WavBlob({ sampleRate, totalFrames, channelParts
 }
 
 export function extractChannel(samples, channelIndex, channelCount, frameCount) {
+  if (!Number.isSafeInteger(channelCount) || channelCount < 1) {
+    throw new RangeError(`Invalid channel count ${String(channelCount)}`);
+  }
+  if (!Number.isSafeInteger(channelIndex) || channelIndex < 0 || channelIndex >= channelCount) {
+    throw new RangeError(`Invalid channel index ${String(channelIndex)} for ${channelCount} channels`);
+  }
+  if (!Number.isSafeInteger(frameCount) || frameCount < 0 || frameCount * channelCount > samples.length) {
+    throw new RangeError(`Invalid frame count ${String(frameCount)} for ${samples.length} samples`);
+  }
   const channelSamples = new Float32Array(frameCount);
   for (let frame = 0; frame < frameCount; frame += 1) {
-    channelSamples[frame] = samples[frame * channelCount + channelIndex] ?? 0;
+    channelSamples[frame] = samples[frame * channelCount + channelIndex];
   }
   return channelSamples;
 }

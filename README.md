@@ -179,7 +179,42 @@ Invalid blocks are reported in recording integrity
 and do not reach OPFS, monitoring or meters. The next valid block is compared
 with the last accepted end for gap/overlap detection. See [the binary contract](docs/protocol.md#pcm-blocks).
 
-The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
+The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each and hold at most 65,536 blocks, so a chunk's block list stays small even with very short blocks. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
+
+On chunk close, immutable block metadata is saved once as `<chunk-file>.f32.json`
+before the OPFS manifest publishes `chunkMetadata: {format: "per-chunk-v1",
+count: N}`. Every manifest written to OPFS, including the final stop/error
+manifest, references the first N chunks through these sidecars and keeps only
+chunks without a committed sidecar (an open chunk or one whose close failed)
+inline in `chunks`. The index also uses a chunk count and naming pattern
+instead of a growing file-name list. Manifest serialization therefore visits
+each closed block once across the recording, and the OPFS manifest no longer
+grows with recording length. Downloaded manifests (Export Manifest) still
+contain the full `chunks` array. Recovery loads sidecar metadata in chunk order
+(up to 10,000 chunks), appends the inline chunks and retains the complete block
+evidence in the recovered manifest. Missing or mismatched metadata produces a
+fatal `chunk-metadata-read-error` warning and refuses WAV export; other
+sessions remain accessible. Historical manifests with inline chunk metadata
+remain readable. Reset and Delete Session remove both PCM files and their
+metadata sidecars.
+
+Recovery admits OPFS JSON before reading it into memory: the index is limited
+to 16 MiB and 10,000 sessions, a manifest to 256 MiB and 10,000 inline chunks,
+each `.f32.json` sidecar to 64 MiB, and every document to 16 nesting levels.
+The writer stays well inside these budgets. An index over budget is ignored
+with a warning (recovery still lists sessions from their manifests and chunk
+files). A manifest that is unreadable or over budget is reported as
+`manifest-read-error`; recovery then continues from the chunk files, and the
+index chunk count plus any committed sidecars still name the chunks that must
+exist, so a missing chunk refuses WAV export instead of silently joining audio
+across the gap. A sidecar over budget is a fatal `chunk-metadata-read-error`
+and refuses WAV export for that session.
+
+Selected-channel WAV export accepts only an integer channel index inside the
+recorded channel range, for both the live and the recovered session. A
+non-integer, NaN or out-of-range index is refused instead of producing a
+silent WAV, and channel extraction refuses truncated chunk data instead of
+padding it with zeros.
 
 The manifest includes:
 
@@ -204,7 +239,7 @@ stats and lag events cannot enter the old session's history.
 A storage/close failure still produces an error manifest and preserves previously
 closed chunks for recovery.
 
-The Disconnect button is disabled while recording is active or the recorder is in an error state. Stop the recording first so the Worker can flush queued OPFS writes, close the current chunk, and write the final manifest. If recording enters an error state, use Reset/Clear Recording before disconnecting so OPFS chunks from the current session are removed. Starting monitor playback during a recording resets the existing monitor underrun/overflow counters; the recorder records that reset and rebases the recording deltas.
+The Disconnect button is disabled while recording is active or the recorder is in an error state. Stop the recording first so the Worker can flush queued OPFS writes, close the current chunk, and write the final manifest. If recording enters an error state, use Reset/Clear Recording before disconnecting so OPFS chunks from the current session are removed. Starting monitor playback during a recording resets the existing monitor underrun/overflow counters; the recorder records that reset and rebases the recording deltas. Underruns and overflows counted before the reset are kept in `counterEpochTotals`, so `underrunsDuringRecording`/`overflowsDuringRecording` and `counterDeltasAtStop` report the whole-session totals across every reset, not only the latest counter epoch. Each `counterResets` sample records the closed epoch's deltas and the running totals.
 
 ## OPFS Recovery
 
@@ -215,6 +250,7 @@ Recovery scan looks only at this PoC's `native-pcm-*` OPFS artifacts:
 - `native-pcm-recordings-index.json`
 - `native-pcm-*-manifest.json`
 - `native-pcm-*-chunk-*.f32`
+- `native-pcm-*-chunk-*.f32.json` (immutable checkpoint metadata)
 
 After a reload, tab close, or browser failure before Stop Recording, reopen the page and use OPFS Sessions:
 
