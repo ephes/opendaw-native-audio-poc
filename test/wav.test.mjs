@@ -20,10 +20,20 @@ test("extractChannel deinterleaves one channel from interleaved Float32 samples"
   ]);
 });
 
-test("extractChannel pads missing trailing samples with zero", () => {
+test("extractChannel rejects truncated input instead of padding with zero", () => {
   const samples = new Float32Array([10, 20, 30]);
 
-  assert.deepEqual([...extractChannel(samples, 1, 2, 3)], [20, 0, 0]);
+  assert.throws(() => extractChannel(samples, 1, 2, 3), RangeError);
+});
+
+test("extractChannel rejects non-integer and out-of-range channel indexes", () => {
+  const samples = new Float32Array([0.1, 1.1, 0.2, 1.2]);
+
+  for (const channelIndex of [0.5, 1.5, Number.NaN, -1, 2, "1", null, undefined, Infinity]) {
+    assert.throws(() => extractChannel(samples, channelIndex, 2, 2), RangeError, String(channelIndex));
+  }
+  assert.throws(() => extractChannel(samples, 0, 0, 2), RangeError);
+  assert.throws(() => extractChannel(samples, 0, 2.5, 1), RangeError);
 });
 
 test("createMonoFloat32WavBlob writes a mono IEEE Float32 WAV header and payload", async () => {

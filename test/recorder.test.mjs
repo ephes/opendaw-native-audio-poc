@@ -186,8 +186,10 @@ test("failed final close is terminal and preserves earlier committed chunks for 
   const manifest = JSON.parse(new TextDecoder().decode(root.files.get(recorder.manifestFileName())));
   assert.equal(manifest.state, "error");
   assert.equal(manifest.stoppedAt, null);
-  assert.equal(manifest.chunks[1].completedAt, null);
-  assert.match(manifest.chunks[1].closeError, /synthetic quota-close failure/);
+  assert.deepEqual(manifest.chunkMetadata, { format: "per-chunk-v1", count: 1 });
+  assert.equal(manifest.chunks.length, 1, "only the unclosed chunk stays inline");
+  assert.equal(manifest.chunks[0].completedAt, null);
+  assert.match(manifest.chunks[0].closeError, /synthetic quota-close failure/);
   const index = JSON.parse(new TextDecoder().decode(root.files.get("native-pcm-recordings-index.json")));
   assert.equal(index.sessions[manifest.sessionId].state, "error");
   assert.deepEqual(root.files.get(committed.fileName), committedBytes);
@@ -650,4 +652,271 @@ test("integrity diagnostics retain first and recent samples with exact totals", 
   const inspection = inspectManifest(manifest);
   assert.equal(inspection.ok, false);
   assert.equal(inspection.summary.continuity.invalidBlocks, 1000);
+});
+
+test("chunk checkpoints serialize each block once and reload complete timeline evidence", async (t) => {
+  const { recorder, root } = storedRecorder();
+  navigatorProperty(t, "storage", { getDirectory: async () => root });
+  const writes = [];
+  const original = root.getFileHandle;
+  root.getFileHandle = async (name, options) => {
+    const handle = await original(name, options);
+    const createWritable = handle.createWritable;
+    handle.createWritable = async () => {
+      const writable = await createWritable();
+      const write = writable.write;
+      writable.write = async (data) => {
+        if (typeof data === "string" && name !== "native-pcm-recordings-index.json") writes.push(data);
+        await write(data);
+      };
+      return writable;
+    };
+    return handle;
+  };
+  await recorder.start(stream);
+  for (let chunk = 0; chunk < 24; chunk += 1) {
+    for (let block = 0; block < 3; block += 1) await record(recorder, (chunk * 3 + block) * 2);
+    await recorder.closeCurrentChunk();
+  }
+  const blockVisits = writes.reduce((sum, json) => sum + (json.match(/"frameCount"/g) ?? []).length, 0);
+  assert.equal(blockVisits, 72, "closed block metadata must be serialized only once during checkpoints");
+  const expected = recorder.buildManifest().chunks;
+  const reloaded = storedRecorder(root).recorder;
+  const recovered = (await reloaded.scanRecoverySessions()).sessions[0];
+  assert.equal(recovered.state, "abandoned");
+  assert.equal(recovered.recoveredFrames, 144);
+  assert.equal(recovered.exportableWav, true);
+  assert.deepEqual(recovered.originalManifest.chunks, expected);
+  await recorder.stop();
+  const stopped = JSON.parse(new TextDecoder().decode(root.files.get(recorder.manifestFileName())));
+  assert.deepEqual(stopped.chunkMetadata, { format: "per-chunk-v1", count: 24 });
+  assert.deepEqual(stopped.chunks, [], "the OPFS stop manifest references committed sidecars");
+  const afterStop = (await storedRecorder(root).recorder.scanRecoverySessions()).sessions[0];
+  assert.equal(afterStop.state, "stopped");
+  assert.deepEqual(afterStop.originalManifest.chunks, expected);
+  assert.deepEqual(JSON.parse(await (await recorder.exportManifest()).blob.text()).chunks, expected);
+  await recorder.clear();
+  assert.deepEqual([...root.files.keys()], ["native-pcm-recordings-index.json"]);
+});
+
+test("missing or mismatched checkpoint metadata refuses recovered WAV and leaves healthy siblings accessible", async (t) => {
+  const { recorder, root } = storedRecorder();
+  navigatorProperty(t, "storage", { getDirectory: async () => root });
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.closeCurrentChunk();
+  const sessionId = recorder.session.sessionId;
+  const metadataName = `${recorder.session.chunks[0].fileName}.json`;
+  const metadataBytes = root.files.get(metadataName);
+  const healthy = storedRecorder(root).recorder;
+  await healthy.start(stream);
+  await record(healthy);
+  await healthy.stop();
+  for (const corrupt of [null, new TextEncoder().encode('{"fileName":"unrelated","index":0}')]) {
+    if (corrupt) root.files.set(metadataName, corrupt);
+    else root.files.delete(metadataName);
+    const reloaded = storedRecorder(root).recorder;
+    const sessions = (await reloaded.scanRecoverySessions()).sessions;
+    const broken = sessions.find((entry) => entry.sessionId === sessionId);
+    assert.equal(broken.state, "error");
+    assert.equal(broken.exportableWav, false);
+    assert.ok(broken.warnings.some((entry) => entry.code === "chunk-metadata-read-error" && entry.fatal));
+    await assert.rejects(reloaded.exportRecoveredSelectedChannelWav(sessionId, 0), /metadata could not be read/);
+    assert.equal(sessions.find((entry) => entry.sessionId === healthy.session.sessionId).exportableWav, true);
+  }
+  root.files.set(metadataName, metadataBytes);
+  await storedRecorder(root).recorder.deleteRecoveredSession(sessionId);
+  assert.equal(root.files.has(metadataName), false);
+  assert.equal(root.files.has(healthy.manifestFileName()), true);
+});
+
+test("selected-channel WAV export refuses non-integer channel indexes at both boundaries", async (t) => {
+  const { recorder, root } = storedRecorder();
+  navigatorProperty(t, "storage", { getDirectory: async () => root });
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.stop();
+  const sessionId = recorder.session.sessionId;
+  const reloaded = storedRecorder(root).recorder;
+  for (const channelIndex of [0.5, 1.5, Number.NaN, -1, 2, "0", null, undefined]) {
+    await assert.rejects(recorder.exportSelectedChannelWav(channelIndex), /outside the recorded channel range/,
+      String(channelIndex));
+    await assert.rejects(reloaded.exportRecoveredSelectedChannelWav(sessionId, channelIndex),
+      /outside the recovered channel range/, String(channelIndex));
+  }
+  const live = await recorder.exportSelectedChannelWav(1);
+  const recovered = await reloaded.exportRecoveredSelectedChannelWav(sessionId, 1);
+  for (const wav of [live, recovered]) {
+    const samples = new Float32Array((await wav.blob.arrayBuffer()).slice(44));
+    assert.deepEqual([...samples], [-0.5, -1]);
+  }
+});
+
+test("monitor counter rebaselines preserve whole-session underrun and overflow totals", async () => {
+  const counters = { underruns: 5, overflows: 2, receivedBlocks: 0 };
+  const root = memoryStorage();
+  const recorder = new PcmRecorder({ readCounters: () => ({ ...counters }), postMessage: () => {} });
+  recorder.openStorageRoot = async () => root;
+  await recorder.start(stream);
+  counters.underruns = 8;
+  counters.overflows = 3;
+  recorder.rebaselineCounters("monitor-start-reset");
+  counters.underruns = 0;
+  counters.overflows = 0;
+  recorder.rebaselineCounters("monitor-start-reset");
+  counters.underruns = 4;
+  counters.overflows = 1;
+  assert.equal(recorder.status().underrunsDuringRecording, 7);
+  assert.equal(recorder.status().overflowsDuringRecording, 2);
+  await recorder.stop();
+  const manifest = recorder.buildManifest();
+  assert.deepEqual(manifest.counterDeltasAtStop, { underrunsDuringRecording: 7, overflowsDuringRecording: 2 });
+  assert.deepEqual(manifest.counterEpochTotals, { underruns: 3, overflows: 1 });
+  assert.deepEqual(manifest.integrity.counterResets.map((entry) => entry.closedEpochDeltas), [
+    { underruns: 3, overflows: 1 },
+    { underruns: 0, overflows: 0 },
+  ]);
+  assert.equal(inspectManifest(manifest).summary.counters.underrunsDuringRecording, 7);
+});
+
+function oversizedFile(size) {
+  return {
+    size,
+    async text() { throw new Error("over-budget JSON must not be materialized"); },
+    async arrayBuffer() { throw new Error("over-budget JSON must not be materialized"); },
+  };
+}
+
+function replaceFile(root, predicate, file) {
+  const getHandle = root.getFileHandle.bind(root);
+  root.getFileHandle = async (name, options) => {
+    const handle = await getHandle(name, options);
+    return predicate(name) ? { ...handle, getFile: async () => file } : handle;
+  };
+}
+
+test("recovery refuses over-budget OPFS JSON before reading its text", async (t) => {
+  for (const target of ["index", "manifest", "sidecar"]) {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    await recorder.start(stream);
+    await record(recorder);
+    await recorder.closeCurrentChunk();
+    const sessionId = recorder.session.sessionId;
+    const sidecar = `${recorder.session.chunks[0].fileName}.json`;
+    const manifestName = recorder.manifestFileName();
+    if (target === "index") {
+      replaceFile(root, (name) => name === "native-pcm-recordings-index.json", oversizedFile(16 * 1024 * 1024 + 1));
+    } else if (target === "manifest") {
+      replaceFile(root, (name) => name === manifestName, oversizedFile(256 * 1024 * 1024 + 1));
+    } else {
+      replaceFile(root, (name) => name === sidecar, oversizedFile(64 * 1024 * 1024 + 1));
+    }
+    const reloaded = storedRecorder(root).recorder;
+    const session = (await reloaded.scanRecoverySessions()).sessions.find((entry) => entry.sessionId === sessionId);
+    assert.ok(session, target);
+    const budgetWarning = session.warnings.find((entry) => /recovery budget/.test(entry.message));
+    assert.ok(budgetWarning, target);
+    if (target === "sidecar") {
+      assert.equal(budgetWarning.code, "chunk-metadata-read-error");
+      assert.equal(budgetWarning.fatal, true);
+      assert.equal(session.exportableWav, false);
+    } else {
+      assert.notEqual(budgetWarning.fatal, true, target);
+      assert.equal(session.exportableWav, true, target);
+      assert.equal(session.recoveredFrames, 2, target);
+    }
+  }
+});
+
+test("recovery refuses deeply nested and oversized-collection JSON", async (t) => {
+  const { recorder, root } = storedRecorder();
+  navigatorProperty(t, "storage", { getDirectory: async () => root });
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.stop();
+  const sessionId = recorder.session.sessionId;
+  const manifestName = recorder.manifestFileName();
+  const original = JSON.parse(new TextDecoder().decode(root.files.get(manifestName)));
+  const nested = { ...original, summary: JSON.parse(`${"[".repeat(40)}${"]".repeat(40)}`) };
+  const tooManyChunks = { ...original, chunks: Array.from({ length: 10_001 }, () => 0) };
+  for (const [label, manifest, pattern] of [
+    ["nested", nested, /nests deeper than 16 levels/],
+    ["chunks", tooManyChunks, /10001 chunks exceed the 10000 chunk budget/],
+  ]) {
+    root.files.set(manifestName, new TextEncoder().encode(JSON.stringify(manifest)));
+    const session = (await storedRecorder(root).recorder.scanRecoverySessions()).sessions
+      .find((entry) => entry.sessionId === sessionId);
+    const warning = session.warnings.find((entry) => entry.code === "manifest-read-error");
+    assert.match(warning?.message ?? "", pattern, label);
+    assert.equal(session.manifestPresent, false, label);
+  }
+  const index = JSON.parse(new TextDecoder().decode(root.files.get("native-pcm-recordings-index.json")));
+  index.sessions = Object.fromEntries(Array.from({ length: 10_001 }, (_, i) => [`s${i}`, {}]));
+  root.files.set("native-pcm-recordings-index.json", new TextEncoder().encode(JSON.stringify(index)));
+  const scan = await storedRecorder(root).recorder.scanRecoverySessions();
+  assert.equal(scan.sessions.length, 1);
+  assert.ok(scan.sessions[0].warnings.some((entry) => /10001 sessions exceed/.test(entry.message)));
+});
+
+test("an unreadable manifest still detects a missing middle chunk from the index and sidecars", async (t) => {
+  for (const evidence of ["index", "sidecars"]) {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    await recorder.start(stream);
+    for (let chunk = 0; chunk < 3; chunk += 1) {
+      await record(recorder, chunk * 2);
+      await recorder.closeCurrentChunk();
+    }
+    await recorder.stop();
+    const sessionId = recorder.session.sessionId;
+    const middle = recorder.session.chunks[1].fileName;
+    root.files.set(recorder.manifestFileName(), new TextEncoder().encode("{truncated"));
+    root.files.delete(middle);
+    if (evidence === "sidecars") {
+      root.files.delete("native-pcm-recordings-index.json");
+    }
+    const session = (await storedRecorder(root).recorder.scanRecoverySessions()).sessions
+      .find((entry) => entry.sessionId === sessionId);
+    assert.ok(session.warnings.some((entry) => entry.code === "manifest-read-error"), evidence);
+    assert.ok(session.chunks.some((chunk) => chunk.fileName === middle && !chunk.present), evidence);
+    assert.equal(session.exportableWav, false, evidence);
+    if (evidence === "index") {
+      assert.equal(session.nonExportableReason, "one or more chunk files are missing");
+    }
+  }
+});
+
+test("chunks roll over at the block cap so their metadata stays within the recovery budget", async () => {
+  const { recorder } = storedRecorder();
+  await recorder.start(stream);
+  for (let block = 0; block < 65_537; block += 1) {
+    recorder.recordBlock({
+      frameStart: block * 2, frameCount: 2, channels: 2, receivedBlockIndex: block,
+      dataBytes: new Uint8Array(16),
+    });
+  }
+  await recorder.writeChain;
+  assert.deepEqual(recorder.session.chunks.map((chunk) => chunk.blocksRecorded), [65_536, 1]);
+  assert.equal(recorder.session.storage.maxBlocksPerChunk, 65_536);
+  await recorder.stop();
+});
+
+test("a session with only leftover metadata sidecars is listed and deletable", async (t) => {
+  const { recorder, root } = storedRecorder();
+  navigatorProperty(t, "storage", { getDirectory: async () => root });
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.stop();
+  const sessionId = recorder.session.sessionId;
+  const sidecar = `${recorder.session.chunks[0].fileName}.json`;
+  for (const name of [...root.files.keys()]) {
+    if (name !== sidecar) root.files.delete(name);
+  }
+  const reloaded = storedRecorder(root).recorder;
+  const session = (await reloaded.scanRecoverySessions()).sessions.find((entry) => entry.sessionId === sessionId);
+  assert.ok(session);
+  assert.equal(session.exportableWav, false);
+  await reloaded.deleteRecoveredSession(sessionId);
+  assert.equal(root.files.has(sidecar), false);
 });

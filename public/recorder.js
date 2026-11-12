@@ -1,15 +1,25 @@
 import { createMonoFloat32WavBlob, extractChannel } from "./wav.js";
 
 const CHUNK_TARGET_BYTES = 64 * 1024 * 1024;
+// Bounds one chunk's block list so its metadata always fits the recovery budget.
+const MAX_BLOCKS_PER_CHUNK = 65_536;
 const BYTES_PER_SAMPLE = 4;
 const STATUS_INTERVAL_MS = 500;
 const BACKLOG_WARNING_BYTES = 64 * 1024 * 1024;
 const PENDING_PCM_CEILING_BYTES = 64 * 1024 * 1024;
 const EVENT_SAMPLE_LIMIT = 32;
+// Recovery reads OPFS JSON only within these budgets, before materializing text.
+const INDEX_JSON_MAX_BYTES = 16 * 1024 * 1024;
+const MANIFEST_JSON_MAX_BYTES = 256 * 1024 * 1024;
+const CHUNK_METADATA_JSON_MAX_BYTES = 64 * 1024 * 1024;
+const JSON_MAX_DEPTH = 16;
+const MAX_INDEX_SESSIONS = 10_000;
+const MAX_RECOVERY_CHUNKS = 10_000;
 const INDEX_FILE_NAME = "native-pcm-recordings-index.json";
 const ARTIFACT_PREFIX = "native-pcm-";
 const MANIFEST_SUFFIX = "-manifest.json";
 const CHUNK_NAME_RE = /^(native-pcm-.+)-chunk-(\d+)\.f32$/;
+const CHUNK_METADATA_NAME_RE = /^(native-pcm-.+-chunk-\d+\.f32)\.json$/;
 
 export class PcmRecorder {
   constructor({ readCounters, postMessage }) {
@@ -29,6 +39,8 @@ export class PcmRecorder {
     this.lastStatusPost = 0;
     this.lastError = "";
     this.nativeInputStats = defaultNativeInputStats();
+    // Closed chunks whose immutable `.f32.json` metadata sidecar is committed.
+    this.committedChunkMetadata = new WeakSet();
   }
 
   setNativeInputStats(stats) {
@@ -137,6 +149,7 @@ export class PcmRecorder {
       storage: {
         mode: "opfs",
         chunkTargetBytes: CHUNK_TARGET_BYTES,
+        maxBlocksPerChunk: MAX_BLOCKS_PER_CHUNK,
         writeBacklogWarningBytes: BACKLOG_WARNING_BYTES,
         pendingPcmCeilingBytes: PENDING_PCM_CEILING_BYTES,
         persisted,
@@ -152,6 +165,8 @@ export class PcmRecorder {
         overflows: counters.overflows,
         receivedBlocks: counters.receivedBlocks,
       },
+      // Monitor counter deltas closed by earlier rebaselines in this session.
+      counterEpochTotals: { underruns: 0, overflows: 0 },
       counterDeltasAtStop: null,
       nativeInputStats: {
         start: { ...nativeStats },
@@ -245,7 +260,7 @@ export class PcmRecorder {
       this.setError(`Failed to close current chunk before clearing recording: ${error.message}`);
     });
     if (this.root && this.session) {
-      const fileNames = this.session.chunks.map((chunk) => chunk.fileName);
+      const fileNames = this.session.chunks.flatMap((chunk) => [chunk.fileName, `${chunk.fileName}.json`]);
       fileNames.push(this.manifestFileName());
       await this.deleteIndexSession(this.session.sessionId);
       await Promise.all(fileNames.map((fileName) => removeEntry(this.root, fileName)));
@@ -340,8 +355,14 @@ export class PcmRecorder {
       return;
     }
     const counters = this.readCounters();
+    const closedEpoch = this.currentEpochCounterDeltas(counters);
+    const totals = this.session.counterEpochTotals;
+    totals.underruns += closedEpoch.underruns;
+    totals.overflows += closedEpoch.overflows;
     appendEvent(this.session.integrity, "counterResets", {
       reason,
+      closedEpochDeltas: { ...closedEpoch },
+      totalsBeforeNewEpoch: { ...totals },
       previousBaseline: { ...this.session.counterBaselines },
       newBaseline: {
         underruns: counters.underruns,
@@ -424,8 +445,8 @@ export class PcmRecorder {
     if (this.state === "recording" || this.state === "stopping") {
       throw new Error("Stop recording before exporting WAV");
     }
-    if (channelIndex < 0 || channelIndex >= this.session.channels) {
-      throw new Error(`Channel ${channelIndex + 1} is outside the recorded channel range`);
+    if (!Number.isSafeInteger(channelIndex) || channelIndex < 0 || channelIndex >= this.session.channels) {
+      throw new Error(`Channel ${describeChannelIndex(channelIndex)} is outside the recorded channel range`);
     }
     await this.writeChain;
     const session = this.buildManifest();
@@ -484,6 +505,10 @@ export class PcmRecorder {
     for (const sessionId of artifacts.chunks.keys()) {
       sessionIds.add(sessionId);
     }
+    // Leftover sidecars alone still surface a session so Delete can remove them.
+    for (const sessionId of artifacts.chunkMetadataNames.keys()) {
+      sessionIds.add(sessionId);
+    }
 
     const sessions = [];
     for (const sessionId of sessionIds) {
@@ -494,6 +519,7 @@ export class PcmRecorder {
           indexEntry: index.sessions[sessionId] ?? null,
           manifestFileName: artifacts.manifests.get(sessionId) ?? null,
           chunkFiles: artifacts.chunks.get(sessionId) ?? [],
+          chunkMetadataNames: artifacts.chunkMetadataNames.get(sessionId) ?? [],
           activeSessionId: this.session?.sessionId ?? null,
           activeSessionState: this.state,
           activeSessionHasOpenChunk: Boolean(this.currentChunk),
@@ -585,8 +611,8 @@ export class PcmRecorder {
     if (!session.exportableWav) {
       throw new Error(session.nonExportableReason || "Recovered session is not exportable as WAV");
     }
-    if (channelIndex < 0 || channelIndex >= session.channels) {
-      throw new Error(`Channel ${channelIndex + 1} is outside the recovered channel range`);
+    if (!Number.isSafeInteger(channelIndex) || channelIndex < 0 || channelIndex >= session.channels) {
+      throw new Error(`Channel ${describeChannelIndex(channelIndex)} is outside the recovered channel range`);
     }
 
     const root = this.root;
@@ -714,7 +740,7 @@ export class PcmRecorder {
     const started = Date.parse(this.session.startedAt);
     const endAt = this.session.stoppedAt ?? this.session.interruptedAt;
     const stopped = endAt ? Date.parse(endAt) : Date.now();
-    const bytes = this.session.chunks.reduce((total, chunk) => total + chunk.bytes, 0);
+    const bytes = this.session.totalRecordedFrames * this.session.channels * BYTES_PER_SAMPLE;
     const counterDeltas = this.session.counterDeltasAtStop ?? this.counterDeltas();
     const nativeInputDeltas = this.nativeInputDeltas();
     const receivedBlocksEnd = this.session.receivedBlocksAtStop ?? this.readCounters().receivedBlocks;
@@ -769,7 +795,11 @@ export class PcmRecorder {
       });
       return;
     }
-    if (!this.currentChunk || this.currentChunk.bytes + block.dataBytes.byteLength > CHUNK_TARGET_BYTES) {
+    if (
+      !this.currentChunk ||
+      this.currentChunk.bytes + block.dataBytes.byteLength > CHUNK_TARGET_BYTES ||
+      this.currentChunk.blocksRecorded >= MAX_BLOCKS_PER_CHUNK
+    ) {
       await this.openNextChunk();
     }
 
@@ -878,6 +908,12 @@ export class PcmRecorder {
       await removeEntry(this.root, chunk.fileName);
       this.session.chunks = this.session.chunks.filter((entry) => entry !== chunk);
     } else if (!skipPersist) {
+      // Commit immutable block evidence before publishing its checkpoint count.
+      const handle = await this.root.getFileHandle(`${chunk.fileName}.json`, { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(JSON.stringify(chunk));
+      await writable.close();
+      this.committedChunkMetadata.add(chunk);
       await this.writeManifestToStorage();
       await this.updateIndexSession(this.session.state ?? this.state);
     }
@@ -889,11 +925,12 @@ export class PcmRecorder {
     }
     const handle = await this.root.getFileHandle(this.manifestFileName(), { create: true });
     const writable = await handle.createWritable();
-    await writable.write(JSON.stringify(this.buildManifest(), null, 2));
+    await writable.write(JSON.stringify(this.buildManifest({ storage: true }), null, 2));
     await writable.close();
   }
 
-  buildManifest() {
+  // OPFS copies reference committed chunk sidecars; exports inline every chunk.
+  buildManifest({ storage = false } = {}) {
     const nativeInputStats = cloneNativeInputStatsRecord(this.session.nativeInputStats);
     if (nativeInputStats && !nativeInputStats.stop) {
       nativeInputStats.latest = this.currentNativeInputStats();
@@ -902,6 +939,7 @@ export class PcmRecorder {
       ...this.session,
       storage: { ...this.session.storage },
       counterBaselines: { ...this.session.counterBaselines },
+      counterEpochTotals: { ...this.session.counterEpochTotals },
       counterDeltasAtStop: this.session.counterDeltasAtStop
         ? { ...this.session.counterDeltasAtStop }
         : null,
@@ -918,11 +956,23 @@ export class PcmRecorder {
         counterResets: this.session.integrity.counterResets.map((entry) => ({ ...entry })),
         writeBacklogEvents: this.session.integrity.writeBacklogEvents.map((entry) => ({ ...entry })),
       },
-      chunks: this.session.chunks.map(({ writable: _writable, ...chunk }) => ({
-        ...chunk,
-        blocks: chunk.blocks.map((block) => ({ ...block })),
-      })),
     };
+    let committed = 0;
+    if (storage) {
+      while (
+        committed < this.session.chunks.length &&
+        this.committedChunkMetadata.has(this.session.chunks[committed])
+      ) {
+        committed += 1;
+      }
+      manifest.chunkMetadata = { format: "per-chunk-v1", count: committed };
+    } else {
+      delete manifest.chunkMetadata;
+    }
+    manifest.chunks = this.session.chunks.slice(committed).map(({ writable: _writable, ...chunk }) => ({
+      ...chunk,
+      blocks: chunk.blocks.map((block) => ({ ...block })),
+    }));
     manifest.summary = this.status();
     return manifest;
   }
@@ -934,15 +984,18 @@ export class PcmRecorder {
         overflowsDuringRecording: 0,
       };
     }
+    const current = this.currentEpochCounterDeltas(counters);
+    const totals = this.session.counterEpochTotals;
     return {
-      underrunsDuringRecording: Math.max(
-        0,
-        counters.underruns - this.session.counterBaselines.underruns,
-      ),
-      overflowsDuringRecording: Math.max(
-        0,
-        counters.overflows - this.session.counterBaselines.overflows,
-      ),
+      underrunsDuringRecording: totals.underruns + current.underruns,
+      overflowsDuringRecording: totals.overflows + current.overflows,
+    };
+  }
+
+  currentEpochCounterDeltas(counters) {
+    return {
+      underruns: Math.max(0, counters.underruns - this.session.counterBaselines.underruns),
+      overflows: Math.max(0, counters.overflows - this.session.counterBaselines.overflows),
     };
   }
 
@@ -993,11 +1046,19 @@ export class PcmRecorder {
     }
     try {
       const handle = await this.root.getFileHandle(INDEX_FILE_NAME);
-      const file = await handle.getFile();
-      const text = await file.text();
-      const parsed = JSON.parse(text);
-      if (!parsed || typeof parsed !== "object" || !parsed.sessions) {
+      const parsed = await readBudgetedJson(handle, { maxBytes: INDEX_JSON_MAX_BYTES, label: INDEX_FILE_NAME });
+      if (
+        !parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+        !parsed.sessions || typeof parsed.sessions !== "object" || Array.isArray(parsed.sessions)
+      ) {
         warnings.push(`Ignoring malformed ${INDEX_FILE_NAME}`);
+        return { index: emptyIndex(), warnings };
+      }
+      const sessionCount = Object.keys(parsed.sessions).length;
+      if (sessionCount > MAX_INDEX_SESSIONS) {
+        warnings.push(
+          `Ignoring ${INDEX_FILE_NAME}: ${sessionCount} sessions exceed the ${MAX_INDEX_SESSIONS} session budget`,
+        );
         return { index: emptyIndex(), warnings };
       }
       return {
@@ -1062,10 +1123,9 @@ export class PcmRecorder {
       sampleFormat: this.session.sampleFormat,
       manifestFileName: this.manifestFileName(),
       chunkFilePrefix: this.session.chunkFilePrefix,
-      chunkFileNames: this.session.chunks.map((chunk) => chunk.fileName),
       chunkCount: this.session.chunks.length,
       totalRecordedFrames: this.session.totalRecordedFrames,
-      totalRecordedBytes: this.session.chunks.reduce((total, chunk) => total + chunk.bytes, 0),
+      totalRecordedBytes: this.session.totalRecordedFrames * this.session.channels * BYTES_PER_SAMPLE,
       updatedAt: now,
     };
     await this.mutateIndex((index) => { index.sessions[sessionId] = entry; });
@@ -1152,6 +1212,63 @@ function cloneNativeInputStatsRecord(record) {
   };
 }
 
+async function readBudgetedJson(handle, { maxBytes, label }) {
+  const file = await handle.getFile();
+  if (!Number.isSafeInteger(file.size) || file.size > maxBytes) {
+    throw new Error(`${label} is ${formatBytes(file.size)}, above the ${formatBytes(maxBytes)} recovery budget`);
+  }
+  const value = JSON.parse(await file.text());
+  assertJsonDepth(value, JSON_MAX_DEPTH, label);
+  return value;
+}
+
+function assertJsonDepth(value, maxDepth, label) {
+  const stack = [[value, 0]];
+  while (stack.length > 0) {
+    const [node, depth] = stack.pop();
+    if (node === null || typeof node !== "object") {
+      continue;
+    }
+    if (depth >= maxDepth) {
+      throw new Error(`${label} nests deeper than ${maxDepth} levels`);
+    }
+    for (const child of Array.isArray(node) ? node : Object.values(node)) {
+      if (child !== null && typeof child === "object") {
+        stack.push([child, depth + 1]);
+      }
+    }
+  }
+}
+
+async function readCheckpointChunkMetadata(root, sessionId, chunkMetadata) {
+  if (!chunkMetadata || typeof chunkMetadata !== "object") {
+    throw new Error("Invalid chunk metadata checkpoint");
+  }
+  const { format, count } = chunkMetadata;
+  if (format !== "per-chunk-v1" || !Number.isSafeInteger(count) || count < 0 || count > MAX_RECOVERY_CHUNKS) {
+    throw new Error("Invalid chunk metadata checkpoint");
+  }
+  const chunks = [];
+  for (let index = 0; index < count; index += 1) {
+    const fileName = `${sessionId}-chunk-${String(index).padStart(5, "0")}.f32`;
+    const metadataHandle = await root.getFileHandle(`${fileName}.json`);
+    const metadata = await readBudgetedJson(metadataHandle, {
+      maxBytes: CHUNK_METADATA_JSON_MAX_BYTES,
+      label: `${fileName}.json`,
+    });
+    if (!metadata || typeof metadata !== "object" || metadata.fileName !== fileName ||
+        metadata.index !== index || !metadata.completedAt || !Array.isArray(metadata.blocks)) {
+      throw new Error(`Invalid chunk metadata for ${fileName}`);
+    }
+    chunks.push(metadata);
+  }
+  return chunks;
+}
+
+function describeChannelIndex(channelIndex) {
+  return Number.isSafeInteger(channelIndex) ? String(channelIndex + 1) : `index ${String(channelIndex)}`;
+}
+
 function formatBytes(bytes) {
   const units = ["B", "KiB", "MiB", "GiB"];
   let value = bytes;
@@ -1188,8 +1305,19 @@ async function removeEntry(root, fileName) {
 async function listRecordingArtifacts(root) {
   const manifests = new Map();
   const chunks = new Map();
+  const chunkMetadataNames = new Map();
   for await (const [name, handle] of root.entries()) {
     if (!name.startsWith(ARTIFACT_PREFIX)) {
+      continue;
+    }
+    const metadataMatch = name.match(CHUNK_METADATA_NAME_RE);
+    if (metadataMatch && handle.kind === "file") {
+      const chunkName = metadataMatch[1];
+      const sessionId = chunkName.match(CHUNK_NAME_RE)[1];
+      if (!chunkMetadataNames.has(sessionId)) {
+        chunkMetadataNames.set(sessionId, []);
+      }
+      chunkMetadataNames.get(sessionId).push(chunkName);
       continue;
     }
     if (name.endsWith(MANIFEST_SUFFIX) && handle.kind === "file") {
@@ -1212,7 +1340,7 @@ async function listRecordingArtifacts(root) {
   for (const chunkList of chunks.values()) {
     chunkList.sort((a, b) => a.index - b.index || a.fileName.localeCompare(b.fileName));
   }
-  return { manifests, chunks };
+  return { manifests, chunks, chunkMetadataNames };
 }
 
 async function buildRecoveredSession({
@@ -1221,6 +1349,7 @@ async function buildRecoveredSession({
   indexEntry,
   manifestFileName,
   chunkFiles,
+  chunkMetadataNames = [],
   activeSessionId,
   activeSessionState,
   activeSessionHasOpenChunk,
@@ -1235,13 +1364,38 @@ async function buildRecoveredSession({
   if (manifestFileName) {
     try {
       const handle = await root.getFileHandle(manifestFileName);
-      const file = await handle.getFile();
-      manifest = JSON.parse(await file.text());
+      const parsed = await readBudgetedJson(handle, { maxBytes: MANIFEST_JSON_MAX_BYTES, label: manifestFileName });
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("manifest is not a JSON object");
+      }
+      if (Array.isArray(parsed.chunks) && parsed.chunks.length > MAX_RECOVERY_CHUNKS) {
+        throw new Error(`${parsed.chunks.length} chunks exceed the ${MAX_RECOVERY_CHUNKS} chunk budget`);
+      }
+      manifest = parsed;
     } catch (error) {
       manifestParseError = error.message;
       warnings.push({
         code: "manifest-read-error",
         message: `Could not read ${manifestFileName}: ${error.message}`,
+      });
+    }
+  }
+  let chunkMetadataError = "";
+  if (manifest?.chunkMetadata) {
+    try {
+      const inlineChunks = Array.isArray(manifest.chunks) ? manifest.chunks : [];
+      const committedChunks = await readCheckpointChunkMetadata(root, sessionId, manifest.chunkMetadata);
+      if (committedChunks.length + inlineChunks.length > MAX_RECOVERY_CHUNKS) {
+        throw new Error(`more than ${MAX_RECOVERY_CHUNKS} chunks are referenced`);
+      }
+      manifest.chunks = [...committedChunks, ...inlineChunks];
+    } catch (error) {
+      chunkMetadataError = error.message;
+      manifest.chunks = [];
+      warnings.push({
+        code: "chunk-metadata-read-error",
+        message: `Could not read checkpoint chunk metadata for ${sessionId}: ${error.message}`,
+        fatal: true,
       });
     }
   }
@@ -1257,13 +1411,44 @@ async function buildRecoveredSession({
   const manifestChunkNames = manifestChunks
     .map((chunk) => chunk?.fileName)
     .filter((name) => typeof name === "string");
-  const indexChunkNames = Array.isArray(indexEntry?.chunkFileNames)
+  let indexChunkNames = Array.isArray(indexEntry?.chunkFileNames)
     ? indexEntry.chunkFileNames.filter((name) => typeof name === "string")
     : [];
+  if (indexChunkNames.length > MAX_RECOVERY_CHUNKS) {
+    warnings.push({
+      code: "index-chunk-list-over-budget",
+      message: `Ignoring ${indexChunkNames.length} legacy index chunk names above the ${MAX_RECOVERY_CHUNKS} chunk budget`,
+    });
+    indexChunkNames = [];
+  }
+  // Without readable manifest chunk lists, the index count and committed
+  // sidecars still define which chunk files must exist.
+  const indexChunkCount = indexEntry?.chunkCount;
+  if (Number.isSafeInteger(indexChunkCount) && indexChunkCount > 0) {
+    if (indexChunkCount > MAX_RECOVERY_CHUNKS) {
+      warnings.push({
+        code: "index-chunk-list-over-budget",
+        message: `Ignoring index chunk count ${indexChunkCount} above the ${MAX_RECOVERY_CHUNKS} chunk budget`,
+      });
+    } else {
+      for (let index = 0; index < indexChunkCount; index += 1) {
+        indexChunkNames.push(`${sessionId}-chunk-${String(index).padStart(5, "0")}.f32`);
+      }
+    }
+  }
+  let sidecarChunkNames = chunkMetadataNames;
+  if (sidecarChunkNames.length > MAX_RECOVERY_CHUNKS) {
+    warnings.push({
+      code: "chunk-metadata-list-over-budget",
+      message: `Ignoring ${sidecarChunkNames.length} chunk metadata sidecars above the ${MAX_RECOVERY_CHUNKS} chunk budget`,
+    });
+    sidecarChunkNames = [];
+  }
   const chunkNames = new Set([
     ...chunkFiles.map((chunk) => chunk.fileName),
     ...manifestChunkNames,
     ...indexChunkNames,
+    ...sidecarChunkNames,
   ]);
   const sortedChunkNames = [...chunkNames].sort(compareChunkNames);
 
@@ -1301,7 +1486,7 @@ async function buildRecoveredSession({
   let state = "orphan";
   if (activeInMemory) {
     state = "active";
-  } else if (manifestParseError || manifestState === "error") {
+  } else if (manifestParseError || chunkMetadataError || manifestState === "error") {
     state = "error";
   } else if (manifestState === "interrupted") {
     state = "interrupted";
@@ -1326,7 +1511,9 @@ async function buildRecoveredSession({
   );
   const shapeKnown = channels > 0 && sampleRate > 0 && sampleFormat === "f32-interleaved";
   let nonExportableReason = "";
-  if (!shapeKnown) {
+  if (chunkMetadataError) {
+    nonExportableReason = "recording metadata could not be read completely";
+  } else if (!shapeKnown) {
     nonExportableReason = "sample rate, channel count, or sample format is unknown";
   } else if (recoveredChunks.length === 0) {
     nonExportableReason = "no exportable chunk files were found";

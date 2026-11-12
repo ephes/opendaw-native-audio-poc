@@ -180,6 +180,21 @@ render quanta afterward; reconfiguration preserves this cadence.
 
 Browser recording artifacts are also outside the backend compatibility boundary. This includes `native-pcm-recordings-index.json`, `native-pcm-*-manifest.json`, `native-pcm-*-recovered-manifest.json`, `native-pcm-*-chunk-*.f32`, and exported `native-pcm-*.wav` files. The current OPFS chunk, manifest, and recovery artifact formats are documented in the README's Browser Recording Mode and OPFS Recovery sections.
 
+Manifests written to OPFS use `chunkMetadata: {format: "per-chunk-v1", count: N}`
+and immutable `native-pcm-*-chunk-*.f32.json` sidecars for the first N closed
+chunks; only chunks without a committed sidecar stay inline in `chunks`. Each
+sidecar is committed before the manifest count advances. Recovery expands these
+references in order, validating the chunk index, file name, completion
+timestamp and block-list presence, then appends the inline chunks; an
+incomplete metadata read is fatal for WAV export. Exported manifests retain
+full inline block evidence, and legacy inline-only manifests remain supported. Recovery checks each OPFS JSON
+file's size and nesting depth before using it; the budgets, recovery and
+cleanup behavior are documented in the README.
+
+Manifests carry `counterEpochTotals: {underruns, overflows}` with the monitor
+counter deltas closed by earlier monitor counter resets; `counterDeltasAtStop`
+includes them.
+
 ## Compatibility Boundary
 
 The WebSocket protocol is the compatibility boundary. A later Swift backend should be able to emit the same messages and binary PCM blocks without changing the browser receiver.
