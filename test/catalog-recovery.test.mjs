@@ -97,3 +97,63 @@ test("catalog writer refuses a generation its reader would reject for nesting", 
   await assert.rejects(recorder.writeIndex(index), /nests deeper/);
   assert.deepEqual(root.files.get(INDEX), bytes);
 });
+
+for (const metadata of [{ type: INDEX_TYPE, version: 2 }, { type: "future-other-catalog", version: 1 }, { version: 1 }, { type: INDEX_TYPE }]) {
+  test(`unsupported catalog ${JSON.stringify(metadata)} stays read-only`, async () => {
+    const { recorder, root } = fixture();
+    const bytes = encoder.encode(JSON.stringify({ ...metadata, sessions: { "native-pcm-saved": {} }, future: { retained: true } }));
+    root.files.set(INDEX, bytes);
+    const read = await recorder.readIndex();
+    assert.equal(read.writable, false);
+    assert.match(read.warnings.join(" "), /unsupported.*type\/version/i);
+    await assert.rejects(recorder.start(stream), /index is read-only/);
+    await assert.rejects(recorder.deleteIndexSession("native-pcm-saved"), /index is read-only/);
+    await assert.rejects(recorder.writeIndex({ ...metadata, sessions: {} }), /unsupported.*type\/version/i);
+    assert.deepEqual(root.files.get(INDEX), bytes);
+  });
+}
+
+test("known catalog mutations preserve extension metadata", async () => {
+  const { recorder, root } = fixture();
+  root.files.set(INDEX, encoder.encode(JSON.stringify({ ...catalog(), extension: { retained: true } })));
+  await recorder.mutateIndex((index) => { index.sessions["native-pcm-saved"] = {}; });
+  assert.deepEqual(decode(root.files.get(INDEX)).extension, { retained: true });
+});
+
+test("recovery bounds every directory entry and refuses deletion of an incomplete inventory", async () => {
+  const { recorder, root } = fixture();
+  await recorder.start(stream); await record(recorder); await recorder.stop();
+  const id = recorder.session.sessionId;
+  const files = new Map(root.files);
+  const entries = root.entries.bind(root);
+  let visits = 0;
+  root.entries = async function* () {
+    for await (const entry of entries()) { visits++; yield entry; }
+    for (let i = 0; i < 60000; i++) { visits++; yield [`unrelated-${i}`, { kind: "file" }]; }
+  };
+  const scan = await recorder.scanRecoverySessions();
+  assert.equal(scan.complete, false);
+  assert.ok(visits <= 50001);
+  assert.match(scan.error, /incomplete.*50000/i);
+  assert.ok(scan.sessions.some((s) => s.sessionId === id));
+  await assert.rejects(recorder.deleteRecoveredSession(id), /incomplete/i);
+  assert.deepEqual(root.files, files);
+});
+
+test("recovery caps the union of indexed and orphan sessions", async () => {
+  const { recorder, root } = fixture();
+  root.files.set(INDEX, encoder.encode(JSON.stringify(catalog({ "native-pcm-indexed": {} }))));
+  let visits = 0;
+  root.entries = async function* () {
+    for (let i = 0; i < 20000; i++) {
+      visits++;
+      yield [`native-pcm-orphan-${i}-chunk-00000.f32.json`, { kind: "file" }];
+    }
+  };
+  const scan = await recorder.scanRecoverySessions();
+  assert.equal(scan.complete, false);
+  assert.equal(scan.sessions.length, 10000);
+  assert.ok(visits <= 10000);
+  assert.match(scan.error, /10000 sessions/);
+  assert.ok(scan.sessions.some((s) => s.sessionId === "native-pcm-indexed"));
+});

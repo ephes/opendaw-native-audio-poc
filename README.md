@@ -210,6 +210,15 @@ exist, so a missing chunk refuses WAV export instead of silently joining audio
 across the gap. A sidecar over budget is a fatal `chunk-metadata-read-error`
 and refuses WAV export for that session.
 
+Only index type `opendaw-native-audio-poc-recording-index`, version `1`, is
+writable. Unsupported or missing type/version is read-only and produces a
+recovery warning; save it and use compatible software before catalog repair.
+Supported version-1 extension metadata survives mutations. Recovery inventory
+examines at most 50,000 directory entries (including unrelated entries) and
+10,000 distinct sessions across the index and artifacts. One lookahead entry
+detects an exceeded limit. Partial results remain listed with an incomplete-scan
+message, and Delete refuses before any index change or artifact removal.
+
 Selected-channel WAV export accepts only an integer channel index inside the
 recorded channel range, for both the live and the recovered session. A
 non-integer, NaN or out-of-range index is refused instead of producing a

@@ -15,6 +15,8 @@ const CHUNK_METADATA_JSON_MAX_BYTES = 64 * 1024 * 1024;
 const JSON_MAX_DEPTH = 16;
 const MAX_INDEX_SESSIONS = 10_000;
 const MAX_RECOVERY_CHUNKS = 10_000;
+const MAX_RECOVERY_ARTIFACTS = 50_000;
+const INDEX_TYPE = "opendaw-native-audio-poc-recording-index";
 const INDEX_FILE_NAME = "native-pcm-recordings-index.json";
 const ARTIFACT_PREFIX = "native-pcm-";
 const MANIFEST_SUFFIX = "-manifest.json";
@@ -497,23 +499,13 @@ export class PcmRecorder {
     this.root = this.root ?? (await this.openStorageRoot());
     const scannedAt = new Date().toISOString();
     const { index, warnings: indexWarnings } = await this.readIndex();
-    const artifacts = await listRecordingArtifacts(this.root);
-    const sessionIds = new Set(Object.keys(index.sessions));
-    for (const sessionId of artifacts.manifests.keys()) {
-      sessionIds.add(sessionId);
-    }
-    for (const sessionId of artifacts.chunks.keys()) {
-      sessionIds.add(sessionId);
-    }
-    // Leftover sidecars alone still surface a session so Delete can remove them.
-    for (const sessionId of artifacts.chunkMetadataNames.keys()) {
-      sessionIds.add(sessionId);
-    }
+    const artifacts = await listRecordingArtifacts(this.root, Object.keys(index.sessions));
+    const { sessionIds } = artifacts;
+    const scanWarnings = [...indexWarnings, ...artifacts.warnings];
 
     const sessions = [];
     for (const sessionId of sessionIds) {
-      sessions.push(
-        await buildRecoveredSession({
+      const session = await buildRecoveredSession({
           root: this.root,
           sessionId,
           indexEntry: index.sessions[sessionId] ?? null,
@@ -523,15 +515,18 @@ export class PcmRecorder {
           activeSessionId: this.session?.sessionId ?? null,
           activeSessionState: this.state,
           activeSessionHasOpenChunk: Boolean(this.currentChunk),
-          indexWarnings,
-        }),
-      );
+          indexWarnings: scanWarnings,
+        });
+      session.artifactFileNames = artifacts.fileNames.get(sessionId) ?? [];
+      sessions.push(session);
     }
 
     sessions.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
     return {
       available: true,
-      error: "",
+      complete: artifacts.complete,
+      warnings: scanWarnings,
+      error: artifacts.warnings.join("; "),
       scannedAt,
       indexFileName: INDEX_FILE_NAME,
       sessions,
@@ -655,6 +650,9 @@ export class PcmRecorder {
     }
     this.root = this.root ?? (await this.openStorageRoot());
     const scan = await this.scanRecoverySessions();
+    if (!scan.complete) {
+      throw new Error(scan.error || "Recovery inventory is incomplete; deletion refused");
+    }
     const session = scan.sessions.find((entry) => entry.sessionId === sessionId);
     if (!session) {
       await this.deleteIndexSession(sessionId);
@@ -666,20 +664,8 @@ export class PcmRecorder {
       });
     }
 
-    const fileNames = new Set();
-    if (session.manifestFileName) {
-      fileNames.add(session.manifestFileName);
-    }
-    for (const chunk of session.chunks) {
-      if (chunk.fileName) {
-        fileNames.add(chunk.fileName);
-      }
-    }
-    for await (const [name] of this.root.entries()) {
-      if (name === `${sessionId}${MANIFEST_SUFFIX}` || name.startsWith(`${sessionId}-chunk-`)) {
-        fileNames.add(name);
-      }
-    }
+    // Delete only exact owned names from the complete, bounded inventory.
+    const fileNames = new Set(session.artifactFileNames);
 
     await this.deleteIndexSession(sessionId);
     await Promise.all([...fileNames].map((fileName) => removeEntry(this.root, fileName)));
@@ -1070,16 +1056,11 @@ export class PcmRecorder {
         );
         return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
       }
-      return {
-        index: {
-          type: parsed.type ?? "opendaw-native-audio-poc-recording-index",
-          version: parsed.version ?? 1,
-          updatedAt: parsed.updatedAt ?? null,
-          sessions: parsed.sessions ?? {},
-        },
-        warnings,
-        writable: true,
-      };
+      if (parsed.type !== INDEX_TYPE || parsed.version !== 1) {
+        warnings.push(`Unsupported recording index type/version; catalog is read-only. Preserve it and use compatible software or artifact recovery.`);
+        return { index: emptyIndex(), warnings, writable: false };
+      }
+      return { index: parsed, warnings, writable: true };
     } catch (error) {
       warnings.push(`Could not read ${INDEX_FILE_NAME}: ${error.message}`);
       return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
@@ -1108,6 +1089,9 @@ export class PcmRecorder {
     index.updatedAt = new Date().toISOString();
     const json = JSON.stringify(index, null, 2);
     const serialized = JSON.parse(json);
+    if (serialized.type !== INDEX_TYPE || serialized.version !== 1) {
+      throw new Error("Unsupported recording index type/version; catalog is read-only");
+    }
     if (!serialized.sessions || typeof serialized.sessions !== "object" || Array.isArray(serialized.sessions)) {
       throw new Error("Invalid recording index sessions");
     }
@@ -1325,45 +1309,48 @@ async function removeEntry(root, fileName) {
   }
 }
 
-async function listRecordingArtifacts(root) {
+async function listRecordingArtifacts(root, indexedSessionIds = []) {
   const manifests = new Map();
   const chunks = new Map();
   const chunkMetadataNames = new Map();
+  const fileNames = new Map();
+  const sessionIds = new Set(indexedSessionIds);
+  const warnings = [];
+  let entries = 0;
   for await (const [name, handle] of root.entries()) {
-    if (!name.startsWith(ARTIFACT_PREFIX)) {
-      continue;
+    // Count all entries: unrelated data and directories also cost enumeration work.
+    if (++entries > MAX_RECOVERY_ARTIFACTS) {
+      warnings.push(`Recovery scan incomplete: exceeded ${MAX_RECOVERY_ARTIFACTS} directory entries; deletion refused`);
+      break;
     }
+    if (!name.startsWith(ARTIFACT_PREFIX) || handle.kind !== "file") continue;
     const metadataMatch = name.match(CHUNK_METADATA_NAME_RE);
-    if (metadataMatch && handle.kind === "file") {
-      const chunkName = metadataMatch[1];
-      const sessionId = chunkName.match(CHUNK_NAME_RE)[1];
-      if (!chunkMetadataNames.has(sessionId)) {
-        chunkMetadataNames.set(sessionId, []);
-      }
-      chunkMetadataNames.get(sessionId).push(chunkName);
-      continue;
+    const chunkMatch = name.match(CHUNK_NAME_RE);
+    const sessionId = metadataMatch ? metadataMatch[1].match(CHUNK_NAME_RE)[1]
+      : name.endsWith(MANIFEST_SUFFIX) ? name.slice(0, -MANIFEST_SUFFIX.length)
+        : chunkMatch?.[1];
+    if (!sessionId) continue;
+    if (!sessionIds.has(sessionId) && sessionIds.size >= MAX_INDEX_SESSIONS) {
+      warnings.push(`Recovery scan incomplete: exceeded ${MAX_INDEX_SESSIONS} sessions; deletion refused`);
+      break;
     }
-    if (name.endsWith(MANIFEST_SUFFIX) && handle.kind === "file") {
-      manifests.set(name.slice(0, -MANIFEST_SUFFIX.length), name);
-      continue;
-    }
-    const match = name.match(CHUNK_NAME_RE);
-    if (match && handle.kind === "file") {
-      const sessionId = match[1];
-      const chunk = {
-        fileName: name,
-        index: Number(match[2]),
-      };
-      if (!chunks.has(sessionId)) {
-        chunks.set(sessionId, []);
-      }
-      chunks.get(sessionId).push(chunk);
+    sessionIds.add(sessionId);
+    if (!fileNames.has(sessionId)) fileNames.set(sessionId, []);
+    fileNames.get(sessionId).push(name);
+    if (metadataMatch) {
+      if (!chunkMetadataNames.has(sessionId)) chunkMetadataNames.set(sessionId, []);
+      chunkMetadataNames.get(sessionId).push(metadataMatch[1]);
+    } else if (name.endsWith(MANIFEST_SUFFIX)) {
+      manifests.set(sessionId, name);
+    } else {
+      if (!chunks.has(sessionId)) chunks.set(sessionId, []);
+      chunks.get(sessionId).push({ fileName: name, index: Number(chunkMatch[2]) });
     }
   }
   for (const chunkList of chunks.values()) {
     chunkList.sort((a, b) => a.index - b.index || a.fileName.localeCompare(b.fileName));
   }
-  return { manifests, chunks, chunkMetadataNames };
+  return { manifests, chunks, chunkMetadataNames, fileNames, sessionIds, warnings, complete: warnings.length === 0 };
 }
 
 async function buildRecoveredSession({
