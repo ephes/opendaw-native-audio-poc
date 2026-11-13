@@ -1042,24 +1042,33 @@ export class PcmRecorder {
       sessions: {},
     });
     if (!this.root) {
-      return { index: emptyIndex(), warnings };
+      return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
     }
     try {
-      const handle = await this.root.getFileHandle(INDEX_FILE_NAME);
+      let handle;
+      try {
+        handle = await this.root.getFileHandle(INDEX_FILE_NAME);
+      } catch (error) {
+        // Only a missing directory entry means a new catalog may be created.
+        if (error?.name === "NotFoundError") {
+          return { index: emptyIndex(), warnings, writable: true };
+        }
+        throw error;
+      }
       const parsed = await readBudgetedJson(handle, { maxBytes: INDEX_JSON_MAX_BYTES, label: INDEX_FILE_NAME });
       if (
         !parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
         !parsed.sessions || typeof parsed.sessions !== "object" || Array.isArray(parsed.sessions)
       ) {
         warnings.push(`Ignoring malformed ${INDEX_FILE_NAME}`);
-        return { index: emptyIndex(), warnings };
+        return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
       }
       const sessionCount = Object.keys(parsed.sessions).length;
       if (sessionCount > MAX_INDEX_SESSIONS) {
         warnings.push(
           `Ignoring ${INDEX_FILE_NAME}: ${sessionCount} sessions exceed the ${MAX_INDEX_SESSIONS} session budget`,
         );
-        return { index: emptyIndex(), warnings };
+        return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
       }
       return {
         index: {
@@ -1069,12 +1078,11 @@ export class PcmRecorder {
           sessions: parsed.sessions ?? {},
         },
         warnings,
+        writable: true,
       };
     } catch (error) {
-      if (error?.name !== "NotFoundError") {
-        warnings.push(`Could not read ${INDEX_FILE_NAME}: ${error.message}`);
-      }
-      return { index: emptyIndex(), warnings };
+      warnings.push(`Could not read ${INDEX_FILE_NAME}: ${error.message}`);
+      return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
     }
   }
 
@@ -1084,7 +1092,10 @@ export class PcmRecorder {
       throw new Error("Web Locks API is unavailable; cannot safely update the shared recording index");
     }
     return locks.request(INDEX_FILE_NAME, async () => {
-      const { index } = await this.readIndex();
+      const { index, warnings, writable } = await this.readIndex();
+      if (!writable) {
+        throw new Error(`Recording index is read-only; preserve it for recovery: ${warnings.join("; ")}`);
+      }
       change(index);
       await this.writeIndex(index);
     });
@@ -1095,10 +1106,22 @@ export class PcmRecorder {
       return;
     }
     index.updatedAt = new Date().toISOString();
+    const json = JSON.stringify(index, null, 2);
+    const serialized = JSON.parse(json);
+    if (!serialized.sessions || typeof serialized.sessions !== "object" || Array.isArray(serialized.sessions)) {
+      throw new Error("Invalid recording index sessions");
+    }
+    if (Object.keys(serialized.sessions).length > MAX_INDEX_SESSIONS) {
+      throw new Error(`Recording index exceeds the ${MAX_INDEX_SESSIONS} session budget`);
+    }
+    if (new Blob([json]).size > INDEX_JSON_MAX_BYTES) {
+      throw new Error(`Recording index exceeds the ${INDEX_JSON_MAX_BYTES} byte budget`);
+    }
+    assertJsonDepth(serialized, JSON_MAX_DEPTH, INDEX_FILE_NAME);
     const handle = await this.root.getFileHandle(INDEX_FILE_NAME, { create: true });
     const writable = await handle.createWritable();
     try {
-      await writable.write(JSON.stringify(index, null, 2));
+      await writable.write(json);
       await writable.close();
     } catch (error) {
       try { await writable.abort(); } catch { /* Preserve the original write failure. */ }

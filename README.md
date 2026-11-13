@@ -167,7 +167,7 @@ Raw size is substantial:
 20 minutes at 14 channels ~= 3.2 GB
 ```
 
-New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. Index read-modify-write operations use an origin-wide Web Locks API lock and reload the index while holding it, preserving unrelated sessions across tabs/workers. An unavailable Web Locks API refuses index mutations explicitly. Reset/Delete update the index before removing artifacts, so a lock or index-write failure preserves the session files for retry. As before, a malformed/unreadable discovery index produces scan warnings and uses an empty-index fallback on the next mutation; artifact scanning still discovers saved sessions. Failed writes abort their writable and release the lock for retry. The shared index is a discovery aid; recovery also scans artifact names directly.
+New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. Index read-modify-write operations use an origin-wide Web Locks API lock and reload the index while holding it, preserving unrelated sessions across tabs/workers. An unavailable Web Locks API refuses index mutations explicitly. Reset/Delete update the index before removing artifacts, so a lock or index-write failure preserves the session files for retry. A malformed, unreadable or over-budget discovery index produces scan warnings and makes index mutations read-only; Start, Reset and Delete refuse to overwrite it or remove saved session artifacts. Only a missing index permits automatic creation. Save the damaged index and recover/export the audio before explicitly repairing or moving that index aside; artifact scanning still discovers saved sessions. Failed writes abort their writable and release the lock for retry. The shared index is a discovery aid; recovery also scans artifact names directly.
 
 PCM admission requires 1–65,536 frames, 1–64 channels matching the stream, zero
 reserved header bytes, and an exact payload length. The cursor and exclusive
@@ -201,7 +201,7 @@ metadata sidecars.
 Recovery admits OPFS JSON before reading it into memory: the index is limited
 to 16 MiB and 10,000 sessions, a manifest to 256 MiB and 10,000 inline chunks,
 each `.f32.json` sidecar to 64 MiB, and every document to 16 nesting levels.
-The writer stays well inside these budgets. An index over budget is ignored
+Index writes validate the serialized UTF-8 size, session count and nesting before opening a writable, including the exact 16 MiB / 10,000-session boundaries. A refused mutation retains the prior catalog bytes. An index over budget is ignored
 with a warning (recovery still lists sessions from their manifests and chunk
 files). A manifest that is unreadable or over budget is reported as
 `manifest-read-error`; recovery then continues from the chunk files, and the
