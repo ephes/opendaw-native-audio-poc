@@ -18,6 +18,8 @@ const MAX_RECOVERY_CHUNKS = 10_000;
 const MAX_RECOVERY_ARTIFACTS = 50_000;
 const INDEX_TYPE = "opendaw-native-audio-poc-recording-index";
 const INDEX_FILE_NAME = "native-pcm-recordings-index.json";
+const MAX_INDEX_WARNINGS = 20;
+const MAX_INDEX_WARNING_CHARS = 500;
 const ARTIFACT_PREFIX = "native-pcm-";
 const MANIFEST_SUFFIX = "-manifest.json";
 const CHUNK_NAME_RE = /^(native-pcm-.+)-chunk-(\d+)\.f32$/;
@@ -126,8 +128,11 @@ export class PcmRecorder {
       return;
     }
 
+    this.root = this.root ?? (await this.openStorageRoot());
+    // Refuse before creating any session state or artifact: a read-only
+    // catalog must not leave orphan manifests or a stuck error session.
+    await this.assertIndexWritable();
     await this.clearNow({ silent: true });
-    this.root = await this.openStorageRoot();
     const persisted = await requestPersistentStorage();
     const counters = this.readCounters();
     const nativeStats = this.currentNativeInputStats();
@@ -219,7 +224,7 @@ export class PcmRecorder {
         this.session.counterDeltasAtStop = this.counterDeltas(stopCounters);
         this.session.nativeInputStats.latest = { ...nativeStats };
         this.session.nativeInputStats.stop = { ...nativeStats };
-        await this.updateIndexSession("stopping");
+        await this.updateIndexSessionBestEffort("stopping");
       }
       this.postStatus(true);
       await this.writeChain.catch(() => {});
@@ -234,7 +239,7 @@ export class PcmRecorder {
           this.setError(interruption);
         }
         await this.writeManifestToStorage();
-        await this.updateIndexSession(this.session.state);
+        await this.updateIndexSessionBestEffort(this.session.state);
       }
       this.state = this.session?.admissionError ? "error" : interruption ? "interrupted" : "stopped";
     } catch (error) {
@@ -515,7 +520,8 @@ export class PcmRecorder {
         activeSessionId: this.session?.sessionId ?? null,
         activeSessionState: this.state,
         activeSessionHasOpenChunk: Boolean(this.currentChunk),
-        indexWarnings: scanWarnings,
+        indexWarnings,
+        scanWarnings: artifacts.warnings,
       });
       session.artifactFileNames = artifacts.fileNames.get(sessionId) ?? [];
       sessions.push(session);
@@ -889,7 +895,7 @@ export class PcmRecorder {
     };
     this.currentChunk = chunk;
     this.session.chunks.push(chunk);
-    await this.updateIndexSession(this.session.state ?? "recording");
+    await this.updateIndexSessionBestEffort(this.session.state ?? "recording");
   }
 
   async closeCurrentChunk({ allowCloseFailure = false, skipPersist = false } = {}) {
@@ -921,7 +927,7 @@ export class PcmRecorder {
       await writable.close();
       this.committedChunkMetadata.add(chunk);
       await this.writeManifestToStorage();
-      await this.updateIndexSession(this.session.state ?? this.state);
+      await this.updateIndexSessionBestEffort(this.session.state ?? this.state);
     }
   }
 
@@ -1130,6 +1136,36 @@ export class PcmRecorder {
     } catch (error) {
       try { await writable.abort(); } catch { /* Preserve the original write failure. */ }
       throw error;
+    }
+  }
+
+  async assertIndexWritable() {
+    const locks = globalThis.navigator?.locks;
+    if (!locks?.request) {
+      throw new Error("Web Locks API is unavailable; cannot safely update the shared recording index");
+    }
+    await locks.request(INDEX_FILE_NAME, async () => {
+      const { warnings, writable } = await this.readIndex();
+      if (!writable) {
+        throw new Error(`Recording index is read-only; preserve it for recovery: ${warnings.join("; ")}`);
+      }
+    });
+  }
+
+  // The index is a discovery aid: once a recording owns artifacts, a catalog
+  // that became read-only must not abort capture or relabel a clean stop.
+  // The refusal still prevents overwriting it; the manifest records why.
+  async updateIndexSessionBestEffort(state) {
+    try {
+      await this.updateIndexSession(state);
+    } catch (error) {
+      if (!this.session) return;
+      const warnings = (this.session.indexWarnings ??= []);
+      const message = `Recording index not updated: ${error.message}`.slice(0, MAX_INDEX_WARNING_CHARS);
+      if (!warnings.includes(message) && warnings.length < MAX_INDEX_WARNINGS) {
+        warnings.push(message);
+      }
+      console.warn(message);
     }
   }
 
@@ -1400,11 +1436,12 @@ async function buildRecoveredSession({
   activeSessionState,
   activeSessionHasOpenChunk,
   indexWarnings,
+  scanWarnings = [],
 }) {
-  const warnings = indexWarnings.map((message) => ({
-    code: "index-warning",
-    message,
-  }));
+  const warnings = [
+    ...indexWarnings.map((message) => ({ code: "index-warning", message })),
+    ...scanWarnings.map((message) => ({ code: "scan-incomplete", message })),
+  ];
   let manifest = null;
   let manifestParseError = "";
   let manifestOwnershipError = false;

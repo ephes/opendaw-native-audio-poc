@@ -45,7 +45,16 @@ for (const failure of ["malformed", "shape", "read", "permission", "getFile-not-
       }
       return getHandle(name, options);
     };
-    await assert.rejects(recorder.start(stream), /index.*read-only/i);
+    const before = [...root.files.keys()].sort();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // A refused Start creates no session or artifact and leaves Start/Reset usable.
+      await assert.rejects(recorder.start(stream), /index.*read-only/i);
+      assert.deepEqual([...root.files.keys()].sort(), before);
+      assert.equal(recorder.session, null);
+      assert.equal(recorder.state, "idle");
+    }
+    await recorder.clear({ silent: true });
+    assert.equal(recorder.state, "idle");
     await assert.rejects(recorder.deleteRecoveredSession(id), /index.*read-only/i);
     assert.deepEqual(root.files.get(INDEX), bytes);
     assert.ok(root.files.has(`${id}-manifest.json`));
@@ -53,6 +62,25 @@ for (const failure of ["malformed", "shape", "read", "permission", "getFile-not-
     assert.ok(scan.sessions.find((s) => s.sessionId === id).warnings.some((w) => w.code === "index-warning"));
   });
 }
+
+test("catalog turning read-only mid-recording keeps capture and a clean stop", async () => {
+  const { recorder, root } = fixture();
+  await recorder.start(stream);
+  const id = recorder.session.sessionId;
+  const bytes = encoder.encode(JSON.stringify({ ...catalog({ [id]: {} }), version: 2 }));
+  root.files.set(INDEX, bytes);
+  await record(recorder);
+  await record(recorder, 2);
+  await recorder.stop();
+  assert.equal(recorder.state, "stopped");
+  assert.equal(recorder.lastError, "");
+  assert.deepEqual(root.files.get(INDEX), bytes);
+  const manifest = decode(root.files.get(`${id}-manifest.json`));
+  assert.equal(manifest.state, "stopped");
+  assert.equal(manifest.totalRecordedFrames, 4);
+  assert.ok(manifest.indexWarnings.length >= 1 && manifest.indexWarnings.length <= 20);
+  assert.match(manifest.indexWarnings[0], /index not updated.*read-only/i);
+});
 
 test("absent catalog can be created", async () => {
   const { recorder, root } = fixture();
@@ -135,7 +163,10 @@ test("recovery bounds every directory entry and refuses deletion of an incomplet
   assert.equal(scan.complete, false);
   assert.ok(visits <= 50001);
   assert.match(scan.error, /incomplete.*50000/i);
-  assert.ok(scan.sessions.some((s) => s.sessionId === id));
+  const recovered = scan.sessions.find((s) => s.sessionId === id);
+  assert.ok(recovered);
+  assert.ok(recovered.warnings.some((w) => w.code === "scan-incomplete" && /50000/.test(w.message)));
+  assert.ok(!recovered.warnings.some((w) => w.code === "index-warning"));
   await assert.rejects(recorder.deleteRecoveredSession(id), /incomplete/i);
   assert.deepEqual(root.files, files);
 });

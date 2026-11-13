@@ -299,7 +299,9 @@ async function runBrowserSmoke(config, port, debugPort, chromeOutput) {
     };
   })()`);
 
-  const recovery = await runRecoverySmoke(cdp);
+  // The OPFS round-trip is a synthetic browser check; the L-12 device smoke
+  // stays a monitor-only hardware check.
+  const recovery = config.source === "sine" ? await runRecoverySmoke(cdp) : { skipped: "device smoke" };
 
   const pageEvents = cdp.events
     .filter((event) => ["Runtime.exceptionThrown", "Log.entryAdded"].includes(event.method))
