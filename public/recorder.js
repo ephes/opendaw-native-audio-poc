@@ -239,7 +239,10 @@ export class PcmRecorder {
           this.setError(interruption);
         }
         await this.writeManifestToStorage();
-        await this.updateIndexSessionBestEffort(this.session.state);
+        if (await this.updateIndexSessionBestEffort(this.session.state)) {
+          // Persist a warning first raised by the final index update.
+          await this.writeManifestToStorage();
+        }
       }
       this.state = this.session?.admissionError ? "error" : interruption ? "interrupted" : "stopped";
     } catch (error) {
@@ -1113,21 +1116,7 @@ export class PcmRecorder {
       return;
     }
     index.updatedAt = new Date().toISOString();
-    const json = JSON.stringify(index, null, 2);
-    const serialized = JSON.parse(json);
-    if (serialized.type !== INDEX_TYPE || serialized.version !== 1) {
-      throw new Error("Unsupported recording index type/version; catalog is read-only");
-    }
-    if (!serialized.sessions || typeof serialized.sessions !== "object" || Array.isArray(serialized.sessions)) {
-      throw new Error("Invalid recording index sessions");
-    }
-    if (Object.keys(serialized.sessions).length > MAX_INDEX_SESSIONS) {
-      throw new Error(`Recording index exceeds the ${MAX_INDEX_SESSIONS} session budget`);
-    }
-    if (new Blob([json]).size > INDEX_JSON_MAX_BYTES) {
-      throw new Error(`Recording index exceeds the ${INDEX_JSON_MAX_BYTES} byte budget`);
-    }
-    assertJsonDepth(serialized, JSON_MAX_DEPTH, INDEX_FILE_NAME);
+    const json = serializeIndexForWrite(index);
     const handle = await this.root.getFileHandle(INDEX_FILE_NAME, { create: true });
     const writable = await handle.createWritable();
     try {
@@ -1145,27 +1134,35 @@ export class PcmRecorder {
       throw new Error("Web Locks API is unavailable; cannot safely update the shared recording index");
     }
     await locks.request(INDEX_FILE_NAME, async () => {
-      const { warnings, writable } = await this.readIndex();
+      const { index, warnings, writable } = await this.readIndex();
       if (!writable) {
         throw new Error(`Recording index is read-only; preserve it for recovery: ${warnings.join("; ")}`);
       }
+      // The new session must also fit the write budgets (sessions, bytes, depth).
+      const probe = { ...index, updatedAt: new Date().toISOString(), sessions: { ...index.sessions } };
+      probe.sessions[`${ARTIFACT_PREFIX}start-budget-probe`] = { ...INDEX_ENTRY_BUDGET_PROBE };
+      serializeIndexForWrite(probe);
     });
   }
 
   // The index is a discovery aid: once a recording owns artifacts, a catalog
   // that became read-only must not abort capture or relabel a clean stop.
   // The refusal still prevents overwriting it; the manifest records why.
+  // Returns true when a new warning was recorded for the manifest.
   async updateIndexSessionBestEffort(state) {
     try {
       await this.updateIndexSession(state);
+      return false;
     } catch (error) {
-      if (!this.session) return;
+      if (!this.session) return false;
       const warnings = (this.session.indexWarnings ??= []);
       const message = `Recording index not updated: ${error.message}`.slice(0, MAX_INDEX_WARNING_CHARS);
+      console.warn(message);
       if (!warnings.includes(message) && warnings.length < MAX_INDEX_WARNINGS) {
         warnings.push(message);
+        return true;
       }
-      console.warn(message);
+      return false;
     }
   }
 
@@ -1375,6 +1372,43 @@ async function removeEntries(root, fileNames) {
     error.retainedFileNames = failures.map(({ fileName }) => fileName);
     throw error;
   }
+}
+
+// Largest realistic entry shape, so the Start pre-check covers the byte budget.
+const INDEX_ENTRY_BUDGET_PROBE = {
+  sessionId: `${"native-pcm-"}${"0".repeat(24)}-${"0".repeat(36)}`,
+  state: "recording",
+  startedAt: "0000-00-00T00:00:00.000Z",
+  stoppedAt: null,
+  sampleRate: 0,
+  channels: 0,
+  framesPerBlock: 0,
+  sampleFormat: "f32-interleaved",
+  manifestFileName: `native-pcm-${"0".repeat(61)}-manifest.json`,
+  chunkFilePrefix: `native-pcm-${"0".repeat(61)}-chunk-`,
+  chunkCount: 0,
+  totalRecordedFrames: 0,
+  totalRecordedBytes: 0,
+  updatedAt: "0000-00-00T00:00:00.000Z",
+};
+
+function serializeIndexForWrite(index) {
+  const json = JSON.stringify(index, null, 2);
+  const serialized = JSON.parse(json);
+  if (serialized.type !== INDEX_TYPE || serialized.version !== 1) {
+    throw new Error("Unsupported recording index type/version; catalog is read-only");
+  }
+  if (!serialized.sessions || typeof serialized.sessions !== "object" || Array.isArray(serialized.sessions)) {
+    throw new Error("Invalid recording index sessions");
+  }
+  if (Object.keys(serialized.sessions).length > MAX_INDEX_SESSIONS) {
+    throw new Error(`Recording index exceeds the ${MAX_INDEX_SESSIONS} session budget`);
+  }
+  if (new Blob([json]).size > INDEX_JSON_MAX_BYTES) {
+    throw new Error(`Recording index exceeds the ${INDEX_JSON_MAX_BYTES} byte budget`);
+  }
+  assertJsonDepth(serialized, JSON_MAX_DEPTH, INDEX_FILE_NAME);
+  return json;
 }
 
 function ownsChunk(sessionId, name) {

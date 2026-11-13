@@ -82,6 +82,36 @@ test("catalog turning read-only mid-recording keeps capture and a clean stop", a
   assert.match(manifest.indexWarnings[0], /index not updated.*read-only/i);
 });
 
+test("Start refuses a full catalog before creating any session or artifact", async () => {
+  const { recorder, root } = fixture();
+  const sessions = Object.fromEntries(Array.from({ length: 10000 }, (_, i) => [`native-pcm-${i}`, {}]));
+  await recorder.writeIndex(catalog(sessions));
+  const bytes = root.files.get(INDEX).slice();
+  const before = [...root.files.keys()].sort();
+  await assert.rejects(recorder.start(stream), /session budget/);
+  assert.deepEqual([...root.files.keys()].sort(), before);
+  assert.deepEqual(root.files.get(INDEX), bytes);
+  assert.equal(recorder.session, null);
+  assert.equal(recorder.state, "idle");
+});
+
+test("a warning first raised by the final stop index update reaches the manifest", async () => {
+  const { recorder, root } = fixture();
+  await recorder.start(stream);
+  const id = recorder.session.sessionId;
+  await record(recorder);
+  const update = recorder.updateIndexSession.bind(recorder);
+  recorder.updateIndexSession = async (state) => {
+    if (state === "stopped") throw new Error("synthetic final index failure");
+    return update(state);
+  };
+  await recorder.stop();
+  assert.equal(recorder.state, "stopped");
+  const manifest = decode(root.files.get(`${id}-manifest.json`));
+  assert.equal(manifest.state, "stopped");
+  assert.deepEqual(manifest.indexWarnings, ["Recording index not updated: synthetic final index failure"]);
+});
+
 test("absent catalog can be created", async () => {
   const { recorder, root } = fixture();
   await recorder.start(stream);
