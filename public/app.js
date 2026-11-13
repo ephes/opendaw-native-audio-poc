@@ -480,7 +480,7 @@ function renderRecovery() {
     : unavailable
       ? recoveryResult.error || "OPFS recovery is unavailable."
       : recoveryResult
-        ? `${sessions.length} OPFS session${sessions.length === 1 ? "" : "s"} found. Last scan: ${formatDateTime(recoveryResult.scannedAt)}`
+        ? `${sessions.length} OPFS session${sessions.length === 1 ? "" : "s"} found. Last scan: ${formatDateTime(recoveryResult.scannedAt)}${recoveryResult.error ? ` — ${recoveryResult.error}` : ""}`
         : "No recovery scan has run.";
   els.recoverySummary.textContent = scanState;
 

@@ -474,12 +474,18 @@ test("a rejected export releases the lifecycle queue for reset", async () => {
 });
 
 for (const action of ["reset", "delete"]) {
-  test(`a corrupt discovery index does not strand ${action} or recreate deleted audio`, async (t) => {
+  test(`a corrupt discovery index protects ${action} until explicit catalog repair`, async (t) => {
     const { recorder, root } = storedRecorder();
     navigatorProperty(t, "storage", { getDirectory: async () => root });
     await recorder.start(stream); await record(recorder); await recorder.stop();
     const oldId = recorder.session.sessionId;
     root.files.set("native-pcm-recordings-index.json", new TextEncoder().encode("synthetic invalid index"));
+    const savedFiles = new Map(root.files);
+    await assert.rejects(action === "reset" ? recorder.clear() : recorder.deleteRecoveredSession(oldId), /index is read-only/);
+    assert.deepEqual(root.files, savedFiles);
+    assert.equal(recorder.state, "stopped");
+    // Explicit repair after saving the damaged catalog; never an automatic fallback.
+    root.files.delete("native-pcm-recordings-index.json");
     if (action === "reset") await recorder.clear();
     else await recorder.deleteRecoveredSession(oldId);
     assert.equal(recorder.state, "idle");

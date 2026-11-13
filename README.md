@@ -85,7 +85,7 @@ just serve-l12
 `just inspect-recording <manifest.json>` validates an exported or recovered recording manifest from disk without hardware, Chrome, OPFS access, browser automation, or raw `.f32` chunk files. The target defaults to the observed L-12 shape: 14 channels, 48 kHz, 960 frames per block, `f32-interleaved`, and zero native input drop deltas.
 For known-bad or exploratory artifacts where native drops are expected, run `node scripts/inspect-recording-manifest.mjs <manifest.json>` directly and choose only the expectations that apply.
 
-`just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling.
+`just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. It also records two synthetic stereo frames into real OPFS, reloads the page, checks recovered manifest/WAV samples and deletes that session. This OPFS round-trip runs only for the synthetic sine source; `just smoke-l12` stays a monitor-only device check. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling.
 
 `just smoke-l12` is an opt-in real-device monitor smoke for the observed ZOOM LiveTrak L-12 path. It starts a temporary input-source server with device substring `ZOOM`, 14 channels, 48 kHz, and 960 frames per block, then runs the same headless browser monitor checks for 30 seconds. It requires the L-12 to be connected and available through CoreAudio. If the device is missing or the requested config cannot open, the command reports that the hardware smoke did not run and includes the Rust server output, such as device selection, config, or stream-open errors. Override the duration with `just smoke-l12 <milliseconds>`, or use the full form `just smoke-l12 <milliseconds> <port> <frames-per-block> <device-substring> <channels> <sample-rate>`. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling. The smoke expects all 14 meters to become active and native dropped callback buffers/frames/events to remain `0`; set `SMOKE_EXPECT_ACTIVE_METERS` only when deliberately running with known silent inputs, and set `SMOKE_EXPECT_NATIVE_DROPS_ZERO=0` only when deliberately investigating a known hardware drop condition.
 
@@ -156,7 +156,7 @@ Monitor startup shares one owned attempt while the worklet module loads and audi
 
 WebSocket reconnects supersede the previous connection. Only the current socket may publish connection state, stream configuration, native input stats, errors, or PCM; delayed events from an old socket are ignored.
 
-Start, Stop, Reset/Clear, Delete Session, and all manifest/WAV exports run in arrival order through one recorder lifecycle queue per recorder. Exports hold that queue through file reads and serialization, using one session/root snapshot; subsequent reset/start/delete requests wait until the download Blob is complete. A failed export releases the queue. Independent tabs can still remove a session: file-read errors refuse export rather than constructing a partial WAV. Repeated Start while recording is a no-op; a failed request releases the queue so Reset or a later Start can proceed. PCM writes use a separate queue, which Stop drains before closing a chunk. A startup failure before session creation leaves the recorder idle so Start and Disconnect remain available. If the lock or index update fails during pre-start cleanup of a prior session, its state and manifest stay intact for retry and the error is reported. Artifact removal can still fail partway through cleanup; retry Reset/Clear or Start to finish removing that session. Once a session exists, startup failures persist an error manifest/index on a best-effort basis.
+Start, Stop, Reset/Clear, Delete Session, and all manifest/WAV exports run in arrival order through one recorder lifecycle queue per recorder. Exports hold that queue through file reads and serialization, using one session/root snapshot; subsequent reset/start/delete requests wait until the download Blob is complete. A failed export releases the queue. Independent tabs can still remove a session: file-read errors refuse export rather than constructing a partial WAV. Repeated Start while recording is a no-op; a failed request releases the queue so Reset or a later Start can proceed. PCM writes use a separate queue, which Stop drains before closing a chunk. A startup failure before session creation leaves the recorder idle so Start and Disconnect remain available. If the lock or index update fails during pre-start cleanup of a prior session, its state and manifest stay intact for retry and the error is reported. Artifact removal can still fail partway through cleanup. Reset and Delete wait for every removal to settle before another lifecycle action runs, report the retained filenames/count, and keep in-memory ownership on failure; retry Reset/Clear, Delete or Start to finish cleanup. Once a session exists, startup failures persist an error manifest/index on a best-effort basis.
 
 Recording uses the Origin Private File System through `navigator.storage.getDirectory()`. Use a Chromium-class desktop browser for this slice. If OPFS is unavailable, recording refuses to arm and monitoring remains usable. The page asks the browser for persistent storage when recording starts, but the browser may still return `false`; long tests should be run in a profile with sufficient free disk space.
 
@@ -167,7 +167,16 @@ Raw size is substantial:
 20 minutes at 14 channels ~= 3.2 GB
 ```
 
-New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. Index read-modify-write operations use an origin-wide Web Locks API lock and reload the index while holding it, preserving unrelated sessions across tabs/workers. An unavailable Web Locks API refuses index mutations explicitly. Reset/Delete update the index before removing artifacts, so a lock or index-write failure preserves the session files for retry. As before, a malformed/unreadable discovery index produces scan warnings and uses an empty-index fallback on the next mutation; artifact scanning still discovers saved sessions. Failed writes abort their writable and release the lock for retry. The shared index is a discovery aid; recovery also scans artifact names directly.
+New session IDs use `native-pcm-<ISO timestamp with colons/dots replaced>-<cryptographic UUID>` so independent tabs starting in the same millisecond have separate manifest and chunk names. Recovery still recognizes historical timestamp-only session IDs. Index read-modify-write operations use an origin-wide Web Locks API lock and reload the index while holding it, preserving unrelated sessions across tabs/workers. An unavailable Web Locks API refuses index mutations explicitly. Reset/Delete update the index before removing artifacts, so a lock or index-write failure preserves the session files for retry. A malformed, unreadable or over-budget discovery index produces scan warnings and makes index mutations read-only; Start, Reset and Delete refuse to overwrite it or remove saved session artifacts. Only a missing index permits automatic creation. Start checks this, and that one more session still fits the index write budgets, before it creates any session or artifact, so a refused Start leaves no files and the recorder stays idle. Once a recording owns artifacts, a catalog that becomes read-only does not stop capture or turn a clean Stop into an error: chunk and stop index updates are skipped (never overwriting the catalog) and recorded as bounded `indexWarnings` in the session manifest. Artifact scanning still discovers saved sessions. To recover, first export the audio and manifests through OPFS Sessions, then move the damaged index aside from the DevTools console of the app page (OPFS is not browsable in DevTools):
+
+```js
+const root = await navigator.storage.getDirectory();
+const index = await root.getFileHandle("native-pcm-recordings-index.json");
+console.log(await (await index.getFile()).text()); // save this output
+await index.move(`damaged-recordings-index-${Date.now()}.json`);
+```
+
+Reload the page; the next Start creates a fresh index and recovery still lists sessions from their artifacts. The moved file has no `native-pcm-` prefix, so recovery and Delete ignore it; remove it manually once it is no longer needed. Failed writes abort their writable and release the lock for retry. The shared index is a discovery aid; recovery also scans artifact names directly.
 
 PCM admission requires 1–65,536 frames, 1–64 channels matching the stream, zero
 reserved header bytes, and an exact payload length. The cursor and exclusive
@@ -201,7 +210,7 @@ metadata sidecars.
 Recovery admits OPFS JSON before reading it into memory: the index is limited
 to 16 MiB and 10,000 sessions, a manifest to 256 MiB and 10,000 inline chunks,
 each `.f32.json` sidecar to 64 MiB, and every document to 16 nesting levels.
-The writer stays well inside these budgets. An index over budget is ignored
+Index writes validate the serialized UTF-8 size, session count and nesting before opening a writable, including the exact 16 MiB / 10,000-session boundaries. A refused mutation retains the prior catalog bytes. An index over budget is ignored
 with a warning (recovery still lists sessions from their manifests and chunk
 files). A manifest that is unreadable or over budget is reported as
 `manifest-read-error`; recovery then continues from the chunk files, and the
@@ -209,6 +218,15 @@ index chunk count plus any committed sidecars still name the chunks that must
 exist, so a missing chunk refuses WAV export instead of silently joining audio
 across the gap. A sidecar over budget is a fatal `chunk-metadata-read-error`
 and refuses WAV export for that session.
+
+Only index type `opendaw-native-audio-poc-recording-index`, version `1`, is
+writable. Unsupported or missing type/version is read-only and produces a
+recovery warning; save it and use compatible software before catalog repair.
+Supported version-1 extension metadata survives mutations. Recovery inventory
+examines at most 50,000 directory entries (including unrelated entries) and
+10,000 distinct sessions across the index and artifacts. One lookahead entry
+detects an exceeded limit. Partial results remain listed with an incomplete-scan
+message, and Delete refuses before any index change or artifact removal.
 
 Selected-channel WAV export accepts only an integer channel index inside the
 recorded channel range, for both the live and the recovered session. A
@@ -264,6 +282,8 @@ After a reload, tab close, or browser failure before Stop Recording, reopen the 
 A failed chunk close ends the recording in `error` with no `stoppedAt`. The incomplete chunk keeps a null `completedAt`, a `closeError`, and its in-memory writable until explicit cleanup. The error manifest preserves earlier closed chunks. After reload, recovery excludes the failed chunk with a `chunk-close-failed` warning and can export the earlier committed chunks; it never labels the session a clean stop. The offline inspector rejects a live manifest containing `closeError` chunks.
 
 Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, native input stats from the original manifest when present, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing native input stats in an older manifest, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
+
+Recovery exports enumerate bounded artifact names, then read only the selected session’s manifest, sidecars and chunks plus the shared index. They preserve unmanifested tail discovery, reject cross-session manifest chunk references, and recheck chunk size during export. An incomplete name inventory refuses export; listing/reconciliation still rebuilds every discovered session.
 
 Cleanly stopped prior sessions may also appear in OPFS Sessions after a reload. They can be exported through the recovery controls or deleted from OPFS. Delete only removes files whose names match the selected `native-pcm-*` session; it does not clear unrelated site data.
 
