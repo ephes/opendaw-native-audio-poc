@@ -265,7 +265,7 @@ export class PcmRecorder {
       const fileNames = this.session.chunks.flatMap((chunk) => [chunk.fileName, `${chunk.fileName}.json`]);
       fileNames.push(this.manifestFileName());
       await this.deleteIndexSession(this.session.sessionId);
-      await Promise.all(fileNames.map((fileName) => removeEntry(this.root, fileName)));
+      await removeEntries(this.root, fileNames);
     }
     this.session = null;
     this.currentChunk = null;
@@ -506,17 +506,17 @@ export class PcmRecorder {
     const sessions = [];
     for (const sessionId of sessionIds) {
       const session = await buildRecoveredSession({
-          root: this.root,
-          sessionId,
-          indexEntry: index.sessions[sessionId] ?? null,
-          manifestFileName: artifacts.manifests.get(sessionId) ?? null,
-          chunkFiles: artifacts.chunks.get(sessionId) ?? [],
-          chunkMetadataNames: artifacts.chunkMetadataNames.get(sessionId) ?? [],
-          activeSessionId: this.session?.sessionId ?? null,
-          activeSessionState: this.state,
-          activeSessionHasOpenChunk: Boolean(this.currentChunk),
-          indexWarnings: scanWarnings,
-        });
+        root: this.root,
+        sessionId,
+        indexEntry: index.sessions[sessionId] ?? null,
+        manifestFileName: artifacts.manifests.get(sessionId) ?? null,
+        chunkFiles: artifacts.chunks.get(sessionId) ?? [],
+        chunkMetadataNames: artifacts.chunkMetadataNames.get(sessionId) ?? [],
+        activeSessionId: this.session?.sessionId ?? null,
+        activeSessionState: this.state,
+        activeSessionHasOpenChunk: Boolean(this.currentChunk),
+        indexWarnings: scanWarnings,
+      });
       session.artifactFileNames = artifacts.fileNames.get(sessionId) ?? [];
       sessions.push(session);
     }
@@ -526,7 +526,7 @@ export class PcmRecorder {
       available: true,
       complete: artifacts.complete,
       warnings: scanWarnings,
-      error: artifacts.warnings.join("; "),
+      error: scanWarnings.join("; "),
       scannedAt,
       indexFileName: INDEX_FILE_NAME,
       sessions,
@@ -668,7 +668,7 @@ export class PcmRecorder {
     const fileNames = new Set(session.artifactFileNames);
 
     await this.deleteIndexSession(sessionId);
-    await Promise.all([...fileNames].map((fileName) => removeEntry(this.root, fileName)));
+    await removeEntries(this.root, [...fileNames]);
     if (this.session?.sessionId === sessionId) {
       this.session = null;
       this.currentChunk = null;
@@ -679,12 +679,32 @@ export class PcmRecorder {
   }
 
   async findRecoveredSession(sessionId) {
-    const scan = await this.scanRecoverySessions();
-    const session = scan.sessions.find((entry) => entry.sessionId === sessionId);
-    if (!session) {
+    if (typeof sessionId !== "string" || !sessionId.startsWith(ARTIFACT_PREFIX) || /[/\\]/.test(sessionId)) {
+      throw new Error("Invalid recording session id");
+    }
+    this.root = this.root ?? (await this.openStorageRoot());
+    const root = this.root;
+    const { index, warnings } = await this.readIndex();
+    const indexed = Object.hasOwn(index.sessions, sessionId);
+    // OPFS has no prefix query: enumerate bounded names, but read only the
+    // requested session's exact artifacts, including unmanifested tail chunks.
+    const artifacts = await listRecordingArtifacts(root, indexed ? [sessionId] : [], sessionId);
+    if (!artifacts.complete) throw new Error(artifacts.warnings.join("; "));
+    if (!artifacts.sessionIds.has(sessionId)) {
       throw new Error(`Recovered session ${sessionId} was not found`);
     }
-    return session;
+    return buildRecoveredSession({
+      root,
+      sessionId,
+      indexEntry: indexed ? index.sessions[sessionId] : null,
+      manifestFileName: artifacts.manifests.get(sessionId) ?? null,
+      chunkFiles: artifacts.chunks.get(sessionId) ?? [],
+      chunkMetadataNames: artifacts.chunkMetadataNames.get(sessionId) ?? [],
+      activeSessionId: this.session?.sessionId ?? null,
+      activeSessionState: this.state,
+      activeSessionHasOpenChunk: Boolean(this.currentChunk),
+      indexWarnings: warnings,
+    });
   }
 
   status() {
@@ -1028,7 +1048,7 @@ export class PcmRecorder {
       sessions: {},
     });
     if (!this.root) {
-      return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
+      return { index: emptyIndex(), warnings, writable: false };
     }
     try {
       let handle;
@@ -1047,14 +1067,14 @@ export class PcmRecorder {
         !parsed.sessions || typeof parsed.sessions !== "object" || Array.isArray(parsed.sessions)
       ) {
         warnings.push(`Ignoring malformed ${INDEX_FILE_NAME}`);
-        return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
+        return { index: emptyIndex(), warnings, writable: false };
       }
       const sessionCount = Object.keys(parsed.sessions).length;
       if (sessionCount > MAX_INDEX_SESSIONS) {
         warnings.push(
           `Ignoring ${INDEX_FILE_NAME}: ${sessionCount} sessions exceed the ${MAX_INDEX_SESSIONS} session budget`,
         );
-        return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
+        return { index: emptyIndex(), warnings, writable: false };
       }
       if (parsed.type !== INDEX_TYPE || parsed.version !== 1) {
         warnings.push(`Unsupported recording index type/version; catalog is read-only. Preserve it and use compatible software or artifact recovery.`);
@@ -1063,7 +1083,7 @@ export class PcmRecorder {
       return { index: parsed, warnings, writable: true };
     } catch (error) {
       warnings.push(`Could not read ${INDEX_FILE_NAME}: ${error.message}`);
-      return { index: emptyIndex(), warnings, writable: warnings.length === 0 };
+      return { index: emptyIndex(), warnings, writable: false };
     }
   }
 
@@ -1309,7 +1329,23 @@ async function removeEntry(root, fileName) {
   }
 }
 
-async function listRecordingArtifacts(root, indexedSessionIds = []) {
+async function removeEntries(root, fileNames) {
+  const names = [...new Set(fileNames)];
+  const results = await Promise.allSettled(names.map((name) => removeEntry(root, name)));
+  const failures = results.flatMap((result, i) => result.status === "rejected"
+    ? [{ fileName: names[i], reason: result.reason }] : []);
+  if (failures.length > 0) {
+    const error = new Error(`Failed to remove ${failures.length} artifacts; retained: ${failures.map(({ fileName, reason }) => `${fileName} (${reason.message})`).join(", ")}`);
+    error.retainedFileNames = failures.map(({ fileName }) => fileName);
+    throw error;
+  }
+}
+
+function ownsChunk(sessionId, name) {
+  return typeof name === "string" && name.match(CHUNK_NAME_RE)?.[1] === sessionId;
+}
+
+async function listRecordingArtifacts(root, indexedSessionIds = [], targetSessionId = null) {
   const manifests = new Map();
   const chunks = new Map();
   const chunkMetadataNames = new Map();
@@ -1329,7 +1365,7 @@ async function listRecordingArtifacts(root, indexedSessionIds = []) {
     const sessionId = metadataMatch ? metadataMatch[1].match(CHUNK_NAME_RE)[1]
       : name.endsWith(MANIFEST_SUFFIX) ? name.slice(0, -MANIFEST_SUFFIX.length)
         : chunkMatch?.[1];
-    if (!sessionId) continue;
+    if (!sessionId || (targetSessionId !== null && sessionId !== targetSessionId)) continue;
     if (!sessionIds.has(sessionId) && sessionIds.size >= MAX_INDEX_SESSIONS) {
       warnings.push(`Recovery scan incomplete: exceeded ${MAX_INDEX_SESSIONS} sessions; deletion refused`);
       break;
@@ -1371,6 +1407,7 @@ async function buildRecoveredSession({
   }));
   let manifest = null;
   let manifestParseError = "";
+  let manifestOwnershipError = false;
   if (manifestFileName) {
     try {
       const handle = await root.getFileHandle(manifestFileName);
@@ -1381,12 +1418,17 @@ async function buildRecoveredSession({
       if (Array.isArray(parsed.chunks) && parsed.chunks.length > MAX_RECOVERY_CHUNKS) {
         throw new Error(`${parsed.chunks.length} chunks exceed the ${MAX_RECOVERY_CHUNKS} chunk budget`);
       }
+      if (Array.isArray(parsed.chunks) && parsed.chunks.some((chunk) => !ownsChunk(sessionId, chunk?.fileName))) {
+        manifestOwnershipError = true;
+        throw new Error("Manifest references chunks outside its session");
+      }
       manifest = parsed;
     } catch (error) {
       manifestParseError = error.message;
       warnings.push({
         code: "manifest-read-error",
         message: `Could not read ${manifestFileName}: ${error.message}`,
+        fatal: error.message === "Manifest references chunks outside its session",
       });
     }
   }
@@ -1422,7 +1464,7 @@ async function buildRecoveredSession({
     .map((chunk) => chunk?.fileName)
     .filter((name) => typeof name === "string");
   let indexChunkNames = Array.isArray(indexEntry?.chunkFileNames)
-    ? indexEntry.chunkFileNames.filter((name) => typeof name === "string")
+    ? indexEntry.chunkFileNames.filter((name) => ownsChunk(sessionId, name))
     : [];
   if (indexChunkNames.length > MAX_RECOVERY_CHUNKS) {
     warnings.push({
@@ -1521,7 +1563,9 @@ async function buildRecoveredSession({
   );
   const shapeKnown = channels > 0 && sampleRate > 0 && sampleFormat === "f32-interleaved";
   let nonExportableReason = "";
-  if (chunkMetadataError) {
+  if (manifestOwnershipError) {
+    nonExportableReason = "manifest references chunks outside its session";
+  } else if (chunkMetadataError) {
     nonExportableReason = "recording metadata could not be read completely";
   } else if (!shapeKnown) {
     nonExportableReason = "sample rate, channel count, or sample format is unknown";

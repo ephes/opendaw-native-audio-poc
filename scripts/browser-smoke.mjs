@@ -299,6 +299,8 @@ async function runBrowserSmoke(config, port, debugPort, chromeOutput) {
     };
   })()`);
 
+  const recovery = await runRecoverySmoke(cdp);
+
   const pageEvents = cdp.events
     .filter((event) => ["Runtime.exceptionThrown", "Log.entryAdded"].includes(event.method))
     .map((event) => event.params);
@@ -312,7 +314,53 @@ async function runBrowserSmoke(config, port, debugPort, chromeOutput) {
   });
 
   socket.close();
-  return { config, isolation, beforeMonitor, afterMonitor, pageEvents, failures };
+  return { config, isolation, beforeMonitor, afterMonitor, recovery, pageEvents, failures };
+}
+
+async function runRecoverySmoke(cdp) {
+  // A fresh temporary Chrome profile owns all storage in this smoke. No real
+  // input or browser downloads: round-trip two synthetic stereo frames in OPFS.
+  const sessionId = await evalExpr(cdp, `(async () => {
+    const { PcmRecorder } = await import("/recorder.js");
+    const recorder = new PcmRecorder({
+      readCounters: () => ({ underruns: 0, overflows: 0, receivedBlocks: 1 }),
+      postMessage() {},
+    });
+    await recorder.start({ sampleRate: 48000, channels: 2, framesPerBlock: 2, sampleFormat: "f32-interleaved" });
+    recorder.recordBlock({
+      frameStart: 0, frameCount: 2, channels: 2, receivedBlockIndex: 0,
+      dataBytes: new Uint8Array(new Float32Array([0.25, -0.5, 0.75, -1]).buffer),
+    });
+    await recorder.stop();
+    return recorder.session.sessionId;
+  })()`);
+  const eventStart = cdp.events.length;
+  await cdp.send("Page.reload");
+  const loadDeadline = Date.now() + 10_000;
+  while (!cdp.events.slice(eventStart).some((event) => event.method === "Page.loadEventFired")) {
+    if (Date.now() >= loadDeadline) throw new Error("Recovery smoke page reload timed out");
+    await sleep(100);
+  }
+  await waitFor(cdp, 'document.readyState === "complete" && Boolean(document.querySelector("#connect"))');
+  return evalExpr(cdp, `(async () => {
+    const { PcmRecorder } = await import("/recorder.js");
+    const recorder = new PcmRecorder({ readCounters: () => ({}), postMessage() {} });
+    const id = ${JSON.stringify(sessionId)};
+    const scan = await recorder.scanRecoverySessions();
+    if (!scan.complete || !scan.sessions.some((session) => session.sessionId === id)) {
+      throw new Error("Browser recovery did not rediscover the saved session");
+    }
+    const manifest = await recorder.exportRecoveredManifest(id);
+    const metadata = JSON.parse(await manifest.blob.text());
+    const wav = await recorder.exportRecoveredSelectedChannelWav(id, 0);
+    const samples = [...new Float32Array(await wav.blob.arrayBuffer(), 44)];
+    if (metadata.reconstructed.frames !== 2 || samples.length !== 2 || samples[0] !== 0.25 || samples[1] !== 0.75) {
+      throw new Error("Browser recovery round-trip changed synthetic audio");
+    }
+    const afterDelete = await recorder.deleteRecoveredSession(id);
+    if (afterDelete.sessions.some((session) => session.sessionId === id)) throw new Error("Browser recovery deletion retained the session");
+    return { reloaded: true, frames: metadata.reconstructed.frames, samples, deleted: true };
+  })()`);
 }
 
 function collectFailures({ config, isolation, beforeMonitor, afterMonitor, runtimeExceptions }) {
