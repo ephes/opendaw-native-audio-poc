@@ -330,3 +330,24 @@ test("exact recovery directory budget is complete", async () => {
   assert.equal(scan.complete, true);
   assert.equal(scan.error, "");
 });
+
+test("Start refuses a catalog one byte short of the real first entry before creating artifacts", async () => {
+  const limit = 16 * 1024 * 1024;
+  // Measure how many bytes a real first index entry adds.
+  const scratch = fixture();
+  await scratch.recorder.writeIndex({ ...catalog(), padding: "" });
+  const empty = scratch.root.files.get(INDEX).byteLength;
+  await scratch.recorder.start(stream);
+  const growth = scratch.root.files.get(INDEX).byteLength - empty;
+  await scratch.recorder.stop();
+  const { recorder, root } = fixture();
+  await recorder.writeIndex({ ...catalog(), padding: "x".repeat(limit - empty - growth + 1) });
+  assert.equal(root.files.get(INDEX).byteLength + growth, limit + 1);
+  const bytes = root.files.get(INDEX).slice();
+  const before = [...root.files.keys()].sort();
+  await assert.rejects(recorder.start(stream), /byte budget/);
+  assert.deepEqual([...root.files.keys()].sort(), before);
+  assert.deepEqual(root.files.get(INDEX), bytes);
+  assert.equal(recorder.session, null);
+  assert.equal(recorder.state, "idle");
+});

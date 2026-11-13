@@ -1140,7 +1140,7 @@ export class PcmRecorder {
       }
       // The new session must also fit the write budgets (sessions, bytes, depth).
       const probe = { ...index, updatedAt: new Date().toISOString(), sessions: { ...index.sessions } };
-      probe.sessions[`${ARTIFACT_PREFIX}start-budget-probe`] = { ...INDEX_ENTRY_BUDGET_PROBE };
+      probe.sessions[INDEX_ENTRY_BUDGET_PROBE.sessionId] = { ...INDEX_ENTRY_BUDGET_PROBE };
       serializeIndexForWrite(probe);
     });
   }
@@ -1374,22 +1374,25 @@ async function removeEntries(root, fileNames) {
   }
 }
 
-// Largest realistic entry shape, so the Start pre-check covers the byte budget.
+// Upper bound of a real entry (full-length session key and field widths), so
+// the Start pre-check covers the byte budget the first index update needs.
+const BUDGET_PROBE_SESSION_ID = `native-pcm-${"0".repeat(24)}-${"0".repeat(36)}`;
+const BUDGET_PROBE_TIME = "0000-00-00T00:00:00.000Z";
 const INDEX_ENTRY_BUDGET_PROBE = {
-  sessionId: `${"native-pcm-"}${"0".repeat(24)}-${"0".repeat(36)}`,
-  state: "recording",
-  startedAt: "0000-00-00T00:00:00.000Z",
-  stoppedAt: null,
-  sampleRate: 0,
-  channels: 0,
-  framesPerBlock: 0,
+  sessionId: BUDGET_PROBE_SESSION_ID,
+  state: "interrupted",
+  startedAt: BUDGET_PROBE_TIME,
+  stoppedAt: BUDGET_PROBE_TIME,
+  sampleRate: Number.MAX_SAFE_INTEGER,
+  channels: Number.MAX_SAFE_INTEGER,
+  framesPerBlock: Number.MAX_SAFE_INTEGER,
   sampleFormat: "f32-interleaved",
-  manifestFileName: `native-pcm-${"0".repeat(61)}-manifest.json`,
-  chunkFilePrefix: `native-pcm-${"0".repeat(61)}-chunk-`,
-  chunkCount: 0,
-  totalRecordedFrames: 0,
-  totalRecordedBytes: 0,
-  updatedAt: "0000-00-00T00:00:00.000Z",
+  manifestFileName: `${BUDGET_PROBE_SESSION_ID}-manifest.json`,
+  chunkFilePrefix: `${BUDGET_PROBE_SESSION_ID}-chunk-`,
+  chunkCount: Number.MAX_SAFE_INTEGER,
+  totalRecordedFrames: Number.MAX_SAFE_INTEGER,
+  totalRecordedBytes: Number.MAX_SAFE_INTEGER,
+  updatedAt: BUDGET_PROBE_TIME,
 };
 
 function serializeIndexForWrite(index) {
