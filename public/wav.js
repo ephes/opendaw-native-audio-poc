@@ -40,7 +40,11 @@ export function extractChannel(samples, channelIndex, channelCount, frameCount) 
   }
   const channelSamples = new Float32Array(frameCount);
   for (let frame = 0; frame < frameCount; frame += 1) {
-    channelSamples[frame] = samples[frame * channelCount + channelIndex];
+    const sample = samples[frame * channelCount + channelIndex];
+    if (!Number.isFinite(sample)) {
+      throw new Error(`Nonfinite persisted PCM at chunk frame ${frame}, channel ${channelIndex + 1}; WAV export refused. Original chunks are unchanged.`);
+    }
+    channelSamples[frame] = sample;
   }
   return channelSamples;
 }

@@ -832,10 +832,21 @@ export class PcmRecorder {
       await this.openNextChunk();
     }
 
-    this.auditTimeline(block);
     const chunk = this.currentChunk;
     const chunkOffsetBytes = chunk.bytes;
-    await chunk.writable.write(block.dataBytes);
+    try {
+      await chunk.writable.write(block.dataBytes);
+    } catch (error) {
+      this.session.storageWriteError = {
+        frameStart: block.frameStart,
+        frameCount: block.frameCount,
+        message: String(error.message).slice(0, 500),
+      };
+      throw error;
+    }
+    // Timeline evidence describes successful PCM writes only. No asynchronous
+    // work may separate this commit from the matching chunk/frame counters.
+    this.auditTimeline(block);
 
     if (chunk.frames === 0) {
       chunk.firstFrameStart = block.frameStart;

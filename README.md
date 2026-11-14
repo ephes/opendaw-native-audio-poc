@@ -185,7 +185,11 @@ are refused before conversion. Every Float32 sample must be finite; NaN and
 positive/negative infinity reject the entire block without replacing values.
 Finite samples, including signed zero and subnormals, retain their exact bytes.
 Invalid blocks are reported in recording integrity
-and do not reach OPFS, monitoring or meters. The next valid block is compared
+and do not reach OPFS, monitoring or meters. Timeline and gap/overlap evidence
+advance only after a successful PCM write, together with frame/block counters.
+A rejected write retains the previous timeline and records a separate bounded
+`storageWriteError` (frame span and up to 500 message characters); normal queued
+capture then enters `error`. The next valid block is compared
 with the last accepted end for gap/overlap detection. See [the binary contract](docs/protocol.md#pcm-blocks).
 
 The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each and hold at most 65,536 blocks, so a chunk's block list stays small even with very short blocks. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
@@ -251,7 +255,13 @@ The manifest includes:
 - native input stats snapshots under `nativeInputStats`, including start/latest/stop counters for dropped callback buffers, dropped frames, drop events, bridge queue capacity, source, and backend `atFrame`
 - detected gaps, overlaps, discontinuities, channel mismatches, invalid blocks, WebSocket lag events, monitor counter resets, byte-based write-backlog warnings, and underrun/overflow deltas during recording
 
-Export Selected WAV writes one mono 32-bit float WAV for the selected source channel. This is intended for DAW import and channel-mapping checks. WAV export reads OPFS chunks and deinterleaves the selected channel, but the resulting mono WAV is assembled as a browser `Blob`; exporting very long channels can still be memory-intensive. All-channel WAV export is intentionally left out of this slice.
+Export Selected WAV writes one mono 32-bit float WAV for the selected source channel. This is intended for DAW import and channel-mapping checks. WAV export reads OPFS chunks and deinterleaves the selected channel. Both current
+and recovered export refuse NaN or Infinity in that channel with a bounded
+chunk-frame/channel diagnostic, leaving the original chunks unchanged. Finite
+samples outside [-1, 1], signed zero and subnormals remain unchanged. The
+resulting mono WAV is assembled as a browser `Blob`; exporting very long channels
+can still be memory-intensive. All-channel WAV export is intentionally left out
+of this slice.
 
 The top status counters show cumulative native dropped cpal callback buffers, dropped frames, and drop events from the Rust backend. The recording status panel also shows native dropped callback buffers/frames/events during the active recording. These counters are separate from WebSocket PCM blocks, browser-side gaps/overlaps, WebSocket lag, and monitor underrun/overflow counters.
 

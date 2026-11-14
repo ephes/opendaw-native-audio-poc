@@ -1013,3 +1013,85 @@ for (const target of ["sidecar", "manifest"]) {
     assert.deepEqual(recovered.originalManifest.chunks[0].blocks, chunk.blocks);
   });
 }
+
+for (const initialBlock of [false, true]) {
+  test(`failed PCM write leaves timeline at last persisted block (initial=${initialBlock})`, async () => {
+    const { recorder, root } = storedRecorder();
+    let fail = false;
+    faultingWriters(root, (name, stage) => fail && name.endsWith(".f32") && stage === "write");
+    await recorder.start(stream);
+    if (initialBlock) await record(recorder);
+    const before = recorder.buildManifest();
+    const block = {
+      frameStart: 10, frameCount: 2, channels: 2, receivedBlockIndex: 5,
+      dataBytes: new Uint8Array(new Float32Array([0.5, -0.5, 1.5, -1.5]).buffer),
+    };
+    fail = true;
+    await assert.rejects(recorder.writeBlockNow(block), /primary write failure/);
+    const failed = recorder.buildManifest();
+    for (const name of ["firstFrameStart", "expectedNextFrame", "recordedBlocks", "totalRecordedFrames", "integrity"]) {
+      assert.deepEqual(failed[name], before[name], name);
+    }
+    assert.deepEqual(failed.storageWriteError, { frameStart: 10, frameCount: 2, message: "primary write failure" });
+    fail = false;
+    await recorder.writeBlockNow(block);
+    await recorder.stop();
+    const manifest = JSON.parse(new TextDecoder().decode(root.files.get(recorder.manifestFileName())));
+    assert.equal(manifest.expectedNextFrame, 12);
+    assert.equal(manifest.totalRecordedFrames, initialBlock ? 4 : 2);
+    assert.equal(manifest.integrity.gaps.length, initialBlock ? 1 : 0);
+    if (initialBlock) assert.equal(manifest.integrity.gaps[0].missingFrames, 8);
+  });
+}
+
+for (const value of [NaN, Infinity, -Infinity]) {
+  test(`current and recovered WAV refuse persisted ${value} without changing source bytes`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    await recorder.start(stream);
+    await record(recorder);
+    await recorder.stop();
+    const name = recorder.session.chunks[0].fileName;
+    const damaged = new Float32Array([0.25, value, 0.75, -1]);
+    root.files.set(name, new Uint8Array(damaged.buffer));
+    const before = root.files.get(name).slice();
+    const reloaded = storedRecorder(root).recorder;
+    for (const exportWav of [
+      () => recorder.exportSelectedChannelWav(1),
+      () => reloaded.exportRecoveredSelectedChannelWav(recorder.session.sessionId, 1),
+    ]) {
+      await assert.rejects(exportWav(), /Nonfinite persisted PCM.*frame 0.*channel 2/);
+      assert.deepEqual(root.files.get(name), before);
+    }
+    // An unaffected channel is still usable; clipping, signed zero and tiny
+    // finite samples must not be normalized by extraction.
+    const finite = new Float32Array([-0, 2.5, 1e-40, -3]);
+    root.files.set(name, new Uint8Array(finite.buffer));
+    for (const exportWav of [
+      () => recorder.exportSelectedChannelWav(1),
+      () => reloaded.exportRecoveredSelectedChannelWav(recorder.session.sessionId, 1),
+    ]) {
+      const wav = new Float32Array((await (await exportWav()).blob.arrayBuffer()).slice(44));
+      assert.deepEqual([...wav], [2.5, -3]);
+    }
+    const signed = new Float32Array((await (await recorder.exportSelectedChannelWav(0)).blob.arrayBuffer()).slice(44));
+    assert.deepEqual(signed, new Float32Array([-0, 1e-40]));
+  });
+}
+
+test("queued PCM write failure persists last successful timeline and storage cause", async () => {
+  const { recorder, root } = storedRecorder();
+  let fail = false;
+  faultingWriters(root, (name, stage) => fail && name.endsWith(".f32") && stage === "write");
+  await recorder.start(stream);
+  await record(recorder);
+  fail = true;
+  await record(recorder, 10);
+  assert.equal(recorder.state, "error");
+  const manifest = JSON.parse(new TextDecoder().decode(root.files.get(recorder.manifestFileName())));
+  assert.equal(manifest.expectedNextFrame, 2);
+  assert.equal(manifest.totalRecordedFrames, 2);
+  assert.equal(manifest.recordedBlocks, 1);
+  assert.deepEqual(manifest.integrity.gaps, []);
+  assert.match(manifest.storageWriteError.message, /primary write failure/);
+});
