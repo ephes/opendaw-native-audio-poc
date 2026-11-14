@@ -7,7 +7,7 @@
 
 - Commit timeline/gap evidence only after PCM writes succeed and retain a bounded storage-write diagnostic; reject nonfinite persisted samples in current and recovered selected-channel WAV exports without modifying audio.
 
-- Abort failed chunk-sidecar and manifest writers; retain one pending closed chunk for checkpoint retries through Stop or Export Manifest without duplicating PCM or claiming clean completion.
+- Abort failed chunk-sidecar and manifest writers; retain one pending closed chunk for checkpoint retries through Export Manifest (or a programmatic stop/interrupt) without duplicating PCM or claiming clean completion.
 
 - Protect unreadable or malformed recording catalogs from Start/Reset/Delete mutations; keep artifact recovery available. Start refuses a read-only or full catalog before creating any session or artifact; an active recording keeps capturing and stops cleanly when the catalog becomes read-only, recording skipped index updates as manifest `indexWarnings`. Document the manual save-and-move-aside procedure.
 - Report incomplete recovery inventories with their own `scan-incomplete` warning code instead of `index-warning`.

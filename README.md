@@ -232,9 +232,10 @@ metadata sidecars.
 Failed sidecar and manifest writes abort their writable, preserving the original
 write/close error even if abort also fails. A single closed chunk stays pending
 until its sidecar and manifest checkpoint publish; rotation retries this owner
-before opening another PCM file. Retrying Stop after a checkpoint failure, or
-Export Manifest in the error state, retries publication without reopening PCM or
-rewriting an already committed sidecar. The session remains `error` with no
+before opening another PCM file. In the UI, Export Manifest in the error state
+retries publication (Stop is disabled once the recorder is in `error`; a
+programmatic `stopNow`/interrupt retry takes the same path), without reopening PCM
+or rewriting an already committed sidecar. The session remains `error` with no
 `stoppedAt`: retry repairs evidence but cannot prove capture completed. Reset or
 Delete discards the pending owner only after artifact cleanup succeeds.
 
