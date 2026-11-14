@@ -926,3 +926,201 @@ test("a session with only leftover metadata sidecars is listed and deletable", a
   await reloaded.deleteRecoveredSession(sessionId);
   assert.equal(root.files.has(sidecar), false);
 });
+
+// Model exclusive writers and staged publication, including abort failures.
+function faultingWriters(root, shouldFail) {
+  const getFileHandle = root.getFileHandle;
+  const locked = new Set();
+  const opens = new Map();
+  const aborts = [];
+  root.getFileHandle = async (name, options) => {
+    const handle = await getFileHandle(name, options);
+    const createWritable = handle.createWritable;
+    handle.createWritable = async () => {
+      assert.equal(locked.has(name), false, `writer still locked: ${name}`);
+      locked.add(name);
+      opens.set(name, (opens.get(name) ?? 0) + 1);
+      const writable = await createWritable();
+      return {
+        async write(data) {
+          if (shouldFail(name, "write")) throw new Error("primary write failure");
+          await writable.write(data);
+        },
+        async close() {
+          if (shouldFail(name, "close")) throw new Error("primary close failure");
+          await writable.close();
+          locked.delete(name);
+        },
+        async abort() {
+          locked.delete(name);
+          aborts.push(name);
+          throw new Error("secondary abort failure");
+        },
+      };
+    };
+    return handle;
+  };
+  return { locked, opens, aborts };
+}
+
+for (const stage of ["write", "close"]) {
+  test(`failed sidecar ${stage} aborts once, preserves cause and releases writer`, async () => {
+    const { recorder, root } = storedRecorder();
+    let fail = true;
+    const writers = faultingWriters(root, (name, operation) =>
+      fail && name.endsWith(".f32.json") && operation === stage);
+    await recorder.start(stream);
+    await record(recorder);
+    const chunk = recorder.currentChunk;
+    await assert.rejects(recorder.closeCurrentChunk(), new RegExp(`primary ${stage} failure`));
+    assert.deepEqual(writers.aborts, [`${chunk.fileName}.json`]);
+    assert.equal(writers.locked.size, 0);
+    fail = false;
+    const writable = await (await root.getFileHandle(`${chunk.fileName}.json`)).createWritable();
+    await writable.close();
+  });
+}
+
+for (const target of ["sidecar", "manifest"]) {
+  test(`Stop retries pending ${target} checkpoint without reopening PCM or claiming clean completion`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    let fail = false;
+    const writers = faultingWriters(root, (name, stage) => fail && stage === "close" &&
+      (target === "sidecar" ? name.endsWith(".f32.json") : name.endsWith("-manifest.json")));
+    await recorder.start(stream);
+    await record(recorder);
+    const chunk = recorder.currentChunk;
+    fail = true;
+    await recorder.stop();
+    assert.equal(recorder.state, "error");
+    assert.equal(recorder.currentChunk, null);
+    assert.equal(recorder.pendingChunkPublication, chunk);
+    const pcm = root.files.get(chunk.fileName).slice();
+    fail = false;
+    await recorder.stop();
+    assert.equal(recorder.pendingChunkPublication, null);
+    assert.equal(recorder.state, "error");
+    assert.equal(recorder.session.stoppedAt, null);
+    assert.deepEqual(root.files.get(chunk.fileName), pcm);
+    assert.equal(writers.opens.get(chunk.fileName), 1);
+    const stored = JSON.parse(new TextDecoder().decode(root.files.get(recorder.manifestFileName())));
+    assert.equal(stored.chunkMetadata.count, 1);
+    assert.deepEqual(stored.chunks, []);
+    const recovered = (await storedRecorder(root).recorder.scanRecoverySessions()).sessions[0];
+    assert.equal(recovered.recoveredFrames, 2);
+    assert.equal(recovered.exportableWav, true);
+    assert.deepEqual(recovered.originalManifest.chunks[0].blocks, chunk.blocks);
+  });
+}
+
+for (const initialBlock of [false, true]) {
+  test(`failed PCM write leaves timeline at last persisted block (initial=${initialBlock})`, async () => {
+    const { recorder, root } = storedRecorder();
+    let fail = false;
+    faultingWriters(root, (name, stage) => fail && name.endsWith(".f32") && stage === "write");
+    await recorder.start(stream);
+    if (initialBlock) await record(recorder);
+    const before = recorder.buildManifest();
+    const block = {
+      frameStart: 10, frameCount: 2, channels: 2, receivedBlockIndex: 5,
+      dataBytes: new Uint8Array(new Float32Array([0.5, -0.5, 1.5, -1.5]).buffer),
+    };
+    fail = true;
+    await assert.rejects(recorder.writeBlockNow(block), /primary write failure/);
+    const failed = recorder.buildManifest();
+    for (const name of ["firstFrameStart", "expectedNextFrame", "recordedBlocks", "totalRecordedFrames", "integrity"]) {
+      assert.deepEqual(failed[name], before[name], name);
+    }
+    assert.deepEqual(failed.storageWriteError, { frameStart: 10, frameCount: 2, message: "primary write failure" });
+    fail = false;
+    await recorder.writeBlockNow(block);
+    await recorder.stop();
+    const manifest = JSON.parse(new TextDecoder().decode(root.files.get(recorder.manifestFileName())));
+    assert.equal(manifest.expectedNextFrame, 12);
+    assert.equal(manifest.totalRecordedFrames, initialBlock ? 4 : 2);
+    assert.equal(manifest.integrity.gaps.length, initialBlock ? 1 : 0);
+    if (initialBlock) assert.equal(manifest.integrity.gaps[0].missingFrames, 8);
+  });
+}
+
+for (const value of [NaN, Infinity, -Infinity]) {
+  test(`current and recovered WAV refuse persisted ${value} without changing source bytes`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    await recorder.start(stream);
+    await record(recorder);
+    await recorder.stop();
+    const name = recorder.session.chunks[0].fileName;
+    const damaged = new Float32Array([0.25, value, 0.75, -1]);
+    root.files.set(name, new Uint8Array(damaged.buffer));
+    const before = root.files.get(name).slice();
+    const reloaded = storedRecorder(root).recorder;
+    for (const exportWav of [
+      () => recorder.exportSelectedChannelWav(1),
+      () => reloaded.exportRecoveredSelectedChannelWav(recorder.session.sessionId, 1),
+    ]) {
+      await assert.rejects(exportWav(), /Nonfinite persisted PCM.*frame 0.*channel 2/);
+      assert.deepEqual(root.files.get(name), before);
+    }
+    // An unaffected channel is still usable; clipping, signed zero and tiny
+    // finite samples must not be normalized by extraction.
+    const finite = new Float32Array([-0, 2.5, 1e-40, -3]);
+    root.files.set(name, new Uint8Array(finite.buffer));
+    for (const exportWav of [
+      () => recorder.exportSelectedChannelWav(1),
+      () => reloaded.exportRecoveredSelectedChannelWav(recorder.session.sessionId, 1),
+    ]) {
+      const wav = new Float32Array((await (await exportWav()).blob.arrayBuffer()).slice(44));
+      assert.deepEqual([...wav], [2.5, -3]);
+    }
+    const signed = new Float32Array((await (await recorder.exportSelectedChannelWav(0)).blob.arrayBuffer()).slice(44));
+    assert.deepEqual(signed, new Float32Array([-0, 1e-40]));
+  });
+}
+
+test("queued PCM write failure persists last successful timeline and storage cause", async () => {
+  const { recorder, root } = storedRecorder();
+  let fail = false;
+  faultingWriters(root, (name, stage) => fail && name.endsWith(".f32") && stage === "write");
+  await recorder.start(stream);
+  await record(recorder);
+  fail = true;
+  await record(recorder, 10);
+  assert.equal(recorder.state, "error");
+  const manifest = JSON.parse(new TextDecoder().decode(root.files.get(recorder.manifestFileName())));
+  assert.equal(manifest.expectedNextFrame, 2);
+  assert.equal(manifest.totalRecordedFrames, 2);
+  assert.equal(manifest.recordedBlocks, 1);
+  assert.deepEqual(manifest.integrity.gaps, []);
+  assert.match(manifest.storageWriteError.message, /primary write failure/);
+});
+
+for (const action of ["clear", "delete"]) {
+  test(`${action} retains pending checkpoint on cleanup failure and retires it after retry`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    let fail = true;
+    faultingWriters(root, (name, stage) => fail && name.endsWith(".f32.json") && stage === "close");
+    await recorder.start(stream);
+    await record(recorder);
+    await recorder.stop();
+    const chunk = recorder.pendingChunkPublication;
+    assert.ok(chunk);
+    const cleanup = () => action === "clear" ? recorder.clear() : recorder.deleteRecoveredSession(recorder.session.sessionId);
+    fail = false;
+    const remove = root.removeEntry;
+    root.removeEntry = async (name) => {
+      if (name === chunk.fileName) throw new Error("synthetic retained PCM");
+      return remove(name);
+    };
+    await assert.rejects(cleanup());
+    assert.equal(recorder.pendingChunkPublication, chunk);
+    assert.ok(root.files.has(chunk.fileName));
+    root.removeEntry = remove;
+    await cleanup();
+    assert.equal(recorder.pendingChunkPublication, null);
+    assert.equal(recorder.session, null);
+    assert.deepEqual([...root.files.keys()], ["native-pcm-recordings-index.json"]);
+  });
+}

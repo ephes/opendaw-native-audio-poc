@@ -25,7 +25,7 @@ test("status messages update recovery controls without changing the selected exp
   class FixtureWorker {
     messages = [];
     constructor() { worker = this; }
-    addEventListener(type, handler) { assert.equal(type, "message"); this.receive = handler; }
+    addEventListener(type, handler) { if (type === "message") this.receive = handler; }
     postMessage(message) { this.messages.push(message); }
     emit(message) { this.receive({ data: message }); }
   }

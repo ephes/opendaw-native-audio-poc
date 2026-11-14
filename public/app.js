@@ -177,8 +177,40 @@ function ensureWorker() {
   if (worker) {
     return;
   }
-  worker = new Worker("/audio-worker.js", { type: "module" });
-  worker.addEventListener("message", handleWorkerMessage);
+  const owned = new Worker("/audio-worker.js", { type: "module" });
+  worker = owned;
+  owned.addEventListener("message", (event) => {
+    if (worker === owned) handleWorkerMessage(event);
+  });
+  for (const type of ["error", "messageerror"]) {
+    owned.addEventListener(type, (event) => {
+      event.preventDefault();
+      if (worker !== owned) return;
+      worker = null;
+      owned.terminate();
+      stopMonitor();
+      sharedBuffer = null;
+      stateView = null;
+      streamInfo = null;
+      recordingStartPending = false;
+      recoveryScanPending = false;
+      nativeInputStats = defaultNativeInputStats();
+      const guidance = "Audio worker failed; capture may be interrupted. Use Scan Recovery to inspect retained OPFS audio, then reconnect. The open chunk may be lost.";
+      // The replacement recorder owns no live session. Exports must use the
+      // recovery panel, not stale in-memory counters/session ownership.
+      recordingStatus = { state: "interrupted", lastError: guidance };
+      recoveryResult = { available: true, sessions: [], error: guidance };
+      meterBars = [];
+      els.meters.replaceChildren();
+      els.leftChannel.replaceChildren();
+      els.rightChannel.replaceChildren();
+      els.wavChannel.replaceChildren();
+      setSocketState("error");
+      els.streamSummary.textContent = guidance;
+      renderCounters();
+      renderRecovery();
+    });
+  }
 }
 
 function releaseMonitor(attempt) {

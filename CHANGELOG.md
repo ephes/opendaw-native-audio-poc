@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Retire crashed/message-corrupt Workers and monitors once, release pending UI controls, ignore stale messages and offer a fresh OPFS recovery scan.
+- Add opt-in `just smoke-opfs-recovery`: kill synthetic recording Workers at real PCM/sidecar/manifest publication barriers, verify trusted metadata prefix, preserved audio/writer release, and a corruption negative control. No new CI jobs.
+
+- Commit timeline/gap evidence only after PCM writes succeed and retain a bounded storage-write diagnostic; reject nonfinite persisted samples in current and recovered selected-channel WAV exports without modifying audio.
+
+- Abort failed chunk-sidecar and manifest writers; retain one pending closed chunk for checkpoint retries through Export Manifest (or a programmatic stop/interrupt) without duplicating PCM or claiming clean completion.
+
 - Protect unreadable or malformed recording catalogs from Start/Reset/Delete mutations; keep artifact recovery available. Start refuses a read-only or full catalog before creating any session or artifact; an active recording keeps capturing and stops cleanly when the catalog becomes read-only, recording skipped index updates as manifest `indexWarnings`. Document the manual save-and-move-aside procedure.
 - Report incomplete recovery inventories with their own `scan-incomplete` warning code instead of `index-warning`.
 - Validate index write size, session count and nesting against recovery read budgets before opening a writable.

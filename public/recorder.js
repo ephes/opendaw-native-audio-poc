@@ -32,6 +32,7 @@ export class PcmRecorder {
     this.root = null;
     this.session = null;
     this.currentChunk = null;
+    this.pendingChunkPublication = null;
     this.state = "idle";
     this.writeChain = Promise.resolve();
     this.lifecycleChain = Promise.resolve();
@@ -211,6 +212,17 @@ export class PcmRecorder {
   }
 
   async stopNow({ interruption = null, counters = null, nativeStats = null } = {}) {
+    // A checkpoint retry repairs evidence, never upgrades a storage failure to
+    // a clean stop (a block triggering rotation may never have been written).
+    if (this.state === "error" && this.pendingChunkPublication) {
+      try {
+        await this.closeCurrentChunk();
+      } catch (error) {
+        this.setError(`Failed to retry chunk checkpoint: ${error.message}`);
+      }
+      this.postStatus(true);
+      return;
+    }
     if (this.state !== "recording" && !(this.state === "stopping" && this.session?.admissionError)) {
       return;
     }
@@ -277,6 +289,7 @@ export class PcmRecorder {
     }
     this.session = null;
     this.currentChunk = null;
+    this.pendingChunkPublication = null;
     this.state = "idle";
     this.pendingWriteBlocks = 0;
     this.pendingWriteBytes = 0;
@@ -435,6 +448,7 @@ export class PcmRecorder {
       throw new Error("Stop recording before exporting the manifest");
     }
     await this.writeChain;
+    if (this.pendingChunkPublication) await this.closeCurrentChunk();
     await this.writeManifestToStorage();
     const manifest = this.buildManifest();
     const json = JSON.stringify(manifest, null, 2);
@@ -681,6 +695,7 @@ export class PcmRecorder {
     if (this.session?.sessionId === sessionId) {
       this.session = null;
       this.currentChunk = null;
+      this.pendingChunkPublication = null;
       this.state = "idle";
       this.postStatus(true);
     }
@@ -818,10 +833,21 @@ export class PcmRecorder {
       await this.openNextChunk();
     }
 
-    this.auditTimeline(block);
     const chunk = this.currentChunk;
     const chunkOffsetBytes = chunk.bytes;
-    await chunk.writable.write(block.dataBytes);
+    try {
+      await chunk.writable.write(block.dataBytes);
+    } catch (error) {
+      this.session.storageWriteError = {
+        frameStart: block.frameStart,
+        frameCount: block.frameCount,
+        message: String(error.message).slice(0, 500),
+      };
+      throw error;
+    }
+    // Timeline evidence describes successful PCM writes only. No asynchronous
+    // work may separate this commit from the matching chunk/frame counters.
+    this.auditTimeline(block);
 
     if (chunk.frames === 0) {
       chunk.firstFrameStart = block.frameStart;
@@ -902,6 +928,7 @@ export class PcmRecorder {
   }
 
   async closeCurrentChunk({ allowCloseFailure = false, skipPersist = false } = {}) {
+    if (!skipPersist) await this.publishPendingChunk();
     if (!this.currentChunk) {
       return;
     }
@@ -923,15 +950,31 @@ export class PcmRecorder {
       await removeEntry(this.root, chunk.fileName);
       this.session.chunks = this.session.chunks.filter((entry) => entry !== chunk);
     } else if (!skipPersist) {
-      // Commit immutable block evidence before publishing its checkpoint count.
+      this.pendingChunkPublication = chunk;
+      await this.publishPendingChunk();
+    }
+  }
+
+  async publishPendingChunk() {
+    const chunk = this.pendingChunkPublication;
+    if (!chunk) return;
+    // Only one closed chunk may await publication. Rotation retries it before
+    // opening another PCM file; successfully closed PCM is never reopened.
+    if (!this.committedChunkMetadata.has(chunk)) {
       const handle = await this.root.getFileHandle(`${chunk.fileName}.json`, { create: true });
       const writable = await handle.createWritable();
-      await writable.write(JSON.stringify(chunk));
-      await writable.close();
+      try {
+        await writable.write(JSON.stringify(chunk));
+        await writable.close();
+      } catch (error) {
+        try { await writable.abort(); } catch { /* Preserve the primary failure. */ }
+        throw error;
+      }
       this.committedChunkMetadata.add(chunk);
-      await this.writeManifestToStorage();
-      await this.updateIndexSessionBestEffort(this.session.state ?? this.state);
     }
+    await this.writeManifestToStorage();
+    await this.updateIndexSessionBestEffort(this.session.state ?? this.state);
+    this.pendingChunkPublication = null;
   }
 
   async writeManifestToStorage() {
@@ -940,8 +983,13 @@ export class PcmRecorder {
     }
     const handle = await this.root.getFileHandle(this.manifestFileName(), { create: true });
     const writable = await handle.createWritable();
-    await writable.write(JSON.stringify(this.buildManifest({ storage: true }), null, 2));
-    await writable.close();
+    try {
+      await writable.write(JSON.stringify(this.buildManifest({ storage: true }), null, 2));
+      await writable.close();
+    } catch (error) {
+      try { await writable.abort(); } catch { /* Preserve the primary failure. */ }
+      throw error;
+    }
   }
 
   // OPFS copies reference committed chunk sidecars; exports inline every chunk.

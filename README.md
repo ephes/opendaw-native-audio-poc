@@ -73,6 +73,7 @@ Development shorthand:
 just test
 just inspect-recording <manifest.json>
 just smoke-browser
+just smoke-opfs-recovery
 just smoke-l12
 just l12-recording-session
 just list
@@ -86,6 +87,23 @@ just serve-l12
 For known-bad or exploratory artifacts where native drops are expected, run `node scripts/inspect-recording-manifest.mjs <manifest.json>` directly and choose only the expectations that apply.
 
 `just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. It also records two synthetic stereo frames into real OPFS, reloads the page, checks recovered manifest/WAV samples and deletes that session. This OPFS round-trip runs only for the synthetic sine source; `just smoke-l12` stays a monitor-only device check. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling.
+
+`just smoke-opfs-recovery` opts into synthetic checkpoint crash tests in a fresh
+temporary Chrome profile, together with the one-second sine monitor and ordinary
+record/reload smoke. It terminates a recording Worker after PCM close, after
+sidecar close, and before manifest close, then starts a fresh recovery Worker.
+The oracle requires exactly the previously published block-metadata prefix,
+an abandoned session with no clean stop, unchanged retained artifact bytes,
+released exclusive writers and exact recovered WAV samples. A closed but
+unpublished PCM tail remains explicitly unverified (`unmanifested-chunk`); it
+must not gain trusted block evidence. A truncated trusted chunk is the negative
+control and must refuse export before the fixture restores it and explicitly
+deletes the test session. No device, production test hooks or additional Actions
+jobs are involved. The equivalent opt-in is
+`SMOKE_OPFS_CRASH_RECOVERY=1 just smoke-browser 1000`; this flag refuses the input
+source. Node's fixture test checks oracle control flow only and cannot certify
+real-browser writer release or durability. These barriers test Worker death,
+not whole-browser termination, power loss or physical disk durability.
 
 `just smoke-l12` is an opt-in real-device monitor smoke for the observed ZOOM LiveTrak L-12 path. It starts a temporary input-source server with device substring `ZOOM`, 14 channels, 48 kHz, and 960 frames per block, then runs the same headless browser monitor checks for 30 seconds. It requires the L-12 to be connected and available through CoreAudio. If the device is missing or the requested config cannot open, the command reports that the hardware smoke did not run and includes the Rust server output, such as device selection, config, or stream-open errors. Override the duration with `just smoke-l12 <milliseconds>`, or use the full form `just smoke-l12 <milliseconds> <port> <frames-per-block> <device-substring> <channels> <sample-rate>`. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling. The smoke expects all 14 meters to become active and native dropped callback buffers/frames/events to remain `0`; set `SMOKE_EXPECT_ACTIVE_METERS` only when deliberately running with known silent inputs, and set `SMOKE_EXPECT_NATIVE_DROPS_ZERO=0` only when deliberately investigating a known hardware drop condition.
 
@@ -185,7 +203,11 @@ are refused before conversion. Every Float32 sample must be finite; NaN and
 positive/negative infinity reject the entire block without replacing values.
 Finite samples, including signed zero and subnormals, retain their exact bytes.
 Invalid blocks are reported in recording integrity
-and do not reach OPFS, monitoring or meters. The next valid block is compared
+and do not reach OPFS, monitoring or meters. Timeline and gap/overlap evidence
+advance only after a successful PCM write, together with frame/block counters.
+A rejected write retains the previous timeline and records a separate bounded
+`storageWriteError` (frame span and up to 500 message characters); normal queued
+capture then enters `error`. The next valid block is compared
 with the last accepted end for gap/overlap detection. See [the binary contract](docs/protocol.md#pcm-blocks).
 
 The recorder stores chunk files in OPFS as interleaved Float32 little-endian PCM with no file header. Chunks are currently targeted at 64 MiB each and hold at most 65,536 blocks, so a chunk's block list stays small even with very short blocks. A small OPFS index file, `native-pcm-recordings-index.json`, tracks known PoC recording sessions and points at their manifest/chunk naming pattern. The manifest is written when recording starts, when chunks close, and when recording stops, and can be downloaded with Export Manifest.
@@ -206,6 +228,16 @@ fatal `chunk-metadata-read-error` warning and refuses WAV export; other
 sessions remain accessible. Historical manifests with inline chunk metadata
 remain readable. Reset and Delete Session remove both PCM files and their
 metadata sidecars.
+
+Failed sidecar and manifest writes abort their writable, preserving the original
+write/close error even if abort also fails. A single closed chunk stays pending
+until its sidecar and manifest checkpoint publish; rotation retries this owner
+before opening another PCM file. In the UI, Export Manifest in the error state
+retries publication (Stop is disabled once the recorder is in `error`; a
+programmatic `stopNow`/interrupt retry takes the same path), without reopening PCM
+or rewriting an already committed sidecar. The session remains `error` with no
+`stoppedAt`: retry repairs evidence but cannot prove capture completed. Reset or
+Delete discards the pending owner only after artifact cleanup succeeds.
 
 Recovery admits OPFS JSON before reading it into memory: the index is limited
 to 16 MiB and 10,000 sessions, a manifest to 256 MiB and 10,000 inline chunks,
@@ -242,7 +274,13 @@ The manifest includes:
 - native input stats snapshots under `nativeInputStats`, including start/latest/stop counters for dropped callback buffers, dropped frames, drop events, bridge queue capacity, source, and backend `atFrame`
 - detected gaps, overlaps, discontinuities, channel mismatches, invalid blocks, WebSocket lag events, monitor counter resets, byte-based write-backlog warnings, and underrun/overflow deltas during recording
 
-Export Selected WAV writes one mono 32-bit float WAV for the selected source channel. This is intended for DAW import and channel-mapping checks. WAV export reads OPFS chunks and deinterleaves the selected channel, but the resulting mono WAV is assembled as a browser `Blob`; exporting very long channels can still be memory-intensive. All-channel WAV export is intentionally left out of this slice.
+Export Selected WAV writes one mono 32-bit float WAV for the selected source channel. This is intended for DAW import and channel-mapping checks. WAV export reads OPFS chunks and deinterleaves the selected channel. Both current
+and recovered export refuse NaN or Infinity in that channel with a bounded
+chunk-frame/channel diagnostic, leaving the original chunks unchanged. Finite
+samples outside [-1, 1], signed zero and subnormals remain unchanged. The
+resulting mono WAV is assembled as a browser `Blob`; exporting very long channels
+can still be memory-intensive. All-channel WAV export is intentionally left out
+of this slice.
 
 The top status counters show cumulative native dropped cpal callback buffers, dropped frames, and drop events from the Rust backend. The recording status panel also shows native dropped callback buffers/frames/events during the active recording. These counters are separate from WebSocket PCM blocks, browser-side gaps/overlaps, WebSocket lag, and monitor underrun/overflow counters.
 
@@ -256,6 +294,14 @@ session. A reconnect's stream configuration waits for the old recording to flush
 stats and lag events cannot enter the old session's history.
 A storage/close failure still produces an error manifest and preserves previously
 closed chunks for recovery.
+
+A terminal Worker `error` or `messageerror` retires that Worker and its monitor
+once, clears pending Start/Scan and live export ownership, and shows interruption
+and recovery guidance. Delayed messages (including downloads) from that Worker
+are ignored. Use Scan Recovery to create a fresh Worker and inspect retained
+OPFS sessions; then reconnect. No Reset/Delete or clean-stop publication is
+attempted by this failure handler, and the open chunk may be lost. A Worker
+failure during a recovery scan also releases the Scan control for retry.
 
 The Disconnect button is disabled while recording is active or the recorder is in an error state. Stop the recording first so the Worker can flush queued OPFS writes, close the current chunk, and write the final manifest. If recording enters an error state, use Reset/Clear Recording before disconnecting so OPFS chunks from the current session are removed. Starting monitor playback during a recording resets the existing monitor underrun/overflow counters; the recorder records that reset and rebases the recording deltas. Underruns and overflows counted before the reset are kept in `counterEpochTotals`, so `underrunsDuringRecording`/`overflowsDuringRecording` and `counterDeltasAtStop` report the whole-session totals across every reset, not only the latest counter epoch. Each `counterResets` sample records the closed epoch's deltas and the running totals.
 
