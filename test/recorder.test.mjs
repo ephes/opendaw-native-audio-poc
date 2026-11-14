@@ -926,3 +926,90 @@ test("a session with only leftover metadata sidecars is listed and deletable", a
   await reloaded.deleteRecoveredSession(sessionId);
   assert.equal(root.files.has(sidecar), false);
 });
+
+// Model exclusive writers and staged publication, including abort failures.
+function faultingWriters(root, shouldFail) {
+  const getFileHandle = root.getFileHandle;
+  const locked = new Set();
+  const opens = new Map();
+  const aborts = [];
+  root.getFileHandle = async (name, options) => {
+    const handle = await getFileHandle(name, options);
+    const createWritable = handle.createWritable;
+    handle.createWritable = async () => {
+      assert.equal(locked.has(name), false, `writer still locked: ${name}`);
+      locked.add(name);
+      opens.set(name, (opens.get(name) ?? 0) + 1);
+      const writable = await createWritable();
+      return {
+        async write(data) {
+          if (shouldFail(name, "write")) throw new Error("primary write failure");
+          await writable.write(data);
+        },
+        async close() {
+          if (shouldFail(name, "close")) throw new Error("primary close failure");
+          await writable.close();
+          locked.delete(name);
+        },
+        async abort() {
+          locked.delete(name);
+          aborts.push(name);
+          throw new Error("secondary abort failure");
+        },
+      };
+    };
+    return handle;
+  };
+  return { locked, opens, aborts };
+}
+
+for (const stage of ["write", "close"]) {
+  test(`failed sidecar ${stage} aborts once, preserves cause and releases writer`, async () => {
+    const { recorder, root } = storedRecorder();
+    let fail = true;
+    const writers = faultingWriters(root, (name, operation) =>
+      fail && name.endsWith(".f32.json") && operation === stage);
+    await recorder.start(stream);
+    await record(recorder);
+    const chunk = recorder.currentChunk;
+    await assert.rejects(recorder.closeCurrentChunk(), new RegExp(`primary ${stage} failure`));
+    assert.deepEqual(writers.aborts, [`${chunk.fileName}.json`]);
+    assert.equal(writers.locked.size, 0);
+    fail = false;
+    const writable = await (await root.getFileHandle(`${chunk.fileName}.json`)).createWritable();
+    await writable.close();
+  });
+}
+
+for (const target of ["sidecar", "manifest"]) {
+  test(`Stop retries pending ${target} checkpoint without reopening PCM or claiming clean completion`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    let fail = false;
+    const writers = faultingWriters(root, (name, stage) => fail && stage === "close" &&
+      (target === "sidecar" ? name.endsWith(".f32.json") : name.endsWith("-manifest.json")));
+    await recorder.start(stream);
+    await record(recorder);
+    const chunk = recorder.currentChunk;
+    fail = true;
+    await recorder.stop();
+    assert.equal(recorder.state, "error");
+    assert.equal(recorder.currentChunk, null);
+    assert.equal(recorder.pendingChunkPublication, chunk);
+    const pcm = root.files.get(chunk.fileName).slice();
+    fail = false;
+    await recorder.stop();
+    assert.equal(recorder.pendingChunkPublication, null);
+    assert.equal(recorder.state, "error");
+    assert.equal(recorder.session.stoppedAt, null);
+    assert.deepEqual(root.files.get(chunk.fileName), pcm);
+    assert.equal(writers.opens.get(chunk.fileName), 1);
+    const stored = JSON.parse(new TextDecoder().decode(root.files.get(recorder.manifestFileName())));
+    assert.equal(stored.chunkMetadata.count, 1);
+    assert.deepEqual(stored.chunks, []);
+    const recovered = (await storedRecorder(root).recorder.scanRecoverySessions()).sessions[0];
+    assert.equal(recovered.recoveredFrames, 2);
+    assert.equal(recovered.exportableWav, true);
+    assert.deepEqual(recovered.originalManifest.chunks[0].blocks, chunk.blocks);
+  });
+}

@@ -207,6 +207,15 @@ sessions remain accessible. Historical manifests with inline chunk metadata
 remain readable. Reset and Delete Session remove both PCM files and their
 metadata sidecars.
 
+Failed sidecar and manifest writes abort their writable, preserving the original
+write/close error even if abort also fails. A single closed chunk stays pending
+until its sidecar and manifest checkpoint publish; rotation retries this owner
+before opening another PCM file. Retrying Stop after a checkpoint failure, or
+Export Manifest in the error state, retries publication without reopening PCM or
+rewriting an already committed sidecar. The session remains `error` with no
+`stoppedAt`: retry repairs evidence but cannot prove capture completed. Reset or
+Delete discards the pending owner only after artifact cleanup succeeds.
+
 Recovery admits OPFS JSON before reading it into memory: the index is limited
 to 16 MiB and 10,000 sessions, a manifest to 256 MiB and 10,000 inline chunks,
 each `.f32.json` sidecar to 64 MiB, and every document to 16 nesting levels.
