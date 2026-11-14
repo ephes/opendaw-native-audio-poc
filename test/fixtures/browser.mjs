@@ -32,14 +32,18 @@ export async function appFixture(t) {
     querySelector() { return new Element(); }
     click() { return this.handlers.get("click")?.(); }
   }
-  const elements = new Map(), contexts = [], nodes = [];
+  const elements = new Map(), contexts = [], nodes = [], workers = [];
   let worker;
   class FixtureWorker {
     messages = [];
-    constructor() { worker = this; }
-    addEventListener(type, handler) { this.receive = handler; }
+    handlers = new Map();
+    terminations = 0;
+    constructor() { worker = this; workers.push(this); }
+    addEventListener(type, handler) { this.handlers.set(type, handler); }
+    terminate() { this.terminations++; }
+    fail(type) { this.handlers.get(type)?.({ preventDefault() {} }); }
     postMessage(message) { this.messages.push(message); }
-    emit(message) { this.receive({ data: message }); }
+    emit(message) { this.handlers.get("message")?.({ data: message }); }
   }
   class Context {
     load = deferred();
@@ -83,7 +87,7 @@ export async function appFixture(t) {
       stream: { sampleRate: 48000, channels: 2, framesPerBlock: 1 } });
     return sharedBuffer;
   };
-  return { elements, contexts, nodes, worker, stream,
+  return { elements, contexts, nodes, workers, get worker() { return worker; }, stream,
     click: (selector) => elements.get(selector).click() };
 }
 

@@ -73,6 +73,7 @@ Development shorthand:
 just test
 just inspect-recording <manifest.json>
 just smoke-browser
+just smoke-opfs-recovery
 just smoke-l12
 just l12-recording-session
 just list
@@ -86,6 +87,23 @@ just serve-l12
 For known-bad or exploratory artifacts where native drops are expected, run `node scripts/inspect-recording-manifest.mjs <manifest.json>` directly and choose only the expectations that apply.
 
 `just smoke-browser` starts a temporary 12-channel sine server, opens Chrome headless, connects the browser page, starts monitor playback, and verifies the AudioWorklet path for 30 seconds; override the duration with `just smoke-browser <milliseconds>`, or set `CHROME_PATH` if Chrome is not installed in the default macOS location. It also records two synthetic stereo frames into real OPFS, reloads the page, checks recovered manifest/WAV samples and deletes that session. This OPFS round-trip runs only for the synthetic sine source; `just smoke-l12` stays a monitor-only device check. The smoke uses free local ports by default; set `SMOKE_PORT` or `SMOKE_CHROME_DEBUG_PORT` when a fixed port is needed. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling.
+
+`just smoke-opfs-recovery` opts into synthetic checkpoint crash tests in a fresh
+temporary Chrome profile, together with the one-second sine monitor and ordinary
+record/reload smoke. It terminates a recording Worker after PCM close, after
+sidecar close, and before manifest close, then starts a fresh recovery Worker.
+The oracle requires exactly the previously published block-metadata prefix,
+an abandoned session with no clean stop, unchanged retained artifact bytes,
+released exclusive writers and exact recovered WAV samples. A closed but
+unpublished PCM tail remains explicitly unverified (`unmanifested-chunk`); it
+must not gain trusted block evidence. A truncated trusted chunk is the negative
+control and must refuse export before the fixture restores it and explicitly
+deletes the test session. No device, production test hooks or additional Actions
+jobs are involved. The equivalent opt-in is
+`SMOKE_OPFS_CRASH_RECOVERY=1 just smoke-browser 1000`; this flag refuses the input
+source. Node's fixture test checks oracle control flow only and cannot certify
+real-browser writer release or durability. These barriers test Worker death,
+not whole-browser termination, power loss or physical disk durability.
 
 `just smoke-l12` is an opt-in real-device monitor smoke for the observed ZOOM LiveTrak L-12 path. It starts a temporary input-source server with device substring `ZOOM`, 14 channels, 48 kHz, and 960 frames per block, then runs the same headless browser monitor checks for 30 seconds. It requires the L-12 to be connected and available through CoreAudio. If the device is missing or the requested config cannot open, the command reports that the hardware smoke did not run and includes the Rust server output, such as device selection, config, or stream-open errors. Override the duration with `just smoke-l12 <milliseconds>`, or use the full form `just smoke-l12 <milliseconds> <port> <frames-per-block> <device-substring> <channels> <sample-rate>`. First runs compile the Rust server inside the smoke's startup window; run `cargo build` first or increase `SMOKE_SERVER_TIMEOUT_MS` if startup times out while cargo is still compiling. The smoke expects all 14 meters to become active and native dropped callback buffers/frames/events to remain `0`; set `SMOKE_EXPECT_ACTIVE_METERS` only when deliberately running with known silent inputs, and set `SMOKE_EXPECT_NATIVE_DROPS_ZERO=0` only when deliberately investigating a known hardware drop condition.
 
@@ -275,6 +293,14 @@ session. A reconnect's stream configuration waits for the old recording to flush
 stats and lag events cannot enter the old session's history.
 A storage/close failure still produces an error manifest and preserves previously
 closed chunks for recovery.
+
+A terminal Worker `error` or `messageerror` retires that Worker and its monitor
+once, clears pending Start/Scan and live export ownership, and shows interruption
+and recovery guidance. Delayed messages (including downloads) from that Worker
+are ignored. Use Scan Recovery to create a fresh Worker and inspect retained
+OPFS sessions; then reconnect. No Reset/Delete or clean-stop publication is
+attempted by this failure handler, and the open chunk may be lost. A Worker
+failure during a recovery scan also releases the Scan control for retry.
 
 The Disconnect button is disabled while recording is active or the recorder is in an error state. Stop the recording first so the Worker can flush queued OPFS writes, close the current chunk, and write the final manifest. If recording enters an error state, use Reset/Clear Recording before disconnecting so OPFS chunks from the current session are removed. Starting monitor playback during a recording resets the existing monitor underrun/overflow counters; the recorder records that reset and rebases the recording deltas. Underruns and overflows counted before the reset are kept in `counterEpochTotals`, so `underrunsDuringRecording`/`overflowsDuringRecording` and `counterDeltasAtStop` report the whole-session totals across every reset, not only the latest counter epoch. Each `counterResets` sample records the closed epoch's deltas and the running totals.
 

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Retire crashed/message-corrupt Workers and monitors once, release pending UI controls, ignore stale messages and offer a fresh OPFS recovery scan.
+- Add opt-in `just smoke-opfs-recovery`: kill synthetic recording Workers at real PCM/sidecar/manifest publication barriers, verify trusted metadata prefix, preserved audio/writer release, and a corruption negative control. No new CI jobs.
+
 - Commit timeline/gap evidence only after PCM writes succeed and retain a bounded storage-write diagnostic; reject nonfinite persisted samples in current and recovered selected-channel WAV exports without modifying audio.
 
 - Abort failed chunk-sidecar and manifest writers; retain one pending closed chunk for checkpoint retries through Stop or Export Manifest without duplicating PCM or claiming clean completion.

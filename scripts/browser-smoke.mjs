@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { runCheckpointCrashOracle } from "./opfs-crash-oracle.mjs";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -61,6 +62,8 @@ async function main() {
 
 function readConfig() {
   const source = readEnum("SMOKE_SOURCE", "sine", ["sine", "input"]);
+  const crashRecovery = readBool("SMOKE_OPFS_CRASH_RECOVERY", false);
+  if (crashRecovery && source !== "sine") throw new Error("OPFS crash recovery requires the synthetic sine source");
   const channels = readPositiveInt("SMOKE_CHANNELS", 12);
   const sampleRate = readPositiveInt("SMOKE_SAMPLE_RATE", 48_000);
   const framesPerBlock = readPositiveInt("SMOKE_FRAMES_PER_BLOCK", 960);
@@ -73,6 +76,7 @@ function readConfig() {
 
   return {
     source,
+    crashRecovery,
     device,
     channels,
     sampleRate,
@@ -303,6 +307,10 @@ async function runBrowserSmoke(config, port, debugPort, chromeOutput) {
   // stays a monitor-only hardware check.
   const recovery = config.source === "sine" ? await runRecoverySmoke(cdp) : { skipped: "device smoke" };
 
+  const checkpointCrashes = config.crashRecovery
+    ? await evalExpr(cdp, `(${runCheckpointCrashOracle.toString()})(new URL("/recorder.js", location.href).href)`, true, 60_000)
+    : { skipped: "opt in with SMOKE_OPFS_CRASH_RECOVERY=1" };
+
   const pageEvents = cdp.events
     .filter((event) => ["Runtime.exceptionThrown", "Log.entryAdded"].includes(event.method))
     .map((event) => event.params);
@@ -316,7 +324,7 @@ async function runBrowserSmoke(config, port, debugPort, chromeOutput) {
   });
 
   socket.close();
-  return { config, isolation, beforeMonitor, afterMonitor, recovery, pageEvents, failures };
+  return { config, isolation, beforeMonitor, afterMonitor, recovery, checkpointCrashes, pageEvents, failures };
 }
 
 async function runRecoverySmoke(cdp) {
@@ -442,7 +450,7 @@ class CdpClient {
     this.events.push(message);
   }
 
-  send(method, params = {}) {
+  send(method, params = {}, timeoutMs = 10_000) {
     const id = this.nextId;
     this.nextId += 1;
     this.socket.send(JSON.stringify({ id, method, params }));
@@ -452,19 +460,19 @@ class CdpClient {
           this.pending.delete(id);
           reject(new Error(`CDP timeout for ${method}`));
         }
-      }, 10_000);
+      }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
     });
   }
 }
 
-async function evalExpr(cdp, expression, awaitPromise = true) {
+async function evalExpr(cdp, expression, awaitPromise = true, timeoutMs = 10_000) {
   const result = await cdp.send("Runtime.evaluate", {
     awaitPromise,
     expression,
     returnByValue: true,
     userGesture: true,
-  });
+  }, timeoutMs);
   if (result.exceptionDetails) {
     throw new Error(`Evaluation failed: ${result.exceptionDetails.text}`);
   }

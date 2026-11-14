@@ -14,6 +14,7 @@ export function memoryStorage() {
           const parts = [];
           return {
             async write(data) { parts.push(data); },
+            async abort() {},
             async close() {
               if (root.beforeClose) await root.beforeClose(name);
               files.set(name, new Uint8Array(await new Blob(parts).arrayBuffer()));
