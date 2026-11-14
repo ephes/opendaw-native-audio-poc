@@ -695,6 +695,7 @@ export class PcmRecorder {
     if (this.session?.sessionId === sessionId) {
       this.session = null;
       this.currentChunk = null;
+      this.pendingChunkPublication = null;
       this.state = "idle";
       this.postStatus(true);
     }

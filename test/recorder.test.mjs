@@ -1095,3 +1095,32 @@ test("queued PCM write failure persists last successful timeline and storage cau
   assert.deepEqual(manifest.integrity.gaps, []);
   assert.match(manifest.storageWriteError.message, /primary write failure/);
 });
+
+for (const action of ["clear", "delete"]) {
+  test(`${action} retains pending checkpoint on cleanup failure and retires it after retry`, async (t) => {
+    const { recorder, root } = storedRecorder();
+    navigatorProperty(t, "storage", { getDirectory: async () => root });
+    let fail = true;
+    faultingWriters(root, (name, stage) => fail && name.endsWith(".f32.json") && stage === "close");
+    await recorder.start(stream);
+    await record(recorder);
+    await recorder.stop();
+    const chunk = recorder.pendingChunkPublication;
+    assert.ok(chunk);
+    const cleanup = () => action === "clear" ? recorder.clear() : recorder.deleteRecoveredSession(recorder.session.sessionId);
+    fail = false;
+    const remove = root.removeEntry;
+    root.removeEntry = async (name) => {
+      if (name === chunk.fileName) throw new Error("synthetic retained PCM");
+      return remove(name);
+    };
+    await assert.rejects(cleanup());
+    assert.equal(recorder.pendingChunkPublication, chunk);
+    assert.ok(root.files.has(chunk.fileName));
+    root.removeEntry = remove;
+    await cleanup();
+    assert.equal(recorder.pendingChunkPublication, null);
+    assert.equal(recorder.session, null);
+    assert.deepEqual([...root.files.keys()], ["native-pcm-recordings-index.json"]);
+  });
+}
