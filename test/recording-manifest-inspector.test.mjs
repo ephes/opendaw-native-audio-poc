@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { inspectManifest, parseCliArgs } from "../scripts/inspect-recording-manifest.mjs";
+import { inspectManifest, parseCliArgs, formatInspectionReport } from "../scripts/inspect-recording-manifest.mjs";
 
 test("inspectManifest accepts a valid stopped manifest", () => {
   const result = inspectManifest(createStoppedManifest(), l12Options());
@@ -484,4 +484,83 @@ test("inspectManifest rejects an uncommitted chunk after close failure", () => {
   const result = inspectManifest(manifest, l12Options());
   assert.equal(result.ok, false);
   assert.match(result.errors.join("\n"), /chunks\[0\].*failed to close.*uncommitted/);
+});
+
+for (const recovered of [false, true]) {
+  test(`inspector refuses unsupported ${recovered ? "recovered" : "ordinary"} schemas before interpretation`, () => {
+    const current = recovered ? createRecoveredManifest() : createStoppedManifest();
+    for (const version of [999, 1.5, "1", null]) {
+      const manifest = { ...current, version };
+      const result = inspectManifest(manifest);
+      assert.equal(result.ok, false);
+      assert.match(result.errors.join("\n"), /Unsupported manifest schema/);
+      assert.equal(result.summary.frames, 0);
+    }
+    const result = inspectManifest(current);
+    assert.doesNotMatch(result.errors.join("\n"), /Unsupported manifest schema/);
+  });
+}
+
+test("chunk identities are unique and belong to the declared session", () => {
+  const valid = createTwoChunkManifestWithGap();
+  // Make the second chunk continuous so identity is the only refusal reason.
+  const chunk = valid.chunks[1];
+  chunk.firstFrameStart = 960; chunk.lastFrameStart = 960; chunk.lastFrameEnd = 1920;
+  chunk.blocks[0].frameStart = 960;
+  valid.expectedNextFrame = 1920;
+  assert.equal(inspectManifest(valid).ok, true);
+  for (const change of [
+    { fileName: valid.chunks[0].fileName },
+    { index: 0 },
+    { fileName: "native-pcm-foreign-chunk-00001.f32" },
+    { fileName: "native-pcm-test-chunk-1.f32" },
+    { index: 1.5 },
+  ]) {
+    const manifest = structuredClone(valid);
+    Object.assign(manifest.chunks[1], change);
+    const result = inspectManifest(manifest);
+    assert.equal(result.ok, false, JSON.stringify(change));
+    assert.match(result.errors.join("\n"), /chunk.*identity|duplicate.*chunk/i);
+  }
+});
+
+
+test("dense malformed blocks retain bounded diagnostics and a failed verdict", () => {
+  const manifest = createStoppedManifest();
+  manifest.chunks[0].blocks = Array.from({ length: 1000 }, () => ({}));
+  const result = inspectManifest(manifest);
+  assert.equal(result.ok, false);
+  assert.equal(result.errors.length, 100);
+  assert.ok(result.omittedErrors >= 3900);
+  const report = formatInspectionReport(result);
+  assert.ok(report.length < 110000);
+  assert.match(report, /omitted/);
+  assert.match(report, /FAIL/);
+});
+
+test("warning retention and scalar diagnostic projections are bounded", () => {
+  const manifest = createRecoveredManifest();
+  manifest.recoveryWarnings = Array.from({ length: 1000 }, () => ({ message: "x".repeat(10000) }));
+  manifest.sampleFormat = "x".repeat(10000);
+  const result = inspectManifest(manifest);
+  assert.equal(result.ok, false);
+  assert.equal(result.warnings.length, 100);
+  assert.ok(result.omittedWarnings >= 900);
+  assert.ok(result.warnings.every(message => message.length <= 500));
+  assert.ok(result.errors.every(message => message.length <= 500));
+  assert.ok(formatInspectionReport(result).length < 110000);
+});
+
+test("aggregate work is refused before inspecting individual block fields", () => {
+  const manifest = createStoppedManifest();
+  const blocks = new Array(1000000);
+  Object.defineProperty(blocks, 0, { get() { throw new Error("block accessed before admission"); } });
+  manifest.chunks[0].blocks = blocks;
+  let result;
+  assert.doesNotThrow(() => { result = inspectManifest(manifest); });
+  assert.equal(result.ok, false);
+  assert.match(result.errors.join("\n"), /inspection work budget/);
+  assert.equal(result.summary.frames, 0);
+  manifest.chunks = new Array(10001);
+  assert.match(inspectManifest(manifest).errors.join("\n"), /chunk budget/);
 });

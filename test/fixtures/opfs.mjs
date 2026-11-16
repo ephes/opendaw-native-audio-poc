@@ -38,6 +38,7 @@ export function barrier() {
 }
 
 export const stream = {
+  source: "sine",
   sampleRate: 48000, channels: 2, framesPerBlock: 2, sampleFormat: "f32-interleaved",
 };
 

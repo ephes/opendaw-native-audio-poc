@@ -3,11 +3,30 @@ const FLOAT32_BYTES = 4;
 const WAVE_FORMAT_IEEE_FLOAT = 3;
 
 export function createMonoFloat32WavBlob({ sampleRate, totalFrames, channelParts }) {
+  if (!Number.isSafeInteger(totalFrames) || totalFrames < 0 ||
+      !Number.isSafeInteger(sampleRate) || sampleRate < 1 || sampleRate * FLOAT32_BYTES > 0xffff_ffff) {
+    throw new Error("Invalid WAV frame count or sample rate");
+  }
   const dataBytes = totalFrames * FLOAT32_BYTES;
   const riffBytes = RIFF_HEADER_BYTES - 8 + dataBytes;
   if (riffBytes > 0xffff_ffff) {
     throw new Error("Selected-channel WAV is larger than the 4 GiB RIFF limit");
   }
+
+  if (!Array.isArray(channelParts)) throw new Error("WAV parts must be an array of binary parts");
+  let payloadBytes = 0;
+  for (const part of channelParts) {
+    const bytes = part instanceof Blob ? part.size :
+      part instanceof ArrayBuffer || ArrayBuffer.isView(part) ? part.byteLength : NaN;
+    if (!Number.isSafeInteger(bytes) || bytes % FLOAT32_BYTES !== 0) {
+      throw new Error("Invalid WAV binary part");
+    }
+    payloadBytes += bytes;
+    if (!Number.isSafeInteger(payloadBytes) || payloadBytes > dataBytes) {
+      throw new Error("WAV payload does not match declared frames");
+    }
+  }
+  if (payloadBytes !== dataBytes) throw new Error("WAV payload does not match declared frames");
 
   const header = new ArrayBuffer(RIFF_HEADER_BYTES);
   const view = new DataView(header);

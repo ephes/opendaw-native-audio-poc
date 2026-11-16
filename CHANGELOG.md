@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Fence already-posted recovery results at page delivery and retain export/download errors after terminal pending-state updates.
+
+- Report export failures as `export-error` so a retained export error yields to later recorder state changes and errors, and drop native stats that arrive before stream configuration without a false integrity error.
+
+- Require unique session-owned inspector chunk identities and bound aggregate inspection work and retained diagnostics, reporting omitted counts without losing failed verdicts.
+
+- Refuse unsupported inspector manifest versions and retain OPFS manifests with incompatible schema/session identity as fatal read-only recovery entries.
+
+- Retain observed native loss on counter regression; advertise the acquisition source in stream-started and refuse mismatched source/regressing cursor stats before evidence mutation.
+
+- Admit one pending export across controls/Worker and validate WAV scalar geometry and exact binary payload size before Blob construction.
+
+- Fence recovery scans/deletions by ordered generations and clean up download URLs/anchors even when activation fails.
+
 - Limit native WebSocket fanout to eight admitted/pending clients; reject excess trusted handshakes with HTTP 503 before subscribing to PCM, and release permits after failed upgrades or complete connection teardown, including cancellation.
 
 - Admit current and recovered selected-channel WAV exports within a 256 MiB working-memory envelope before reading PCM; include mono retention, Blob-copy headroom and the largest multichannel source chunk, and preserve raw OPFS audio on refusal.

@@ -22,6 +22,9 @@ let lastMeterPost = 0;
 let nativeInputStats = null;
 let recordingStartsPending = 0;
 let pcmRefused = false;
+let exportPending = false;
+let recoveryGeneration = 0;
+let recoveryQueue = Promise.resolve();
 let recorder = new PcmRecorder({
   readCounters,
   postMessage: (message) => postMessage(message),
@@ -53,7 +56,7 @@ self.addEventListener("message", (event) => {
   } else if (message.type === "export-selected-wav") {
     runExport(() => recorder.exportSelectedChannelWav(message.channelIndex));
   } else if (message.type === "recovery-scan") {
-    runRecoveryScan();
+    runRecoveryScan(message.requestId);
   } else if (message.type === "export-recovered-manifest") {
     runExport(() => recorder.exportRecoveredManifest(message.sessionId));
   } else if (message.type === "export-recovered-wav") {
@@ -61,7 +64,7 @@ self.addEventListener("message", (event) => {
       recorder.exportRecoveredSelectedChannelWav(message.sessionId, message.channelIndex),
     );
   } else if (message.type === "delete-recovered-session") {
-    runDeleteRecoveredSession(message.sessionId);
+    runDeleteRecoveredSession(message.sessionId, message.requestId);
   }
 });
 
@@ -133,8 +136,18 @@ function handleSocketMessage(event) {
         postMessage({ type: "error", code: "invalid-control", message: "Stream configuration refused" });
       }
     } else if (message.type === "native-input-stats") {
+      // Stats can precede a stream-started deferred behind a pending Start.
+      // Drop them without evidence; the next periodic report is admitted.
+      if (!streamInfo) return;
+      if (message.source !== streamInfo.source ||
+          (nativeInputStats && message.atFrame < nativeInputStats.atFrame)) {
+        recorder.noteInvalidBlock("Native stats source or frame cursor disagrees with stream generation");
+        postMessage({ type: "error", code: "invalid-native-stats",
+          message: "Native stats source or frame cursor disagrees with stream generation" });
+        return;
+      }
       nativeInputStats = message;
-      if (streamInfo) recorder.setNativeInputStats(message);
+      recorder.setNativeInputStats(message);
       postMessage({ type: "native-input-stats", stats: nativeInputStats });
     } else if (message.type === "stream-error") {
       if (message.code === "device-lost") {
@@ -151,7 +164,7 @@ function validateControl(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error();
   const integer = (value, max, min = 0) => Number.isSafeInteger(value) && value >= min && value <= max;
   if (message.type === "stream-started") {
-    if (!integer(message.channels, 64, 1) || !integer(message.sampleRate, 384000, 1) ||
+    if (!["sine", "input"].includes(message.source) || !integer(message.channels, 64, 1) || !integer(message.sampleRate, 384000, 1) ||
         !integer(message.framesPerBlock, 65536, 1) || message.sampleFormat !== "f32-interleaved" ||
         ringCapacity(message) * message.channels * RING_BUFFER_BYTES_PER_SAMPLE + STATE_BYTES > MAX_RING_BYTES) {
       throw new Error();
@@ -178,7 +191,7 @@ function ringCapacity(info) {
 
 function configureStream(info) {
   const recordingBusy = recordingStartsPending || recorder.state === "recording" || recorder.state === "stopping";
-  if (streamInfo && ["sampleRate", "channels", "framesPerBlock", "sampleFormat"]
+  if (streamInfo && ["source", "sampleRate", "channels", "framesPerBlock", "sampleFormat"]
     .every((key) => streamInfo[key] === info[key])) {
     if (!recordingBusy) pcmRefused = false;
     return;
@@ -199,6 +212,8 @@ function configureStream(info) {
   const state = new Int32Array(buffer, 0, STATE_INTS);
   pcmRefused = false;
   streamInfo = info;
+  nativeInputStats = null;
+  recorder.setNativeInputStats(null);
   sharedBuffer = buffer;
   stateView = state;
   Atomics.store(stateView, STATE.WRITE_FRAME, 0);
@@ -212,7 +227,6 @@ function configureStream(info) {
   Atomics.store(stateView, STATE.FRAMES_PER_BLOCK, info.framesPerBlock);
   Atomics.store(stateView, STATE.RECEIVED_BLOCKS, 0);
   sampleView = createRingBufferViews(sharedBuffer, stateView).sampleView;
-  if (nativeInputStats) recorder.setNativeInputStats(nativeInputStats);
   postMessage({ type: "shared-buffer", sharedBuffer, stream: info });
 }
 
@@ -285,43 +299,49 @@ function runRecorderAction(action) {
 }
 
 function runExport(action) {
-  action()
+  if (exportPending) return;
+  exportPending = true;
+  postMessage({ type: "export-status", pending: true });
+  Promise.resolve().then(action)
     .then((result) => {
       postMessage({ type: "download", filename: result.filename, blob: result.blob });
     })
     .catch((error) => {
-      postMessage({ type: "recording-error", message: error.message });
+      postMessage({ type: "export-error", message: error.message });
       postMessage({ type: "recording-status", status: recorder.status() });
+    }).finally(() => {
+      exportPending = false;
+      postMessage({ type: "export-status", pending: false });
     });
 }
 
-function runRecoveryScan() {
-  recorder
-    .scanRecoverySessions()
-    .then((result) => {
-      postMessage({ type: "recovery-sessions", result });
-    })
-    .catch((error) => {
-      postMessage({
-        type: "recovery-sessions",
-        result: {
-          available: false,
-          error: error.message,
-          scannedAt: new Date().toISOString(),
-          sessions: [],
-        },
-      });
-    });
+function runRecoveryScan(requestId) {
+  runRecoveryAction(() => recorder.scanRecoverySessions(), false, requestId);
 }
 
-function runDeleteRecoveredSession(sessionId) {
-  recorder
-    .deleteRecoveredSession(sessionId)
-    .then((result) => {
-      postMessage({ type: "recovery-sessions", result });
-    })
-    .catch((error) => {
+function runDeleteRecoveredSession(sessionId, requestId) {
+  runRecoveryAction(() => recorder.deleteRecoveredSession(sessionId), true, requestId);
+}
+
+function runRecoveryAction(action, mutation, requestId) {
+  const generation = ++recoveryGeneration;
+  // A scan requested during deletion must read after that mutation completes.
+  recoveryQueue = recoveryQueue.then(action).catch(async (error) => {
+    if (mutation) {
       postMessage({ type: "recording-error", message: error.message });
-      runRecoveryScan();
-    });
+      return recorder.scanRecoverySessions();
+    }
+    return { available: false, error: error.message,
+      scannedAt: new Date().toISOString(), sessions: [] };
+  }).then((result) => {
+    if (generation === recoveryGeneration) {
+      postMessage({ type: "recovery-sessions", generation, requestId, result });
+    }
+  }).catch((error) => {
+    if (generation === recoveryGeneration) {
+      postMessage({ type: "recovery-sessions", generation, requestId, result: {
+        available: false, error: error.message, sessions: [],
+      } });
+    }
+  });
 }

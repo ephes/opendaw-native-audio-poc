@@ -90,3 +90,22 @@ test("createMonoFloat32WavBlob rejects files beyond the RIFF size limit", () => 
 function readAscii(view, offset, length) {
   return String.fromCharCode(...new Uint8Array(view.buffer, view.byteOffset + offset, length));
 }
+
+test("WAV geometry and payload are admitted together", async () => {
+  const valid = { sampleRate: 48000, totalFrames: 1, channelParts: [new Float32Array([0.5])] };
+  for (const totalFrames of [-1, 0.5, NaN, Infinity, "1", Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => createMonoFloat32WavBlob({ ...valid, totalFrames }));
+  }
+  for (const sampleRate of [0, -1, 0.5, NaN, Infinity, "48000", 2 ** 30]) {
+    assert.throws(() => createMonoFloat32WavBlob({ ...valid, sampleRate }));
+  }
+  for (const channelParts of [[], [new Float32Array(2)], ["abcd"], [new Uint8Array(3)], null]) {
+    assert.throws(() => createMonoFloat32WavBlob({ ...valid, channelParts }));
+  }
+  for (const totalFrames of [0, 1]) {
+    const blob = createMonoFloat32WavBlob({ ...valid, totalFrames, channelParts: [new Float32Array(totalFrames)] });
+    const view = new DataView(await blob.arrayBuffer());
+    assert.equal(view.getUint32(4, true), blob.size - 8);
+    assert.equal(view.getUint32(40, true), blob.size - 44);
+  }
+});

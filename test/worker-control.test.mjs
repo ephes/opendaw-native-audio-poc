@@ -94,7 +94,7 @@ test("producer and worker share geometry limits including rounded ring byte ceil
   const f = await workerFixture(t);
   for (const { accepted, ...geometry } of geometryCases) {
     const start = f.messages.length;
-    f.socket.emit("message", JSON.stringify({ type: "stream-started", ...geometry, sampleFormat: "f32-interleaved" }));
+    f.socket.emit("message", JSON.stringify({ type: "stream-started", ...geometry, source: "sine", sampleFormat: "f32-interleaved" }));
     const result = f.messages.slice(start);
     assert.equal(result.length, 1);
     assert.equal(result[0].type, accepted ? "shared-buffer" : "error", JSON.stringify(geometry));
@@ -107,4 +107,34 @@ test("producer and worker share geometry limits including rounded ring byte ceil
       assert.equal(new Int32Array(result[0].sharedBuffer)[STATE.RECEIVED_BLOCKS], 1);
     }
   }
+});
+
+test("native stats bind source and monotonic cursor to the configured generation", async (t) => {
+  const root = memoryStorage();
+  const f = await workerFixture(t, { navigator: {
+    storage: { getDirectory: async () => root, persist: async () => true }, locks: memoryLocks(),
+  } });
+  const stats = (source, atFrame) => ({ type: "native-input-stats", source, atFrame,
+    nativeDroppedBlocks: 0, nativeDroppedFrames: 0, nativeDropEvents: 0, bridgeQueueCapacityBlocks: 64 });
+  const beforeConfiguration = f.messages.length;
+  f.socket.emit("message", JSON.stringify(stats("input", 1)));
+  assert.equal(f.messages.length, beforeConfiguration, "pre-configuration stats are dropped silently");
+  f.socket.emit("message", JSON.stringify({ ...started, source: "input" }));
+  f.socket.emit("message", JSON.stringify(stats("input", 10)));
+  f.send("recording-start"); await settle();
+  for (const bad of [stats("sine", 11), stats("input", 9)]) {
+    const count = f.messages.filter(m => m.type === "native-input-stats").length;
+    f.socket.emit("message", JSON.stringify(bad));
+    assert.equal(f.messages.at(-1).code, "invalid-native-stats");
+    assert.equal(f.messages.filter(m => m.type === "native-input-stats").length, count);
+  }
+  f.send("recording-stop"); await settle(); await settle();
+  f.send("export-manifest"); await settle();
+  const manifest = JSON.parse(await f.messages.filter(m => m.type === "download").at(-1).blob.text());
+  assert.equal(manifest.nativeInputStats.stop.atFrame, 10);
+  assert.equal(manifest.nativeInputStats.stop.source, "input");
+  assert.equal(manifest.integrity.invalidBlocks.length, 2);
+  f.socket.emit("message", JSON.stringify({ ...started, source: "sine" }));
+  f.socket.emit("message", JSON.stringify(stats("sine", 0)));
+  assert.equal(f.messages.at(-1).type, "native-input-stats");
 });

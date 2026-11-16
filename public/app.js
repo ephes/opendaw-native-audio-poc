@@ -56,6 +56,9 @@ let recordingStartPending = false;
 let socketStateValue = "closed";
 let recoveryResult = null;
 let recoveryScanPending = false;
+let exportPending = false;
+let exportError = "";
+let recoveryRequestId = 0;
 let nativeInputStats = defaultNativeInputStats();
 
 els.connect.addEventListener("click", () => {
@@ -84,10 +87,10 @@ els.recordReset.addEventListener("click", () => {
   worker?.postMessage({ type: "recording-reset" });
 });
 els.exportManifest.addEventListener("click", () => {
-  worker?.postMessage({ type: "export-manifest" });
+  requestExport({ type: "export-manifest" });
 });
 els.exportWav.addEventListener("click", () => {
-  worker?.postMessage({
+  requestExport({
     type: "export-selected-wav",
     channelIndex: Number(els.wavChannel.value),
   });
@@ -99,7 +102,7 @@ els.recoveryExportManifest.addEventListener("click", () => {
   if (!session) {
     return;
   }
-  worker?.postMessage({
+  requestExport({
     type: "export-recovered-manifest",
     sessionId: session.sessionId,
   });
@@ -109,7 +112,7 @@ els.recoveryExportWav.addEventListener("click", () => {
   if (!session) {
     return;
   }
-  worker?.postMessage({
+  requestExport({
     type: "export-recovered-wav",
     sessionId: session.sessionId,
     channelIndex: Number(els.recoveryWavChannel.value),
@@ -124,8 +127,11 @@ els.recoveryDelete.addEventListener("click", () => {
     `Delete OPFS files for ${session.sessionId}? This removes its manifest, chunks, and index entry.`,
   );
   if (confirmed) {
+    recoveryScanPending = true;
+    renderRecovery();
     worker?.postMessage({
       type: "delete-recovered-session",
+      requestId: ++recoveryRequestId,
       sessionId: session.sessionId,
     });
   }
@@ -194,6 +200,8 @@ function ensureWorker() {
       streamInfo = null;
       recordingStartPending = false;
       recoveryScanPending = false;
+      exportPending = false;
+      exportError = "";
       nativeInputStats = defaultNativeInputStats();
       const guidance = "Audio worker failed; capture may be interrupted. Use Scan Recovery to inspect retained OPFS audio, then reconnect. The open chunk may be lost.";
       // The replacement recorder owns no live session. Exports must use the
@@ -321,14 +329,34 @@ function handleWorkerMessage(event) {
   } else if (message.type === "error") {
     els.streamSummary.textContent = message.message;
   } else if (message.type === "recording-status") {
+    const previous = recordingStatus;
     recordingStatus = message.status;
     recordingStartPending = false;
+    // An export error must not mask later acquisition state or errors.
+    // A first status (previous null) is not a transition.
+    if (exportError && ((previous && message.status?.state !== previous.state) ||
+        (message.status?.lastError && message.status.lastError !== previous?.lastError))) {
+      exportError = "";
+    }
     renderRecordingStatus();
   } else if (message.type === "recording-error") {
+    exportError = "";
     els.recordError.textContent = message.message;
+  } else if (message.type === "export-error") {
+    exportError = `Export failed: ${message.message}`;
+    els.recordError.textContent = exportError;
+  } else if (message.type === "export-status") {
+    exportPending = message.pending;
+    renderRecordingStatus();
   } else if (message.type === "download") {
-    downloadBlob(message.blob, message.filename);
+    try {
+      downloadBlob(message.blob, message.filename);
+    } catch (error) {
+      exportError = `Download failed: ${error.message}. Retained OPFS audio is unchanged.`;
+      els.recordError.textContent = exportError;
+    }
   } else if (message.type === "recovery-sessions") {
+    if (message.requestId !== undefined && message.requestId !== recoveryRequestId) return;
     recoveryResult = message.result;
     recoveryScanPending = false;
     renderRecovery();
@@ -475,23 +503,38 @@ function renderRecordingStatus() {
   els.recordBacklog.textContent =
     `${formatBytes(status.pendingWriteBytes)} / ${formatBytes(status.writeBacklogHighWaterBytes)}`;
   els.recordStorage.textContent = status.storageMode;
-  els.recordError.textContent = status.lastError ?? "";
+  els.recordError.textContent = exportError || status.lastError || "";
 
   els.recordStart.disabled = !connected || recorderBusy;
   els.recordStop.disabled = !activeRecording;
   els.recordReset.disabled = !hasRecording || status.state === "recording" || status.state === "stopping";
-  els.exportManifest.disabled = !canExport;
-  els.exportWav.disabled = !canExport;
+  els.exportManifest.disabled = !canExport || exportPending;
+  els.exportWav.disabled = !canExport || exportPending;
   els.wavChannel.disabled = !canExport;
   els.connect.disabled = recorderBusy || !window.crossOriginIsolated;
   updateRecoveryControls();
+}
+
+function requestExport(message) {
+  if (!worker || exportPending) return;
+  exportPending = true;
+  exportError = "";
+  renderRecordingStatus();
+  try {
+    worker.postMessage(message);
+  } catch (error) {
+    exportPending = false;
+    renderRecordingStatus();
+    exportError = `Export failed: ${error.message}`;
+    els.recordError.textContent = exportError;
+  }
 }
 
 function scanRecovery() {
   ensureWorker();
   recoveryScanPending = true;
   renderRecovery();
-  worker.postMessage({ type: "recovery-scan" });
+  worker.postMessage({ type: "recovery-scan", requestId: ++recoveryRequestId });
 }
 
 function renderRecovery() {
@@ -591,9 +634,10 @@ function updateRecoveryControls(session = selectedRecoverySession()) {
   els.recoverySession.disabled = !(recoveryResult?.sessions?.length) || recoveryScanPending;
   els.recoveryRefresh.disabled = recoveryScanPending;
   els.recoveryExportManifest.disabled =
-    !canUseSelected || recordingActive || selectedActive || selectedOpenInMemory || recoveryScanPending;
+    !canUseSelected || session.exportableManifest === false || exportPending || recordingActive || selectedActive || selectedOpenInMemory || recoveryScanPending;
   els.recoveryExportWav.disabled =
     !canUseSelected ||
+    exportPending ||
     recordingActive ||
     selectedActive ||
     selectedOpenInMemory ||
@@ -601,12 +645,13 @@ function updateRecoveryControls(session = selectedRecoverySession()) {
     recoveryScanPending;
   els.recoveryWavChannel.disabled =
     !canUseSelected ||
+    exportPending ||
     recordingActive ||
     selectedActive ||
     selectedOpenInMemory ||
     !session.exportableWav ||
     recoveryScanPending;
-  els.recoveryDelete.disabled = !canUseSelected || selectedActive || recoveryScanPending;
+  els.recoveryDelete.disabled = !canUseSelected || session.metadataReadOnly === true || selectedActive || recoveryScanPending;
 }
 
 function recoveryMetric(label, value) {
@@ -641,13 +686,23 @@ function formatShape(session) {
 
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.append(anchor);
-  anchor.click();
-  anchor.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  let anchor;
+  let activated = false;
+  try {
+    anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.append(anchor);
+    anchor.click();
+    activated = true;
+  } finally {
+    try {
+      anchor?.remove();
+    } finally {
+      if (activated) window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      else URL.revokeObjectURL(url);
+    }
+  }
 }
 
 function formatDuration(seconds) {

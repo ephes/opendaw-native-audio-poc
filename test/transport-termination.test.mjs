@@ -28,7 +28,7 @@ for (const event of ["close", "error", "device-lost"]) {
     } });
     const configure = (socket) => {
       socket.emit("open");
-      socket.emit("message", JSON.stringify({ type: "stream-started", ...stream }));
+      socket.emit("message", JSON.stringify({ type: "stream-started", ...stream, source: "input" }));
     };
     configure(f.socket);
     const stats = (count) => JSON.stringify({ type: "native-input-stats", source: "input",
@@ -114,7 +114,7 @@ test("transport close during queued Start excludes pre-session counters and newe
   const f = await workerFixture(t, { navigator: {
     storage: { getDirectory: async () => root, persist: async () => true }, locks: memoryLocks(),
   } });
-  const started = JSON.stringify({ type: "stream-started", ...stream });
+  const started = JSON.stringify({ type: "stream-started", ...stream, source: "input" });
   const stats = (count) => JSON.stringify({ type: "native-input-stats", source: "input",
     nativeDroppedBlocks: count, nativeDroppedFrames: count * 2, nativeDropEvents: count,
     bridgeQueueCapacityBlocks: 64, atFrame: 100 });

@@ -510,3 +510,15 @@ maps keyed by array name; totals remain exact and omissions equal total minus
 retained samples. Status and offline inspection use totals. Historical manifests
 without these maps still use array lengths. Recovery exports preserve integrity
 samples and totals; any retained integrity failure still fails inspection.
+
+Recovery scans and deletions share ordered request generations. Only the newest result is published, so an older scan cannot restore a deleted session. Download activation failures remove the temporary anchor and revoke its URL immediately; successful downloads retain a ten-second grace period. OPFS artifacts remain available for retry.
+
+All manifest/WAV export controls share one pending owner in the page and Worker, admitted before lifecycle enqueue. Repeated requests are ignored until completion/failure; Worker retirement releases the page owner. Recording controls remain available. WAV construction requires safe integer frame counts, a positive integer sample rate whose byte rate fits uint32, and binary parts with exactly four bytes per declared frame.
+
+Native stats require the source advertised by `stream-started` and a nondecreasing frame cursor in that stream generation. Stats that arrive before the stream is configured are dropped silently; the next periodic report is admitted. Incompatible stats after configuration leave evidence unchanged and report an integrity error. A regressing native drop counter during recording is refused: previously observed drops remain in the manifest and the integrity failure prevents certifying clean acquisition.
+
+The offline inspector supports exactly version 1 of ordinary and recovered recording manifests; it refuses other versions before interpreting their fields. OPFS recovery admits only an ordinary recording manifest at version 1 whose internal `sessionId` exactly matches its artifact session. Unsupported type/version or foreign identity leaves artifacts listed with a fatal read-only diagnostic, disables recovery exports/deletion, and preserves bytes for compatible tooling or manual repair.
+
+Offline manifest inspection admits at most 10,000 chunks and 1,000,000 aggregate chunk, block and recovery-warning entries before per-entry validation. Chunk indices must be safe nonnegative integers, unique with unique filenames, and filenames must exactly match `<sessionId>-chunk-<index padded to at least five digits>.f32`. Identity failures refuse timeline interpretation. Errors and warnings each retain the first 100 messages, at most 500 characters per message/scalar display field; `omittedErrors`/`omittedWarnings` count further diagnostics and the report prints these omissions. Truncation never clears a failed verdict. These limits refuse inspection, without altering saved audio.
+
+The page also fences recovery results by its own echoed request identity, covering already-posted messages delivered after a newer delete/scan request. Export and download errors stay visible when pending controls are released and clear on retry or Worker retirement.

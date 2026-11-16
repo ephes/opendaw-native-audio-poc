@@ -112,6 +112,7 @@ struct AudioBlock {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StreamStarted {
+    source: &'static str,
     #[serde(rename = "type")]
     event_type: &'static str,
     sample_rate: u32,
@@ -313,6 +314,7 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
     ));
     let stream_info = StreamStarted {
         event_type: "stream-started",
+        source: native_stats.source,
         sample_rate: args.sample_rate,
         channels: args.channels,
         frames_per_block: args.frames_per_block,
@@ -1169,6 +1171,7 @@ mod tests {
             authority: "127.0.0.1:1".into(),
             stream_info: StreamStarted {
                 event_type: "stream-started",
+                source: "sine",
                 sample_rate: 48000,
                 channels: 2,
                 frames_per_block: 1,
@@ -1632,6 +1635,7 @@ mod tests {
             .expect("websocket should connect");
 
         let started = message_text_json(recv_ws_message(&mut socket).await);
+        assert_eq!(started.get("source").and_then(Value::as_str), Some("sine"));
         assert_eq!(
             started.get("type").and_then(Value::as_str),
             Some("stream-started")
