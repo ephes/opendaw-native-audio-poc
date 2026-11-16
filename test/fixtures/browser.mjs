@@ -43,7 +43,11 @@ export async function appFixture(t) {
     terminate() { this.terminations++; }
     fail(type) { this.handlers.get(type)?.({ preventDefault() {} }); }
     postMessage(message) { this.messages.push(message); }
-    emit(message) { this.handlers.get("message")?.({ data: message }); }
+    emit(message) {
+      const scoped = ["socket-state", "shared-buffer", "meters", "native-input-stats", "error"].includes(message.type);
+      const generation = this.messages.findLast(m => m.type === "connect")?.generation;
+      this.handlers.get("message")?.({ data: scoped ? { generation, ...message } : message });
+    }
   }
   class Context {
     load = deferred();
@@ -88,6 +92,7 @@ export async function appFixture(t) {
   });
   await import(`../../public/app.js?fixture=${crypto.randomUUID()}`);
   const stream = (sharedBuffer = new SharedArrayBuffer(256 + 16)) => {
+    if (worker.messages.at(-1)?.type !== "connect") elements.get("#connect").click();
     worker.emit({ type: "socket-state", state: "open" });
     worker.emit({ type: "shared-buffer", sharedBuffer,
       stream: { sampleRate: 48000, channels: 2, framesPerBlock: 1 } });
@@ -104,15 +109,21 @@ export async function workerFixture(t, values = {}) {
     handlers = new Map();
     constructor() { sockets.push(this); }
     addEventListener(type, handler) { this.handlers.set(type, handler); }
+    removeEventListener(type, handler) { if (this.handlers.get(type) === handler) this.handlers.delete(type); }
     close() { this.emit("close"); }
     emit(type, data) { this.handlers.get(type)?.({ data }); }
   }
   installGlobals(t, {
     self: { addEventListener(type, handler) { assert.equal(type, "message"); receive = handler; } },
+    setTimeout: () => 0, clearTimeout() {},
     WebSocket: Socket, postMessage: (message) => messages.push(message), ...values,
   });
   await import(`../../public/audio-worker.js?fixture=${crypto.randomUUID()}`);
-  const send = (type, fields = {}) => receive({ data: { type, url: "ws://synthetic.invalid/ws", ...fields } });
+  let generation = 0;
+  const send = (type, fields = {}) => {
+    if (type === "connect") generation++;
+    receive({ data: { type, url: "ws://synthetic.invalid/ws", generation, ...fields } });
+  };
   send("connect");
   return { messages, sockets, send, socket: sockets[0] };
 }

@@ -44,6 +44,9 @@ const els = {
 };
 
 let worker = null;
+let nextConnectionGeneration = 0;
+let connectionGeneration = null;
+const CONNECTION_REPLIES = new Set(["socket-state", "shared-buffer", "meters", "native-input-stats", "error"]);
 let audioContext = null;
 let workletNode = null;
 let monitorAttempt = null;
@@ -55,6 +58,7 @@ let recordingStatus = null;
 let recordingStartPending = false;
 let socketStateValue = "closed";
 let recoveryResult = null;
+let recoveryChannelOwner = null;
 let recoveryScanPending = false;
 let exportPending = false;
 let exportError = "";
@@ -147,7 +151,8 @@ scanRecovery();
 
 function connect() {
   ensureWorker();
-  worker.postMessage({ type: "connect", url: websocketUrl() });
+  connectionGeneration = ++nextConnectionGeneration;
+  worker.postMessage({ type: "connect", url: websocketUrl(), generation: connectionGeneration });
   els.connect.textContent = "Disconnect";
   setSocketState("connecting");
 }
@@ -156,7 +161,9 @@ function disconnect() {
   if (isRecorderBusy(recordingStatus)) {
     return;
   }
-  worker?.postMessage({ type: "disconnect" });
+  const retiredGeneration = connectionGeneration;
+  connectionGeneration = null;
+  worker?.postMessage({ type: "disconnect", generation: retiredGeneration });
   stopMonitor();
   sharedBuffer = null;
   stateView = null;
@@ -193,6 +200,7 @@ function ensureWorker() {
       event.preventDefault();
       if (worker !== owned) return;
       worker = null;
+      connectionGeneration = null;
       owned.terminate();
       stopMonitor();
       sharedBuffer = null;
@@ -311,8 +319,11 @@ function updateMonitorChannels() {
 
 function handleWorkerMessage(event) {
   const message = event.data;
+  if (CONNECTION_REPLIES.has(message.type) &&
+      (connectionGeneration === null || message.generation !== connectionGeneration)) return;
   if (message.type === "socket-state") {
     setSocketState(message.state);
+    if (message.message) els.streamSummary.textContent = message.message;
   } else if (message.type === "shared-buffer") {
     stopMonitor();
     sharedBuffer = message.sharedBuffer;
@@ -446,6 +457,7 @@ function setSocketState(state) {
   els.socketState.textContent = state;
   els.connect.textContent = state === "connecting" || state === "open" ? "Disconnect" : "Connect";
   if (state === "closed" || state === "error" || state === "device-lost") {
+    connectionGeneration = null;
     stopMonitor();
     sharedBuffer = null;
     stateView = null;
@@ -556,12 +568,19 @@ function renderRecovery() {
   }
 
   const session = selectedRecoverySession();
+  const previousChannel = Number(els.recoveryWavChannel.value);
+  const preserveChannel = session && recoveryChannelOwner?.sessionId === session.sessionId &&
+    recoveryChannelOwner.channels === session.channels && Number.isInteger(previousChannel) &&
+    previousChannel >= 0 && previousChannel < session.channels;
+  recoveryChannelOwner = session ? { sessionId: session.sessionId, channels: session.channels } : null;
   els.recoveryWavChannel.replaceChildren();
   if (session?.channels > 0) {
     for (let index = 0; index < session.channels; index += 1) {
       els.recoveryWavChannel.append(new Option(`Channel ${index + 1}`, String(index)));
     }
   }
+
+  if (preserveChannel) els.recoveryWavChannel.value = String(previousChannel);
 
   const unavailable = recoveryResult && !recoveryResult.available;
   const scanState = recoveryScanPending

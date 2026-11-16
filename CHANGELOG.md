@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fence page/Worker connection commands and replies by generation, retiring already-posted stream buffers/state on Disconnect without discarding recovery or recording messages.
+- Settle WebSocket constructor refusal as a fixed retryable connection error before retiring the previous transport, preserving Worker recovery/recording ownership.
+- Bound handshake plus first valid stream configuration with one ten-second startup deadline; detach retired socket listeners and allow explicit retry after timeout.
+- Preserve the selected recovery WAV channel across inventory refreshes for the same session/channel count; reset on changed geometry or session identity.
+
 - Fence already-posted recovery results at page delivery and retain export/download errors after terminal pending-state updates.
 
 - Report export failures as `export-error` so a retained export error yields to later recorder state changes and errors, and drop native stats that arrive before stream configuration without a false integrity error.

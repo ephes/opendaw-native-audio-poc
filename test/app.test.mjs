@@ -65,8 +65,30 @@ test("status messages update recovery controls without changing the selected exp
     assert.equal(elements.get("#recovery-export-wav").disabled, active);
     assert.equal(elements.get("#recovery-export-manifest").disabled, active);
   }
+  const refreshed = { sessionId: "native-pcm-synthetic", state: "stopped", channels: 6, sampleRate: 48000,
+    recoveredFrames: 2, recoveredBytes: 48, chunkCount: 1, exportableWav: true };
+  elements.get("#recovery-refresh").click();
+  assert.equal(channel.value, "4", "starting the scan preserves the channel");
+  assert.equal(channel.disabled, true);
+  worker.emit({ type: "recovery-sessions", result: { available: true, sessions: [refreshed] } });
+  assert.equal(channel.value, "4", "refreshing the same session preserves the channel");
   elements.get("#recovery-export-wav").click();
   assert.deepEqual(worker.messages.at(-1), {
     type: "export-recovered-wav", sessionId: "native-pcm-synthetic", channelIndex: 4,
   });
+  worker.emit({ type: "export-status", pending: false });
+  for (const replacement of [
+    { ...refreshed, channels: 3 }, // Shrinking geometry invalidates channel 5.
+    { ...refreshed, channels: 7 }, // Growing geometry resets selection too.
+    { ...refreshed, sessionId: "native-pcm-other", channels: 7 },
+  ]) {
+    channel.value = "2";
+    worker.emit({ type: "recovery-sessions", result: { available: true, sessions: [replacement] } });
+    assert.equal(channel.value, "0", "identity/geometry change resets the channel");
+  }
+  worker.emit({ type: "recovery-sessions", result: { available: true, sessions: [] } });
+  assert.equal(channel.value, "");
+  assert.equal(channel.disabled, true);
+  worker.emit({ type: "recovery-sessions", result: { available: true, sessions: [refreshed] } });
+  assert.equal(channel.value, "0", "a returning removed session starts at channel 1");
 });
