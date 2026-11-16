@@ -280,9 +280,12 @@ Export Selected WAV writes one mono 32-bit float WAV for the selected source cha
 and recovered export refuse NaN or Infinity in that channel with a bounded
 chunk-frame/channel diagnostic, leaving the original chunks unchanged. Finite
 samples outside [-1, 1], signed zero and subnormals remain unchanged. The
-resulting mono WAV is assembled as a browser `Blob`; exporting very long channels
-can still be memory-intensive. All-channel WAV export is intentionally left out
-of this slice.
+resulting mono WAV is assembled as a browser `Blob`, so both exports first admit
+the request against a fixed 256 MiB working-memory envelope and refuse longer
+recordings before reading any PCM (see Known limits). With the default 64 MiB
+chunks this caps a selected-channel export at roughly 25 million frames, about
+8.7 minutes at 48 kHz. All-channel WAV export is intentionally left out of this
+slice.
 
 The top status counters show cumulative native dropped cpal callback buffers, dropped frames, and drop events from the Rust backend. The recording status panel also shows native dropped callback buffers/frames/events during the active recording. These counters are separate from WebSocket PCM blocks, browser-side gaps/overlaps, WebSocket lag, and monitor underrun/overflow counters.
 
