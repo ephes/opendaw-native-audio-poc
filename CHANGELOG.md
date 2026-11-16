@@ -4,6 +4,8 @@
 
 - Fence already-posted recovery results at page delivery and retain export/download errors after terminal pending-state updates.
 
+- Report export failures as `export-error` so a retained export error yields to later recorder state changes and errors, and drop native stats that arrive before stream configuration without a false integrity error.
+
 - Require unique session-owned inspector chunk identities and bound aggregate inspection work and retained diagnostics, reporting omitted counts without losing failed verdicts.
 
 - Refuse unsupported inspector manifest versions and retain OPFS manifests with incompatible schema/session identity as fatal read-only recovery entries.

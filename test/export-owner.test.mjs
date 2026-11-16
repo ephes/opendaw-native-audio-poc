@@ -22,6 +22,8 @@ test("worker admits one export before lifecycle enqueue and releases failure for
   gate.reject(new Error("synthetic export failure"));
   await settle();
   assert.equal(f.messages.filter(m => m.type === "export-status").at(-1).pending, false);
+  assert.equal(f.messages.filter(m => m.type === "export-error").at(-1).message, "synthetic export failure");
+  assert.equal(f.messages.filter(m => m.type === "recording-error").length, 0);
   gate = deferred();
   f.send("export-selected-wav");
   await settle();
@@ -39,9 +41,11 @@ test("page shares pending export ownership across controls and worker retirement
   f.click("#recovery-export-wav"); f.click("#recovery-export-manifest"); f.click("#export-wav");
   assert.equal(f.worker.messages.filter(m => m.type.startsWith("export-")).length, 1);
   assert.equal(f.elements.get("#recovery-export-wav").disabled, true);
-  f.worker.emit({ type: "recording-error", message: "synthetic read failure" });
+  f.worker.emit({ type: "export-error", message: "synthetic read failure" });
   f.worker.emit({ type: "recording-status", status: { state: "idle" } });
   f.worker.emit({ type: "export-status", pending: false });
+  assert.match(f.elements.get("#record-error").textContent, /synthetic read failure/);
+  f.worker.emit({ type: "recording-status", status: { state: "idle" } });
   assert.match(f.elements.get("#record-error").textContent, /synthetic read failure/);
   assert.equal(f.elements.get("#recovery-export-wav").disabled, false);
   f.click("#recovery-export-wav");
@@ -52,4 +56,24 @@ test("page shares pending export ownership across controls and worker retirement
     sessionId: "native-pcm-synthetic", state: "stopped", channels: 2, exportableWav: true,
   }] } });
   assert.equal(f.elements.get("#recovery-export-wav").disabled, false);
+});
+
+test("an export error does not mask later recorder state or errors", async (t) => {
+  const f = await appFixture(t);
+  f.worker.emit({ type: "recording-status", status: { state: "idle", lastError: "" } });
+  f.worker.emit({ type: "export-error", message: "synthetic export refusal" });
+  f.worker.emit({ type: "recording-status", status: { state: "idle", lastError: "" } });
+  assert.match(f.elements.get("#record-error").textContent, /synthetic export refusal/);
+  f.worker.emit({ type: "recording-status", status: { state: "error", lastError: "synthetic storage failure" } });
+  assert.equal(f.elements.get("#record-error").textContent, "synthetic storage failure");
+
+  f.worker.emit({ type: "export-error", message: "second export refusal" });
+  f.worker.emit({ type: "recording-status", status: { state: "recording", lastError: "synthetic storage failure" } });
+  assert.equal(f.elements.get("#record-error").textContent, "synthetic storage failure");
+
+  f.worker.emit({ type: "export-error", message: "third export refusal" });
+  f.worker.emit({ type: "recording-error", message: "synthetic transport interruption" });
+  assert.equal(f.elements.get("#record-error").textContent, "synthetic transport interruption");
+  f.worker.emit({ type: "recording-status", status: { state: "recording", lastError: "synthetic storage failure" } });
+  assert.equal(f.elements.get("#record-error").textContent, "synthetic storage failure");
 });

@@ -116,8 +116,9 @@ test("native stats bind source and monotonic cursor to the configured generation
   } });
   const stats = (source, atFrame) => ({ type: "native-input-stats", source, atFrame,
     nativeDroppedBlocks: 0, nativeDroppedFrames: 0, nativeDropEvents: 0, bridgeQueueCapacityBlocks: 64 });
+  const beforeConfiguration = f.messages.length;
   f.socket.emit("message", JSON.stringify(stats("input", 1)));
-  assert.equal(f.messages.at(-1).code, "invalid-native-stats");
+  assert.equal(f.messages.length, beforeConfiguration, "pre-configuration stats are dropped silently");
   f.socket.emit("message", JSON.stringify({ ...started, source: "input" }));
   f.socket.emit("message", JSON.stringify(stats("input", 10)));
   f.send("recording-start"); await settle();

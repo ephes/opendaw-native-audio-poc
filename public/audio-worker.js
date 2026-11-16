@@ -136,15 +136,18 @@ function handleSocketMessage(event) {
         postMessage({ type: "error", code: "invalid-control", message: "Stream configuration refused" });
       }
     } else if (message.type === "native-input-stats") {
-      if (!streamInfo || message.source !== streamInfo.source ||
+      // Stats can precede a stream-started deferred behind a pending Start.
+      // Drop them without evidence; the next periodic report is admitted.
+      if (!streamInfo) return;
+      if (message.source !== streamInfo.source ||
           (nativeInputStats && message.atFrame < nativeInputStats.atFrame)) {
-        if (streamInfo) recorder.noteInvalidBlock("Native stats source or frame cursor disagrees with stream generation");
+        recorder.noteInvalidBlock("Native stats source or frame cursor disagrees with stream generation");
         postMessage({ type: "error", code: "invalid-native-stats",
           message: "Native stats source or frame cursor disagrees with stream generation" });
         return;
       }
       nativeInputStats = message;
-      if (streamInfo) recorder.setNativeInputStats(message);
+      recorder.setNativeInputStats(message);
       postMessage({ type: "native-input-stats", stats: nativeInputStats });
     } else if (message.type === "stream-error") {
       if (message.code === "device-lost") {
@@ -224,7 +227,6 @@ function configureStream(info) {
   Atomics.store(stateView, STATE.FRAMES_PER_BLOCK, info.framesPerBlock);
   Atomics.store(stateView, STATE.RECEIVED_BLOCKS, 0);
   sampleView = createRingBufferViews(sharedBuffer, stateView).sampleView;
-  if (nativeInputStats) recorder.setNativeInputStats(nativeInputStats);
   postMessage({ type: "shared-buffer", sharedBuffer, stream: info });
 }
 
@@ -305,7 +307,7 @@ function runExport(action) {
       postMessage({ type: "download", filename: result.filename, blob: result.blob });
     })
     .catch((error) => {
-      postMessage({ type: "recording-error", message: error.message });
+      postMessage({ type: "export-error", message: error.message });
       postMessage({ type: "recording-status", status: recorder.status() });
     }).finally(() => {
       exportPending = false;

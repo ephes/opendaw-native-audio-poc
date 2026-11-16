@@ -329,12 +329,22 @@ function handleWorkerMessage(event) {
   } else if (message.type === "error") {
     els.streamSummary.textContent = message.message;
   } else if (message.type === "recording-status") {
+    const previous = recordingStatus;
     recordingStatus = message.status;
     recordingStartPending = false;
+    // An export error must not mask later acquisition state or errors.
+    // A first status (previous null) is not a transition.
+    if (exportError && ((previous && message.status?.state !== previous.state) ||
+        (message.status?.lastError && message.status.lastError !== previous?.lastError))) {
+      exportError = "";
+    }
     renderRecordingStatus();
   } else if (message.type === "recording-error") {
-    if (exportPending) exportError = message.message;
+    exportError = "";
     els.recordError.textContent = message.message;
+  } else if (message.type === "export-error") {
+    exportError = `Export failed: ${message.message}`;
+    els.recordError.textContent = exportError;
   } else if (message.type === "export-status") {
     exportPending = message.pending;
     renderRecordingStatus();

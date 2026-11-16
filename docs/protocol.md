@@ -260,11 +260,13 @@ monitor/context once and exposes Start Monitor for retry without ending capture.
 
 Page/Worker recovery requests are ordered by a Worker-owned generation, included in `recovery-sessions`; superseded results are discarded. Scans requested during deletion wait for the mutation.
 
-The Worker emits `export-status` with `pending: true/false` around one admitted export. Duplicate pending exports are ignored before queueing; success emits one `download`, failure emits `recording-error`, and both release admission. Page retirement releases local pending state.
+The Worker emits `export-status` with `pending: true/false` around one admitted export. Duplicate pending exports are ignored before queueing; success emits one `download`, failure emits `export-error` (never `recording-error`), and both release admission. Page retirement releases local pending state.
 
 `stream-started.source` is required and is exactly `sine` or `input`, matching
-the actual acquisition source. Stats are accepted only after configuration,
-with the same source and a nondecreasing `atFrame` within that configuration
+the actual acquisition source. Stats are accepted only after configuration;
+stats arriving earlier (for example while `stream-started` waits behind a
+pending Start) are dropped without an error, and the next periodic report is
+admitted. Accepted stats need the same source and a nondecreasing `atFrame` within that configuration
 and socket generation (equal cursors are valid). A changed source is a stream
 replacement even when PCM geometry is unchanged. Incompatible stats are refused
 before counter mutation with a bounded `invalid-native-stats` error and recording
@@ -276,4 +278,4 @@ Recording manifest schema admission is exact: `opendaw-native-audio-poc-recordin
 
 The offline inspector validates unique session-owned chunk filename/index identities before timeline calculations. It admits at most 10,000 chunks and 1,000,000 combined chunk/block/recovery-warning entries before inspecting entries. Diagnostic results retain 100 errors and 100 warnings of at most 500 characters each, with exact omitted counts and an unchanged failed verdict; displayed scalar strings use the same character ceiling.
 
-Page recovery scan/delete requests also carry `requestId`, echoed in each result. The page rejects results from older requests, including messages posted before a newer mutation was requested but delivered afterwards. Export/download errors remain visible after terminal export-status releases admission, until retry or Worker retirement.
+Page recovery scan/delete requests also carry `requestId`, echoed in each result. The page rejects results from older requests, including messages posted before a newer mutation was requested but delivered afterwards. Export/download errors remain visible after terminal export-status releases admission, until retry, Worker retirement, a later `recording-error`, or a `recording-status` that changes the recorder state or reports a new `lastError`; an old export error never masks current acquisition errors.
