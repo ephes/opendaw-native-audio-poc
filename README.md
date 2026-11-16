@@ -331,6 +331,16 @@ A failed chunk close ends the recording in `error` with no `stoppedAt`. The inco
 
 Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, native input stats from the original manifest when present, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing native input stats in an older manifest, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
 
+Every scan and selected-session recovery export shares one 256 MiB metadata
+budget across the index, manifests and checkpoint sidecars. Each file's UTF-8
+byte size is charged before reading text; each admitted block description also
+costs 256 accounting bytes before retention/reconstruction. This is a conservative
+work/retention allowance, not a browser heap-size guarantee. Per-file and depth
+limits still apply. Exhaustion marks the scan incomplete, stops further metadata
+reads and disables exports and deletion from that partial catalog; saved files
+are preserved. Selected-session exports use a fresh budget and can recover an
+individual session when a full multi-session scan exceeds its total budget.
+
 Recovery exports enumerate bounded artifact names, then read only the selected session’s manifest, sidecars and chunks plus the shared index. They preserve unmanifested tail discovery, reject cross-session manifest chunk references, and recheck chunk size during export. An incomplete name inventory refuses export; listing/reconciliation still rebuilds every discovered session.
 
 Cleanly stopped prior sessions may also appear in OPFS Sessions after a reload. They can be exported through the recovery controls or deleted from OPFS. Delete only removes files whose names match the selected `native-pcm-*` session; it does not clear unrelated site data.

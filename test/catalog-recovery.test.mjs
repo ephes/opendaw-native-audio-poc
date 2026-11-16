@@ -351,3 +351,51 @@ test("Start refuses a catalog one byte short of the real first entry before crea
   assert.equal(recorder.session, null);
   assert.equal(recorder.state, "idle");
 });
+
+test("one metadata budget spans index, manifests and checkpoint block descriptions", async () => {
+  const { recorder, root } = fixture();
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.stop();
+  const first = recorder.session.sessionId;
+  // Independent synthetic sessions, each admitted in isolation.
+  for (const id of ["native-pcm-copy-a", "native-pcm-copy-b"]) {
+    for (const [name, bytes] of [...root.files]) {
+      if (!name.startsWith(`${first}-`)) continue;
+      root.files.set(name.replace(first, id), name.endsWith(".json")
+        ? encoder.encode(new TextDecoder().decode(bytes).replaceAll(first, id)) : bytes.slice());
+    }
+  }
+  const allBytes = [...root.files].filter(([name]) => name.endsWith(".json"))
+    .reduce((sum, [, bytes]) => sum + bytes.byteLength, 0);
+  // A lower injectable ceiling exercises the real scan with tiny fixtures.
+  recorder.recoveryMetadataMaxBytes = allBytes - 1;
+  const before = new Map([...root.files].map(([name, bytes]) => [name, bytes.slice()]));
+  let readBytes = 0;
+  const getHandle = root.getFileHandle.bind(root);
+  root.getFileHandle = async (name, options) => {
+    const handle = await getHandle(name, options);
+    const getFile = handle.getFile;
+    handle.getFile = async () => {
+      const file = await getFile();
+      const text = file.text.bind(file);
+      file.text = () => { readBytes += file.size; return text(); };
+      return file;
+    };
+    return handle;
+  };
+  const scan = await recorder.scanRecoverySessions();
+  assert.equal(scan.complete, false);
+  assert.match(scan.error, /metadata.*budget/i);
+  assert.ok(readBytes <= recorder.recoveryMetadataMaxBytes);
+  assert.ok(scan.sessions.every((s) => !s.exportableWav && !s.exportableManifest));
+  await assert.rejects(recorder.deleteRecoveredSession(first), /metadata.*budget/i);
+  assert.deepEqual(root.files, before);
+  recorder.recoveryMetadataMaxBytes = allBytes + 3 * 256;
+  assert.equal((await recorder.scanRecoverySessions()).complete, true);
+  // Raw JSON fits; retained block-description accounting independently refuses.
+  recorder.recoveryMetadataMaxBytes = allBytes;
+  assert.equal((await recorder.scanRecoverySessions()).complete, false);
+  recorder.recoveryMetadataMaxBytes = 1;
+  await assert.rejects(recorder.exportRecoveredManifest(first), /metadata.*budget/i);
+});
