@@ -39,8 +39,8 @@ JSON messages describe device and stream state:
 The current Rust server sends `stream-started` when a WebSocket client connects, then sends an initial `native-input-stats` event, then sends additional stats events about once per second. It sends `stream-error` when the server detects a client-side stream delivery problem such as a lagging WebSocket receiver. A CPAL stream callback error is terminal for that capture generation: a retained,
 capacity-one notification causes `stream-error` with `code: "device-lost"`, then
 ends client delivery. Every send retains its existing deadline. Later clients
-receive `device-lost` before stream-started; restart the input bridge and reconnect
-explicitly. The Worker closes its socket, refuses later PCM and interrupts the
+receive only `device-lost` instead of `stream-started` and are then disconnected;
+restart the input bridge and reconnect explicitly. The Worker closes its socket, refuses later PCM and interrupts the
 recorder exactly once through its lifecycle queue; the page retires the monitor
 and enables Connect. Interruption drains admitted writes, while
 preserving committed chunks. This error is not a WebSocket lag sample. Per-channel browser meters are computed in the Worker from received PCM blocks rather than sent as JSON.
@@ -201,8 +201,11 @@ equivalents) before JSON.parse consumes index/manifest/checkpoint metadata.
 Ambiguity makes discovery incomplete, refuses recovery export/deletion and
 preserves saved bytes; unique historical records need no rewrite. A shared 256 MiB scan/export
 allowance charges index/manifest/sidecar byte sizes before text reads plus 256
-accounting bytes per retained block description. Exhaustion means incomplete
-evidence: no trusted export or deletion, no saved-file changes. The budgets, recovery and
+accounting bytes per retained block description. Exhaustion marks the scan
+incomplete and stops further metadata reads without changing saved files; sessions
+read completely before exhaustion keep their export verdict, later ones are listed
+from names only and flagged. Deletion needs only the complete name inventory, so
+deleting sessions frees budget; a selected-session export uses a fresh budget. The budgets, recovery and
 cleanup behavior are documented in the README.
 
 Manifests carry `counterEpochTotals: {underruns, overflows}` with the monitor

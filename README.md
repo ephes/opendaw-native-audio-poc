@@ -344,10 +344,14 @@ budget across the index, manifests and checkpoint sidecars. Each file's UTF-8
 byte size is charged before reading text; each admitted block description also
 costs 256 accounting bytes before retention/reconstruction. This is a conservative
 work/retention allowance, not a browser heap-size guarantee. Per-file and depth
-limits still apply. Exhaustion marks the scan incomplete, stops further metadata
-reads and disables exports and deletion from that partial catalog; saved files
-are preserved. Selected-session exports use a fresh budget and can recover an
-individual session when a full multi-session scan exceeds its total budget.
+limits still apply. Exhaustion marks the scan incomplete and stops further metadata
+reads; saved files are preserved. Sessions read completely before exhaustion keep
+their export verdict. Later sessions are still listed from their artifact names
+(no metadata text is read) and flagged as not exportable from that scan.
+Deletion relies only on the complete name inventory (ambiguous metadata still
+refuses it), so deleting sessions frees budget for a complete scan. Selected-session
+exports use a fresh budget and can recover an individual session when a full
+multi-session scan exceeds its total budget.
 
 Recovery exports enumerate bounded artifact names, then read only the selected session’s manifest, sidecars and chunks plus the shared index. They preserve unmanifested tail discovery, reject cross-session manifest chunk references, and recheck chunk size during export. An incomplete name inventory refuses export; listing/reconciliation still rebuilds every discovered session.
 

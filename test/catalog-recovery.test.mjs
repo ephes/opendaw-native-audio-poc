@@ -386,11 +386,28 @@ test("one metadata budget spans index, manifests and checkpoint block descriptio
   };
   const scan = await recorder.scanRecoverySessions();
   assert.equal(scan.complete, false);
+  assert.equal(scan.inventoryComplete, true);
   assert.match(scan.error, /metadata.*budget/i);
   assert.ok(readBytes <= recorder.recoveryMetadataMaxBytes);
-  assert.ok(scan.sessions.every((s) => !s.exportableWav && !s.exportableManifest));
-  await assert.rejects(recorder.deleteRecoveredSession(first), /metadata.*budget/i);
+  assert.deepEqual(new Set(scan.sessions.map((s) => s.sessionId)), new Set([first, "native-pcm-copy-a", "native-pcm-copy-b"]));
+  // Sessions read completely before exhaustion stay exportable; the rest are flagged.
+  const readable = scan.sessions.filter((s) => s.exportableWav);
+  const unread = scan.sessions.filter((s) => !s.exportableWav);
+  assert.equal(readable.length, 2);
+  assert.equal(unread.length, 1);
+  assert.ok(!unread[0].exportableManifest);
+  assert.match(unread[0].nonExportableReason, /metadata budget/i);
   assert.deepEqual(root.files, before);
+  // Selected-session export uses a fresh budget, so the unread session is still recoverable.
+  const wav = await recorder.exportRecoveredSelectedChannelWav(unread[0].sessionId, 0);
+  assert.ok(wav.blob.size > 44);
+  // Deletion needs only the complete name inventory and frees budget for a full scan.
+  const afterDelete = await recorder.deleteRecoveredSession(readable[0].sessionId);
+  assert.ok([...root.files.keys()].every((name) => !name.startsWith(`${readable[0].sessionId}-`)));
+  assert.equal(afterDelete.complete, true);
+  assert.equal(afterDelete.sessions.length, 2);
+  assert.ok(afterDelete.sessions.every((s) => s.exportableWav));
+  for (const [name, bytes] of before) root.files.set(name, bytes.slice());
   recorder.recoveryMetadataMaxBytes = allBytes + 3 * 256;
   assert.equal((await recorder.scanRecoverySessions()).complete, true);
   // Raw JSON fits; retained block-description accounting independently refuses.

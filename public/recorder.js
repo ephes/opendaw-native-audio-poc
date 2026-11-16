@@ -530,8 +530,11 @@ export class PcmRecorder {
     const scanWarnings = [...indexWarnings, ...artifacts.warnings];
 
     const sessions = [];
+    const exhaustedMessage =
+      "Recovery metadata budget exceeded before this session was fully read; export it individually or delete other sessions";
     for (const sessionId of sessionIds) {
-      if (metadataBudget.exhausted) break;
+      // After exhaustion every metadata read is refused before its text is read,
+      // so later sessions are still listed (for deletion) from names alone.
       const session = await buildRecoveredSession({
         root: this.root,
         metadataBudget,
@@ -547,25 +550,26 @@ export class PcmRecorder {
         scanWarnings: artifacts.warnings,
       });
       session.artifactFileNames = artifacts.fileNames.get(sessionId) ?? [];
+      // Sessions admitted completely before exhaustion keep their own verdict.
+      if (metadataBudget.exhausted && !metadataBudget.ambiguous) markRecoveredSessionIncomplete(session, exhaustedMessage);
       sessions.push(session);
     }
 
-    if (metadataBudget.exhausted || metadataBudget.ambiguous) {
-      const message = metadataBudget.ambiguous
-        ? "Recovery scan incomplete: ambiguous JSON object members; export and deletion refused"
-        : "Recovery scan incomplete: total metadata budget exceeded; export and deletion refused";
+    if (metadataBudget.ambiguous) {
+      const message = "Recovery scan incomplete: ambiguous JSON object members; export and deletion refused";
       scanWarnings.push(message);
-      for (const session of sessions) {
-        session.exportableManifest = false;
-        session.exportableWav = false;
-        session.nonExportableReason = message;
-        session.warnings.push({ code: "scan-incomplete", message, fatal: true });
-      }
+      for (const session of sessions) markRecoveredSessionIncomplete(session, message);
+    } else if (metadataBudget.exhausted) {
+      scanWarnings.push(
+        "Recovery scan incomplete: total metadata budget exceeded; sessions not fully read cannot be exported from this scan. Deleting sessions frees budget",
+      );
     }
     sessions.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
     return {
       available: true,
       complete: artifacts.complete && !metadataBudget.exhausted && !metadataBudget.ambiguous,
+      // Deletion needs only the exact name inventory; mutateIndex re-reads the index.
+      inventoryComplete: artifacts.complete && !metadataBudget.ambiguous,
       warnings: scanWarnings,
       error: scanWarnings.join("; "),
       scannedAt,
@@ -691,7 +695,7 @@ export class PcmRecorder {
     }
     this.root = this.root ?? (await this.openStorageRoot());
     const scan = await this.scanRecoverySessions();
-    if (!scan.complete) {
+    if (!scan.inventoryComplete) {
       throw new Error(scan.error || "Recovery inventory is incomplete; deletion refused");
     }
     const session = scan.sessions.find((entry) => entry.sessionId === sessionId);
@@ -1364,6 +1368,13 @@ async function readBudgetedJson(handle, { maxBytes, label, metadataBudget = null
     chunks.reduce((sum, chunk) => sum + (Array.isArray(chunk?.blocks) ? chunk.blocks.length : 0), 0);
   chargeRecoveryMetadata(metadataBudget, blocks * RETAINED_BLOCK_METADATA_BYTES);
   return value;
+}
+
+function markRecoveredSessionIncomplete(session, message) {
+  session.exportableManifest = false;
+  session.exportableWav = false;
+  session.nonExportableReason = message;
+  session.warnings.push({ code: "scan-incomplete", message, fatal: true });
 }
 
 function assertRecoveryMetadataComplete(budget) {
