@@ -56,7 +56,7 @@ self.addEventListener("message", (event) => {
   } else if (message.type === "export-selected-wav") {
     runExport(() => recorder.exportSelectedChannelWav(message.channelIndex));
   } else if (message.type === "recovery-scan") {
-    runRecoveryScan();
+    runRecoveryScan(message.requestId);
   } else if (message.type === "export-recovered-manifest") {
     runExport(() => recorder.exportRecoveredManifest(message.sessionId));
   } else if (message.type === "export-recovered-wav") {
@@ -64,7 +64,7 @@ self.addEventListener("message", (event) => {
       recorder.exportRecoveredSelectedChannelWav(message.sessionId, message.channelIndex),
     );
   } else if (message.type === "delete-recovered-session") {
-    runDeleteRecoveredSession(message.sessionId);
+    runDeleteRecoveredSession(message.sessionId, message.requestId);
   }
 });
 
@@ -313,15 +313,15 @@ function runExport(action) {
     });
 }
 
-function runRecoveryScan() {
-  runRecoveryAction(() => recorder.scanRecoverySessions());
+function runRecoveryScan(requestId) {
+  runRecoveryAction(() => recorder.scanRecoverySessions(), false, requestId);
 }
 
-function runDeleteRecoveredSession(sessionId) {
-  runRecoveryAction(() => recorder.deleteRecoveredSession(sessionId), true);
+function runDeleteRecoveredSession(sessionId, requestId) {
+  runRecoveryAction(() => recorder.deleteRecoveredSession(sessionId), true, requestId);
 }
 
-function runRecoveryAction(action, mutation = false) {
+function runRecoveryAction(action, mutation, requestId) {
   const generation = ++recoveryGeneration;
   // A scan requested during deletion must read after that mutation completes.
   recoveryQueue = recoveryQueue.then(action).catch(async (error) => {
@@ -333,11 +333,11 @@ function runRecoveryAction(action, mutation = false) {
       scannedAt: new Date().toISOString(), sessions: [] };
   }).then((result) => {
     if (generation === recoveryGeneration) {
-      postMessage({ type: "recovery-sessions", generation, result });
+      postMessage({ type: "recovery-sessions", generation, requestId, result });
     }
   }).catch((error) => {
     if (generation === recoveryGeneration) {
-      postMessage({ type: "recovery-sessions", generation, result: {
+      postMessage({ type: "recovery-sessions", generation, requestId, result: {
         available: false, error: error.message, sessions: [],
       } });
     }

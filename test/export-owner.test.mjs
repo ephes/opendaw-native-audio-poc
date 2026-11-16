@@ -39,9 +39,13 @@ test("page shares pending export ownership across controls and worker retirement
   f.click("#recovery-export-wav"); f.click("#recovery-export-manifest"); f.click("#export-wav");
   assert.equal(f.worker.messages.filter(m => m.type.startsWith("export-")).length, 1);
   assert.equal(f.elements.get("#recovery-export-wav").disabled, true);
+  f.worker.emit({ type: "recording-error", message: "synthetic read failure" });
+  f.worker.emit({ type: "recording-status", status: { state: "idle" } });
   f.worker.emit({ type: "export-status", pending: false });
+  assert.match(f.elements.get("#record-error").textContent, /synthetic read failure/);
   assert.equal(f.elements.get("#recovery-export-wav").disabled, false);
   f.click("#recovery-export-wav");
+  assert.equal(f.elements.get("#record-error").textContent, "");
   f.worker.fail("error");
   f.click("#recovery-refresh");
   f.worker.emit({ type: "recovery-sessions", result: { available: true, sessions: [{

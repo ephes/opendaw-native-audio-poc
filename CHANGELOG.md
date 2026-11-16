@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fence already-posted recovery results at page delivery and retain export/download errors after terminal pending-state updates.
+
 - Require unique session-owned inspector chunk identities and bound aggregate inspection work and retained diagnostics, reporting omitted counts without losing failed verdicts.
 
 - Refuse unsupported inspector manifest versions and retain OPFS manifests with incompatible schema/session identity as fatal read-only recovery entries.

@@ -57,6 +57,8 @@ let socketStateValue = "closed";
 let recoveryResult = null;
 let recoveryScanPending = false;
 let exportPending = false;
+let exportError = "";
+let recoveryRequestId = 0;
 let nativeInputStats = defaultNativeInputStats();
 
 els.connect.addEventListener("click", () => {
@@ -129,6 +131,7 @@ els.recoveryDelete.addEventListener("click", () => {
     renderRecovery();
     worker?.postMessage({
       type: "delete-recovered-session",
+      requestId: ++recoveryRequestId,
       sessionId: session.sessionId,
     });
   }
@@ -198,6 +201,7 @@ function ensureWorker() {
       recordingStartPending = false;
       recoveryScanPending = false;
       exportPending = false;
+      exportError = "";
       nativeInputStats = defaultNativeInputStats();
       const guidance = "Audio worker failed; capture may be interrupted. Use Scan Recovery to inspect retained OPFS audio, then reconnect. The open chunk may be lost.";
       // The replacement recorder owns no live session. Exports must use the
@@ -329,6 +333,7 @@ function handleWorkerMessage(event) {
     recordingStartPending = false;
     renderRecordingStatus();
   } else if (message.type === "recording-error") {
+    if (exportPending) exportError = message.message;
     els.recordError.textContent = message.message;
   } else if (message.type === "export-status") {
     exportPending = message.pending;
@@ -337,9 +342,11 @@ function handleWorkerMessage(event) {
     try {
       downloadBlob(message.blob, message.filename);
     } catch (error) {
-      els.recordError.textContent = `Download failed: ${error.message}. Retained OPFS audio is unchanged.`;
+      exportError = `Download failed: ${error.message}. Retained OPFS audio is unchanged.`;
+      els.recordError.textContent = exportError;
     }
   } else if (message.type === "recovery-sessions") {
+    if (message.requestId !== undefined && message.requestId !== recoveryRequestId) return;
     recoveryResult = message.result;
     recoveryScanPending = false;
     renderRecovery();
@@ -486,7 +493,7 @@ function renderRecordingStatus() {
   els.recordBacklog.textContent =
     `${formatBytes(status.pendingWriteBytes)} / ${formatBytes(status.writeBacklogHighWaterBytes)}`;
   els.recordStorage.textContent = status.storageMode;
-  els.recordError.textContent = status.lastError ?? "";
+  els.recordError.textContent = exportError || status.lastError || "";
 
   els.recordStart.disabled = !connected || recorderBusy;
   els.recordStop.disabled = !activeRecording;
@@ -501,13 +508,15 @@ function renderRecordingStatus() {
 function requestExport(message) {
   if (!worker || exportPending) return;
   exportPending = true;
+  exportError = "";
   renderRecordingStatus();
   try {
     worker.postMessage(message);
   } catch (error) {
     exportPending = false;
     renderRecordingStatus();
-    els.recordError.textContent = `Export failed: ${error.message}`;
+    exportError = `Export failed: ${error.message}`;
+    els.recordError.textContent = exportError;
   }
 }
 
@@ -515,7 +524,7 @@ function scanRecovery() {
   ensureWorker();
   recoveryScanPending = true;
   renderRecovery();
-  worker.postMessage({ type: "recovery-scan" });
+  worker.postMessage({ type: "recovery-scan", requestId: ++recoveryRequestId });
 }
 
 function renderRecovery() {
