@@ -29,7 +29,7 @@ use futures_util::{Sink, SinkExt, Stream as MessageStream, StreamExt};
 use serde::Serialize;
 use tokio::{
     net::TcpListener,
-    sync::{broadcast, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch},
     task::{JoinHandle, JoinSet},
     time::{Instant, MissedTickBehavior},
 };
@@ -45,6 +45,7 @@ const MAX_RING_BYTES: u64 = 64 * 1024 * 1024;
 const RING_STATE_BYTES: u64 = 256;
 const PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS: usize = 256;
 const INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS: usize = 64;
+const MAX_WEBSOCKET_CLIENTS: usize = 8;
 const CLIENT_SEND_DEADLINE: Duration = Duration::from_secs(2);
 const NATIVE_STATS_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -92,6 +93,7 @@ struct AppState {
     blocks: broadcast::Sender<Arc<AudioBlock>>,
     native_stats: Arc<NativeInputStats>,
     capture_fault: watch::Receiver<bool>,
+    client_permits: Arc<Semaphore>,
 }
 
 struct SourceRuntime {
@@ -346,6 +348,7 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
         blocks: block_tx,
         native_stats,
         capture_fault,
+        client_permits: Arc::new(Semaphore::new(MAX_WEBSOCKET_CLIENTS)),
     };
     let public_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("public");
     let app = Router::new()
@@ -438,25 +441,41 @@ async fn ws_handler(
     if !trusted_websocket_request(&headers, &state.authority) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| websocket_stream(socket, state))
+    // Never queue excess handshakes or create a PCM subscription for them.
+    let Ok(permit) = state.client_permits.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    // Axum drops this closure (and its permit) if the HTTP upgrade fails.
+    ws.on_upgrade(move |socket| websocket_stream(socket, state, permit))
         .into_response()
 }
 
-async fn websocket_stream(socket: WebSocket, state: AppState) {
+async fn websocket_stream(socket: WebSocket, state: AppState, permit: OwnedSemaphorePermit) {
     let (sender, receiver) = socket.split();
-    websocket_client(sender, receiver, state, CLIENT_SEND_DEADLINE).await;
+    websocket_client(sender, receiver, permit, state, CLIENT_SEND_DEADLINE).await;
 }
 
-async fn websocket_client<S, R, E>(sender: S, mut receiver: R, state: AppState, deadline: Duration)
-where
+async fn websocket_client<S, R, E>(
+    sender: S,
+    receiver: R,
+    permit: OwnedSemaphorePermit,
+    state: AppState,
+    deadline: Duration,
+) where
     S: Sink<Message> + Unpin,
     R: MessageStream<Item = std::result::Result<Message, E>> + Unpin + Send + 'static,
     E: Send + 'static,
 {
+    // Both halves retain the permit: cancellation may drop this future before
+    // the aborted reader task has actually been destroyed by the runtime.
+    let permit = Arc::new(permit);
+    let reader_permit = permit.clone();
     let blocks = state.blocks.subscribe();
     // JoinSet aborts its owned reader even if this connection future is cancelled.
     let mut readers = JoinSet::new();
     readers.spawn(async move {
+        let _permit = reader_permit;
+        let mut receiver = receiver;
         while let Some(Ok(message)) = receiver.next().await {
             if matches!(message, Message::Close(_)) {
                 break;
@@ -1158,6 +1177,7 @@ mod tests {
             blocks: broadcast::channel(1).0,
             native_stats: Arc::new(NativeInputStats::new(Source::Sine, 0)),
             capture_fault: watch::channel(false).1,
+            client_permits: Arc::new(Semaphore::new(MAX_WEBSOCKET_CLIENTS)),
         }
     }
 
@@ -1188,6 +1208,7 @@ mod tests {
         let task = tokio::spawn(websocket_client(
             sink,
             reader,
+            state.client_permits.clone().try_acquire_owned().unwrap(),
             state.clone(),
             Duration::from_secs(1),
         ));
@@ -1211,7 +1232,14 @@ mod tests {
         assert_eq!(state.blocks.receiver_count(), 0);
         assert!(messages.try_recv().is_err());
         let (sink, reader, mut messages, _close, dropped) = client_fixture(0);
-        websocket_client(sink, reader, state, Duration::from_secs(1)).await;
+        websocket_client(
+            sink,
+            reader,
+            state.client_permits.clone().try_acquire_owned().unwrap(),
+            state,
+            Duration::from_secs(1),
+        )
+        .await;
         let value: Value =
             serde_json::from_str(fixture_message(&mut messages).await.to_text().unwrap()).unwrap();
         assert_eq!(value["code"], "device-lost");
@@ -1224,6 +1252,7 @@ mod tests {
         for kind in ["started", "initial-stats", "pcm", "periodic-stats", "lag"] {
             let state = client_state();
             let blocks = state.blocks.clone();
+            let permits = state.client_permits.clone();
             let stall_at = match kind {
                 "started" => 1,
                 "initial-stats" => 2,
@@ -1233,6 +1262,7 @@ mod tests {
             let task = tokio::spawn(websocket_client(
                 sink,
                 reader,
+                state.client_permits.clone().try_acquire_owned().unwrap(),
                 state,
                 Duration::from_millis(10),
             ));
@@ -1269,6 +1299,11 @@ mod tests {
                 .unwrap();
             assert!(dropped.load(Ordering::SeqCst), "reader not reaped: {kind}");
             assert_eq!(blocks.receiver_count(), 0, "subscription retained: {kind}");
+            assert_eq!(
+                permits.available_permits(),
+                MAX_WEBSOCKET_CLIENTS,
+                "permit retained: {kind}"
+            );
         }
     }
 
@@ -1281,6 +1316,7 @@ mod tests {
             let task = tokio::spawn(websocket_client(
                 sink,
                 reader,
+                state.client_permits.clone().try_acquire_owned().unwrap(),
                 state,
                 Duration::from_secs(30),
             ));
@@ -1302,6 +1338,7 @@ mod tests {
         let slow = tokio::spawn(websocket_client(
             slow_sink,
             slow_reader,
+            state.client_permits.clone().try_acquire_owned().unwrap(),
             state.clone(),
             Duration::from_millis(10),
         ));
@@ -1310,6 +1347,7 @@ mod tests {
         let healthy = tokio::spawn(websocket_client(
             sink,
             reader,
+            state.client_permits.clone().try_acquire_owned().unwrap(),
             state.clone(),
             Duration::from_secs(1),
         ));
@@ -1333,6 +1371,167 @@ mod tests {
             .unwrap();
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(state.blocks.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_client_holds_permit_until_both_halves_are_dropped() {
+        let state = client_state();
+        let permits = state.client_permits.clone();
+        let blocks = state.blocks.clone();
+        let (sink, reader, mut messages, _close, dropped) = client_fixture(1);
+        let task = tokio::spawn(websocket_client(
+            sink,
+            reader,
+            permits.clone().try_acquire_owned().unwrap(),
+            state,
+            Duration::from_secs(30),
+        ));
+        fixture_message(&mut messages).await;
+        assert_eq!(permits.available_permits(), MAX_WEBSOCKET_CLIENTS - 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while permits.available_permits() != MAX_WEBSOCKET_CLIENTS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "reader retained after permit release"
+        );
+        assert_eq!(blocks.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_http_upgrade_releases_connection_permit() {
+        // Deliberately discard the 101 response after the production handler
+        // admits the request: Hyper cannot upgrade this connection.
+        async fn discard_upgrade(
+            ws: WebSocketUpgrade,
+            State(state): State<AppState>,
+            headers: HeaderMap,
+        ) -> axum::response::Response {
+            let response = ws_handler(ws, State(state), headers).await;
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            StatusCode::BAD_REQUEST.into_response()
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut state = client_state();
+        state.authority = addr.to_string();
+        let permits = state.client_permits.clone();
+        let blocks = state.blocks.clone();
+        let app = Router::new()
+            .route("/ws", get(discard_upgrade))
+            .with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for _ in 0..MAX_WEBSOCKET_CLIENTS + 1 {
+            let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert(header::ORIGIN, format!("http://{addr}").parse().unwrap());
+            match connect_async(request).await {
+                Err(WsError::Http(response)) => {
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST)
+                }
+                other => panic!("expected discarded upgrade, got {other:?}"),
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while permits.available_permits() != MAX_WEBSOCKET_CLIENTS {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(blocks.receiver_count(), 0);
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_client_limit_refuses_before_subscription_and_reopens_after_close() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut state = client_state();
+        state.authority = addr.to_string();
+        let blocks = state.blocks.clone();
+        let permits = state.client_permits.clone();
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let request = || {
+            let mut request = format!("ws://{addr}/ws").into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert(header::ORIGIN, format!("http://{addr}").parse().unwrap());
+            request
+        };
+        let mut sockets = Vec::new();
+        for _ in 0..MAX_WEBSOCKET_CLIENTS {
+            let (mut socket, _) = connect_async(request()).await.unwrap();
+            assert_eq!(
+                message_text_json(recv_ws_message(&mut socket).await)["type"],
+                "stream-started"
+            );
+            assert_eq!(
+                message_text_json(recv_ws_message(&mut socket).await)["type"],
+                "native-input-stats"
+            );
+            sockets.push(socket);
+        }
+        assert_eq!(blocks.receiver_count(), MAX_WEBSOCKET_CLIENTS);
+        for _ in 0..3 {
+            match connect_async(request()).await {
+                Err(WsError::Http(response)) => {
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE)
+                }
+                other => panic!("expected client-cap refusal, got {other:?}"),
+            }
+            assert_eq!(
+                blocks.receiver_count(),
+                MAX_WEBSOCKET_CLIENTS,
+                "refusal must not subscribe"
+            );
+        }
+        sockets.pop().unwrap().close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while blocks.receiver_count() != MAX_WEBSOCKET_CLIENTS - 1
+                || permits.available_permits() != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (mut replacement, _) = connect_async(request()).await.unwrap();
+        recv_ws_message(&mut replacement).await;
+        recv_ws_message(&mut replacement).await;
+        assert_eq!(blocks.receiver_count(), MAX_WEBSOCKET_CLIENTS);
+        blocks.send(test_block()).unwrap();
+        for socket in &mut sockets {
+            let message = recv_ws_message(socket).await;
+            let ClientMessage::Binary(payload) = message else {
+                panic!("expected healthy PCM")
+            };
+            assert_pcm_block(&payload, 1, 2);
+        }
+        drop(replacement);
+        drop(sockets);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while blocks.receiver_count() != 0
+                || permits.available_permits() != MAX_WEBSOCKET_CLIENTS
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
