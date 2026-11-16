@@ -144,21 +144,29 @@ test("transport close during queued Start excludes pre-session counters and newe
   assert.equal(manifest.nativeInputStats.stop.nativeDroppedBlocks, manifest.nativeInputStats.start.nativeDroppedBlocks);
 });
 
-test("page clears connectivity and exposes interrupted exports and retry", async (t) => {
-  const f = await appFixture(t);
-  f.stream();
-  f.worker.emit({ type: "recording-status", status: { state: "recording", sessionId: "fixture", recordedFrames: 6 } });
-  f.worker.emit({ type: "socket-state", state: "closed" });
-  f.worker.emit({ type: "recording-status", status: {
-    state: "interrupted", sessionId: "fixture", recordedFrames: 6, lastError: "Transport closed",
-  } });
-  assert.equal(f.elements.get("#record-state").textContent, "interrupted");
-  assert.equal(f.elements.get("#record-start").disabled, true);
-  assert.equal(f.elements.get("#monitor").disabled, true);
-  assert.equal(f.elements.get("#connect").disabled, false);
-  assert.equal(f.elements.get("#export-manifest").disabled, false);
-  assert.equal(f.elements.get("#export-wav").disabled, false);
-  assert.equal(f.elements.get("#wav-channel").disabled, false);
-  f.click("#connect");
-  assert.equal(f.worker.messages.at(-1).type, "connect");
-});
+for (const state of ["closed", "device-lost"]) {
+  test(`page clears ${state} connectivity and exposes interrupted exports and retry`, async (t) => {
+    const f = await appFixture(t);
+    f.stream();
+    f.worker.emit({ type: "recording-status", status: { state: "recording", sessionId: "fixture", recordedFrames: 6 } });
+    const monitor = f.click("#monitor");
+    f.contexts[0].load.resolve();
+    await monitor;
+    f.worker.emit({ type: "socket-state", state });
+    assert.equal(f.contexts[0].closes, 1);
+    assert.equal(f.nodes[0].disconnected, true);
+    f.worker.emit({ type: "recording-status", status: {
+      state: "interrupted", sessionId: "fixture", recordedFrames: 6, lastError: "Transport closed",
+    } });
+    assert.equal(f.elements.get("#record-state").textContent, "interrupted");
+    assert.equal(f.elements.get("#record-start").disabled, true);
+    assert.equal(f.elements.get("#monitor").disabled, true);
+    assert.equal(f.elements.get("#connect").disabled, false);
+    assert.equal(f.elements.get("#export-manifest").disabled, false);
+    assert.equal(f.elements.get("#export-wav").disabled, false);
+    assert.equal(f.elements.get("#wav-channel").disabled, false);
+    f.click("#connect");
+    assert.equal(f.worker.messages.at(-1).type, "connect");
+  });
+
+}

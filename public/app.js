@@ -417,7 +417,7 @@ function setSocketState(state) {
   socketStateValue = state;
   els.socketState.textContent = state;
   els.connect.textContent = state === "connecting" || state === "open" ? "Disconnect" : "Connect";
-  if (state === "closed" || state === "error") {
+  if (state === "closed" || state === "error" || state === "device-lost") {
     stopMonitor();
     sharedBuffer = null;
     stateView = null;

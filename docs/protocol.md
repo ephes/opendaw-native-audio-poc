@@ -41,7 +41,8 @@ capacity-one notification causes `stream-error` with `code: "device-lost"`, then
 ends client delivery. Every send retains its existing deadline. Later clients
 receive `device-lost` before stream-started; restart the input bridge and reconnect
 explicitly. The Worker closes its socket, refuses later PCM and interrupts the
-recorder exactly once through its lifecycle queue, draining admitted writes and
+recorder exactly once through its lifecycle queue; the page retires the monitor
+and enables Connect. Interruption drains admitted writes, while
 preserving committed chunks. This error is not a WebSocket lag sample. Per-channel browser meters are computed in the Worker from received PCM blocks rather than sent as JSON.
 
 `native-input-stats` is a cumulative backend observability event. It does not change the binary PCM block layout and older clients can ignore it. Fields:

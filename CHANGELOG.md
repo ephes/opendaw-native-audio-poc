@@ -6,7 +6,7 @@
 
 - Bound aggregate recovery metadata reads and retained block descriptions across all sessions; mark exhausted inventories incomplete and refuse exports/deletion while preserving files.
 
-- Propagate CPAL callback faults through a bounded retained notification to terminal `device-lost` delivery and recorder interruption, preserving committed audio and allowing explicit reconnect after bridge restart.
+- Propagate CPAL callback faults through a bounded retained notification to terminal `device-lost` delivery and recorder interruption, preserving committed audio, retiring the page monitor and allowing explicit reconnect after bridge restart.
 
 - Fence retired monitor messages and processor faults; close failed processors once and permit a fresh monitor retry, including faults during resume.
 
