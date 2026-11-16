@@ -351,3 +351,121 @@ test("Start refuses a catalog one byte short of the real first entry before crea
   assert.equal(recorder.session, null);
   assert.equal(recorder.state, "idle");
 });
+
+test("one metadata budget spans index, manifests and checkpoint block descriptions", async () => {
+  const { recorder, root } = fixture();
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.stop();
+  const first = recorder.session.sessionId;
+  // Independent synthetic sessions, each admitted in isolation.
+  for (const id of ["native-pcm-copy-a", "native-pcm-copy-b"]) {
+    for (const [name, bytes] of [...root.files]) {
+      if (!name.startsWith(`${first}-`)) continue;
+      root.files.set(name.replace(first, id), name.endsWith(".json")
+        ? encoder.encode(new TextDecoder().decode(bytes).replaceAll(first, id)) : bytes.slice());
+    }
+  }
+  const allBytes = [...root.files].filter(([name]) => name.endsWith(".json"))
+    .reduce((sum, [, bytes]) => sum + bytes.byteLength, 0);
+  // A lower injectable ceiling exercises the real scan with tiny fixtures.
+  recorder.recoveryMetadataMaxBytes = allBytes - 1;
+  const before = new Map([...root.files].map(([name, bytes]) => [name, bytes.slice()]));
+  let readBytes = 0;
+  const getHandle = root.getFileHandle.bind(root);
+  root.getFileHandle = async (name, options) => {
+    const handle = await getHandle(name, options);
+    const getFile = handle.getFile;
+    handle.getFile = async () => {
+      const file = await getFile();
+      const text = file.text.bind(file);
+      file.text = () => { readBytes += file.size; return text(); };
+      return file;
+    };
+    return handle;
+  };
+  const scan = await recorder.scanRecoverySessions();
+  assert.equal(scan.complete, false);
+  assert.equal(scan.inventoryComplete, true);
+  assert.match(scan.error, /metadata.*budget/i);
+  assert.ok(readBytes <= recorder.recoveryMetadataMaxBytes);
+  assert.deepEqual(new Set(scan.sessions.map((s) => s.sessionId)), new Set([first, "native-pcm-copy-a", "native-pcm-copy-b"]));
+  // Sessions read completely before exhaustion stay exportable; the rest are flagged.
+  const readable = scan.sessions.filter((s) => s.exportableWav);
+  const unread = scan.sessions.filter((s) => !s.exportableWav);
+  assert.equal(readable.length, 2);
+  assert.equal(unread.length, 1);
+  assert.ok(!unread[0].exportableManifest);
+  assert.match(unread[0].nonExportableReason, /metadata budget/i);
+  assert.deepEqual(root.files, before);
+  // Selected-session export uses a fresh budget, so the unread session is still recoverable.
+  const wav = await recorder.exportRecoveredSelectedChannelWav(unread[0].sessionId, 0);
+  assert.ok(wav.blob.size > 44);
+  // Deletion needs only the complete name inventory and frees budget for a full scan.
+  const afterDelete = await recorder.deleteRecoveredSession(readable[0].sessionId);
+  assert.ok([...root.files.keys()].every((name) => !name.startsWith(`${readable[0].sessionId}-`)));
+  assert.equal(afterDelete.complete, true);
+  assert.equal(afterDelete.sessions.length, 2);
+  assert.ok(afterDelete.sessions.every((s) => s.exportableWav));
+  for (const [name, bytes] of before) root.files.set(name, bytes.slice());
+  recorder.recoveryMetadataMaxBytes = allBytes + 3 * 256;
+  assert.equal((await recorder.scanRecoverySessions()).complete, true);
+  // Raw JSON fits; retained block-description accounting independently refuses.
+  recorder.recoveryMetadataMaxBytes = allBytes;
+  assert.equal((await recorder.scanRecoverySessions()).complete, false);
+  recorder.recoveryMetadataMaxBytes = 1;
+  await assert.rejects(recorder.exportRecoveredManifest(first), /metadata.*budget/i);
+});
+
+for (const target of ["manifest-sessionId", "manifest-chunks", "manifest-version", "index-version", "checkpoint-block"]) {
+  for (const reverse of [false, true]) {
+    for (const escaped of [false, true]) {
+      test(`ambiguous recovery ${target}, reverse=${reverse}, escaped=${escaped} preserves files`, async () => {
+        const { recorder, root } = fixture();
+        await recorder.start(stream);
+        await record(recorder);
+        await recorder.stop();
+        const id = recorder.session.sessionId;
+        const name = target.startsWith("manifest") ? `${id}-manifest.json`
+          : target.startsWith("index") ? INDEX : `${id}-chunk-00000.f32.json`;
+        const object = decode(root.files.get(name));
+        const key = target === "checkpoint-block" ? "frameStart" : target.split("-")[1];
+        const owner = target === "checkpoint-block" ? object.blocks[0] : object;
+        const actual = JSON.stringify(owner[key]);
+        const alternate = key === "sessionId" ? '"native-pcm-other"' : key === "chunks" ? '[{}]' : '99';
+        const spelling = escaped ? `"${key[0]}\\u${key.charCodeAt(1).toString(16).padStart(4, "0")}${key.slice(2)}"` : JSON.stringify(key);
+        const original = `${JSON.stringify(key)}:${actual}`;
+        const duplicate = `${spelling}:${alternate}`;
+        const raw = JSON.stringify(object).replace(original, reverse ? `${duplicate},${original}` : `${original},${duplicate}`);
+        root.files.set(name, encoder.encode(raw));
+        const before = new Map([...root.files].map(([name, bytes]) => [name, bytes.slice()]));
+        const scan = await recorder.scanRecoverySessions();
+        assert.equal(scan.complete, false);
+        assert.match(scan.error, /ambiguous|duplicate/i);
+        assert.ok(scan.sessions.every((s) => !s.exportableManifest && !s.exportableWav));
+        await assert.rejects(recorder.exportRecoveredManifest(id), /ambiguous|duplicate/i);
+        await assert.rejects(recorder.exportRecoveredSelectedChannelWav(id, 0), /ambiguous|duplicate/i);
+        await assert.rejects(recorder.deleteRecoveredSession(id), /ambiguous|duplicate/i);
+        assert.deepEqual(root.files, before);
+      });
+    }
+  }
+}
+
+test("unique escaped names and repeated names in separate objects retain existing metadata", async () => {
+  const { recorder, root } = fixture();
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.stop();
+  const id = recorder.session.sessionId;
+  const name = `${id}-manifest.json`;
+  const manifest = decode(root.files.get(name));
+  manifest.extension = { first: { key: '\\"{}[]: , "key":0' }, second: { key: "é🎵" } };
+  root.files.set(name, encoder.encode(JSON.stringify(manifest).replace('"version":', '"vers\\u0069on":')));
+  const before = new Map([...root.files].map(([name, bytes]) => [name, bytes.slice()]));
+  assert.equal((await recorder.scanRecoverySessions()).complete, true);
+  const exported = JSON.parse(await (await recorder.exportRecoveredManifest(id)).blob.text());
+  assert.deepEqual(exported.originalManifest.extension, manifest.extension);
+  assert.equal((await recorder.exportRecoveredSelectedChannelWav(id, 0)).blob.size, 52);
+  assert.deepEqual(root.files, before);
+});

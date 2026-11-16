@@ -18,7 +18,7 @@ function pcm(frameStart) {
   [0.25, -0.5, 0.75, -1].forEach((v, i) => view.setFloat32(16 + i * 4, v, true));
   return buffer;
 }
-for (const event of ["close", "error"]) {
+for (const event of ["close", "error", "device-lost"]) {
   test(`${event} interrupts recording once, flushes PCM and permits reconnect`, async (t) => {
     const root = memoryStorage();
     let chunkCloses = 0;
@@ -40,7 +40,12 @@ for (const event of ["close", "error"]) {
     const status = () => f.messages.filter((m) => m.type === "recording-status").at(-1)?.status;
     await until(() => status()?.state === "recording");
     for (const frame of [0, 2, 4]) f.socket.emit("message", pcm(frame));
-    f.socket.emit(event);
+    if (event === "device-lost") {
+      const fault = JSON.stringify({ type: "stream-error", code: "device-lost", message: "Input capture failed" });
+      f.socket.emit("message", fault);
+      f.socket.emit("message", fault);
+      f.socket.emit("message", pcm(6));
+    } else f.socket.emit(event);
     f.socket.emit("close"); f.socket.emit("error");
     assert.equal(new Int32Array(buffer)[STATE.CONNECTED], 0);
     // Reconnect before the queued interruption drains: counters/session ownership must survive.
@@ -139,21 +144,29 @@ test("transport close during queued Start excludes pre-session counters and newe
   assert.equal(manifest.nativeInputStats.stop.nativeDroppedBlocks, manifest.nativeInputStats.start.nativeDroppedBlocks);
 });
 
-test("page clears connectivity and exposes interrupted exports and retry", async (t) => {
-  const f = await appFixture(t);
-  f.stream();
-  f.worker.emit({ type: "recording-status", status: { state: "recording", sessionId: "fixture", recordedFrames: 6 } });
-  f.worker.emit({ type: "socket-state", state: "closed" });
-  f.worker.emit({ type: "recording-status", status: {
-    state: "interrupted", sessionId: "fixture", recordedFrames: 6, lastError: "Transport closed",
-  } });
-  assert.equal(f.elements.get("#record-state").textContent, "interrupted");
-  assert.equal(f.elements.get("#record-start").disabled, true);
-  assert.equal(f.elements.get("#monitor").disabled, true);
-  assert.equal(f.elements.get("#connect").disabled, false);
-  assert.equal(f.elements.get("#export-manifest").disabled, false);
-  assert.equal(f.elements.get("#export-wav").disabled, false);
-  assert.equal(f.elements.get("#wav-channel").disabled, false);
-  f.click("#connect");
-  assert.equal(f.worker.messages.at(-1).type, "connect");
-});
+for (const state of ["closed", "device-lost"]) {
+  test(`page clears ${state} connectivity and exposes interrupted exports and retry`, async (t) => {
+    const f = await appFixture(t);
+    f.stream();
+    f.worker.emit({ type: "recording-status", status: { state: "recording", sessionId: "fixture", recordedFrames: 6 } });
+    const monitor = f.click("#monitor");
+    f.contexts[0].load.resolve();
+    await monitor;
+    f.worker.emit({ type: "socket-state", state });
+    assert.equal(f.contexts[0].closes, 1);
+    assert.equal(f.nodes[0].disconnected, true);
+    f.worker.emit({ type: "recording-status", status: {
+      state: "interrupted", sessionId: "fixture", recordedFrames: 6, lastError: "Transport closed",
+    } });
+    assert.equal(f.elements.get("#record-state").textContent, "interrupted");
+    assert.equal(f.elements.get("#record-start").disabled, true);
+    assert.equal(f.elements.get("#monitor").disabled, true);
+    assert.equal(f.elements.get("#connect").disabled, false);
+    assert.equal(f.elements.get("#export-manifest").disabled, false);
+    assert.equal(f.elements.get("#export-wav").disabled, false);
+    assert.equal(f.elements.get("#wav-channel").disabled, false);
+    f.click("#connect");
+    assert.equal(f.worker.messages.at(-1).type, "connect");
+  });
+
+}

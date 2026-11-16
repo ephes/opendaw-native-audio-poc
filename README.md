@@ -170,7 +170,9 @@ just inspect-recording ./native-pcm-...-manifest.json
 
 The inspector checks the manifest stream shape, continuity arrays, chunk/block frame and byte math, top-level frame/block totals, and native input drop deltas. It fails on gaps, overlaps, discontinuities, channel mismatches, invalid blocks, malformed chunk metadata, fatal recovery warnings, and native dropped callback buffers/frames/events when the zero-drop expectation is enabled. It reports monitor underruns/overflows, WebSocket lag events, monitor counter resets, and write-backlog high-water counters as warnings because those are browser/monitor observability signals rather than direct proof of native input loss.
 
-Monitor startup shares one owned attempt while the worklet module loads and audio resumes. Disconnect or stream replacement cancels publication and closes that attempt; load/resume failures show an error and enable Start Monitor for retry.
+Monitor startup shares one owned attempt while the worklet module loads and audio resumes. Disconnect or stream replacement cancels publication and closes that attempt; load/resume failures show an error and enable Start Monitor for retry. Each node owns its message and processor-fault listeners; retirement detaches them and ignores already queued stale callbacks. A current `processorerror` closes the failed monitor once and enables Start Monitor for retry, including faults during resume. Recording capture remains independent.
+
+A CPAL capture callback error publishes one retained `device-lost` notification. Connected clients stop receiving PCM, the page retires its monitor, and the Worker drains queued recording writes into an `interrupted` manifest, preserving committed audio for recovery/export without a clean stop. Duplicate errors and late socket data cannot finalize twice. Restart the input bridge after device failure, then explicitly Connect again; clients of the still-failed bridge receive the same terminal error. This is covered with synthetic callback/control/recorder fixtures, not hardware acceptance.
 
 WebSocket reconnects supersede the previous connection. Only the current socket may publish connection state, stream configuration, native input stats, errors, or PCM; delayed events from an old socket are ignored.
 
@@ -328,6 +330,28 @@ After a reload, tab close, or browser failure before Stop Recording, reopen the 
 A failed chunk close ends the recording in `error` with no `stoppedAt`. The incomplete chunk keeps a null `completedAt`, a `closeError`, and its in-memory writable until explicit cleanup. The error manifest preserves earlier closed chunks. After reload, recovery excludes the failed chunk with a `chunk-close-failed` warning and can export the earlier committed chunks; it never labels the session a clean stop. The offline inspector rejects a live manifest containing `closeError` chunks.
 
 Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, native input stats from the original manifest when present, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing native input stats in an older manifest, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
+
+OPFS index, manifest and checkpoint JSON must have unique object member names at
+every depth. Admission checks raw names before decoding, so escaped-equivalent
+names (for example `sessionId` and `sess\u0069onId`) are duplicates too. Ambiguous
+metadata marks discovery incomplete and refuses recovery manifest/WAV export and
+deletion; the index stays read-only. Preserve the original files for manual repair
+or compatible tooling. Unique historical metadata is admitted without rewriting;
+the same name in separate objects is valid.
+
+Every scan and selected-session recovery export shares one 256 MiB metadata
+budget across the index, manifests and checkpoint sidecars. Each file's UTF-8
+byte size is charged before reading text; each admitted block description also
+costs 256 accounting bytes before retention/reconstruction. This is a conservative
+work/retention allowance, not a browser heap-size guarantee. Per-file and depth
+limits still apply. Exhaustion marks the scan incomplete and stops further metadata
+reads; saved files are preserved. Sessions read completely before exhaustion keep
+their export verdict. Later sessions are still listed from their artifact names
+(no metadata text is read) and flagged as not exportable from that scan.
+Deletion relies only on the complete name inventory (ambiguous metadata still
+refuses it), so deleting sessions frees budget for a complete scan. Selected-session
+exports use a fresh budget and can recover an individual session when a full
+multi-session scan exceeds its total budget.
 
 Recovery exports enumerate bounded artifact names, then read only the selected session’s manifest, sidecars and chunks plus the shared index. They preserve unmanifested tail discovery, reject cross-session manifest chunk references, and recheck chunk size during export. An incomplete name inventory refuses export; listing/reconciliation still rebuilds every discovered session.
 

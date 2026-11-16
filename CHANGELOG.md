@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Refuse duplicate persisted JSON object names, including escaped equivalents, before recovery decoding; keep ambiguous inventories incomplete and preserve original files without export/deletion authorization.
+
+- Bound aggregate recovery metadata reads and retained block descriptions across all sessions; mark exhausted inventories incomplete while preserving files. Sessions read before exhaustion stay exportable, later sessions are listed from names only, and deletion (which needs only the name inventory) remains possible to free budget.
+
+- Propagate CPAL callback faults through a bounded retained notification to terminal `device-lost` delivery and recorder interruption, preserving committed audio, retiring the page monitor and allowing explicit reconnect after bridge restart.
+
+- Fence retired monitor messages and processor faults; close failed processors once and permit a fresh monitor retry, including faults during resume.
+
 - Retire crashed/message-corrupt Workers and monitors once, release pending UI controls, ignore stale messages and offer a fresh OPFS recovery scan.
 - Add opt-in `just smoke-opfs-recovery`: kill synthetic recording Workers at real PCM/sidecar/manifest publication barriers, verify trusted metadata prefix, preserved audio/writer release, and a corruption negative control. No new CI jobs.
 

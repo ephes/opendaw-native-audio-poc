@@ -12,6 +12,8 @@ const EVENT_SAMPLE_LIMIT = 32;
 const INDEX_JSON_MAX_BYTES = 16 * 1024 * 1024;
 const MANIFEST_JSON_MAX_BYTES = 256 * 1024 * 1024;
 const CHUNK_METADATA_JSON_MAX_BYTES = 64 * 1024 * 1024;
+const RECOVERY_METADATA_MAX_BYTES = 256 * 1024 * 1024;
+const RETAINED_BLOCK_METADATA_BYTES = 256;
 const JSON_MAX_DEPTH = 16;
 const MAX_INDEX_SESSIONS = 10_000;
 const MAX_RECOVERY_CHUNKS = 10_000;
@@ -29,6 +31,7 @@ export class PcmRecorder {
   constructor({ readCounters, postMessage }) {
     this.readCounters = readCounters;
     this.postMessage = postMessage;
+    this.recoveryMetadataMaxBytes = RECOVERY_METADATA_MAX_BYTES;
     this.root = null;
     this.session = null;
     this.currentChunk = null;
@@ -520,15 +523,21 @@ export class PcmRecorder {
 
     this.root = this.root ?? (await this.openStorageRoot());
     const scannedAt = new Date().toISOString();
-    const { index, warnings: indexWarnings } = await this.readIndex();
+    const metadataBudget = { remaining: this.recoveryMetadataMaxBytes, exhausted: false };
+    const { index, warnings: indexWarnings } = await this.readIndex(metadataBudget);
     const artifacts = await listRecordingArtifacts(this.root, Object.keys(index.sessions));
     const { sessionIds } = artifacts;
     const scanWarnings = [...indexWarnings, ...artifacts.warnings];
 
     const sessions = [];
+    const exhaustedMessage =
+      "Recovery metadata budget exceeded before this session was fully read; export it individually or delete other sessions";
     for (const sessionId of sessionIds) {
+      // After exhaustion every metadata read is refused before its text is read,
+      // so later sessions are still listed (for deletion) from names alone.
       const session = await buildRecoveredSession({
         root: this.root,
+        metadataBudget,
         sessionId,
         indexEntry: index.sessions[sessionId] ?? null,
         manifestFileName: artifacts.manifests.get(sessionId) ?? null,
@@ -541,13 +550,26 @@ export class PcmRecorder {
         scanWarnings: artifacts.warnings,
       });
       session.artifactFileNames = artifacts.fileNames.get(sessionId) ?? [];
+      // Sessions admitted completely before exhaustion keep their own verdict.
+      if (metadataBudget.exhausted && !metadataBudget.ambiguous) markRecoveredSessionIncomplete(session, exhaustedMessage);
       sessions.push(session);
     }
 
+    if (metadataBudget.ambiguous) {
+      const message = "Recovery scan incomplete: ambiguous JSON object members; export and deletion refused";
+      scanWarnings.push(message);
+      for (const session of sessions) markRecoveredSessionIncomplete(session, message);
+    } else if (metadataBudget.exhausted) {
+      scanWarnings.push(
+        "Recovery scan incomplete: total metadata budget exceeded; sessions not fully read cannot be exported from this scan. Deleting sessions frees budget",
+      );
+    }
     sessions.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
     return {
       available: true,
-      complete: artifacts.complete,
+      complete: artifacts.complete && !metadataBudget.exhausted && !metadataBudget.ambiguous,
+      // Deletion needs only the exact name inventory; mutateIndex re-reads the index.
+      inventoryComplete: artifacts.complete && !metadataBudget.ambiguous,
       warnings: scanWarnings,
       error: scanWarnings.join("; "),
       scannedAt,
@@ -673,7 +695,7 @@ export class PcmRecorder {
     }
     this.root = this.root ?? (await this.openStorageRoot());
     const scan = await this.scanRecoverySessions();
-    if (!scan.complete) {
+    if (!scan.inventoryComplete) {
       throw new Error(scan.error || "Recovery inventory is incomplete; deletion refused");
     }
     const session = scan.sessions.find((entry) => entry.sessionId === sessionId);
@@ -708,7 +730,9 @@ export class PcmRecorder {
     }
     this.root = this.root ?? (await this.openStorageRoot());
     const root = this.root;
-    const { index, warnings } = await this.readIndex();
+    const metadataBudget = { remaining: this.recoveryMetadataMaxBytes, exhausted: false };
+    const { index, warnings } = await this.readIndex(metadataBudget);
+    assertRecoveryMetadataComplete(metadataBudget);
     const indexed = Object.hasOwn(index.sessions, sessionId);
     // OPFS has no prefix query: enumerate bounded names, but read only the
     // requested session's exact artifacts, including unmanifested tail chunks.
@@ -717,8 +741,9 @@ export class PcmRecorder {
     if (!artifacts.sessionIds.has(sessionId)) {
       throw new Error(`Recovered session ${sessionId} was not found`);
     }
-    return buildRecoveredSession({
+    const session = await buildRecoveredSession({
       root,
+      metadataBudget,
       sessionId,
       indexEntry: indexed ? index.sessions[sessionId] : null,
       manifestFileName: artifacts.manifests.get(sessionId) ?? null,
@@ -729,6 +754,8 @@ export class PcmRecorder {
       activeSessionHasOpenChunk: Boolean(this.currentChunk),
       indexWarnings: warnings,
     });
+    assertRecoveryMetadataComplete(metadataBudget);
+    return session;
   }
 
   status() {
@@ -1096,7 +1123,7 @@ export class PcmRecorder {
     return this.session.manifestFileName ?? `${this.session.sessionId}-manifest.json`;
   }
 
-  async readIndex() {
+  async readIndex(metadataBudget = null) {
     const warnings = [];
     const emptyIndex = () => ({
       type: "opendaw-native-audio-poc-recording-index",
@@ -1118,7 +1145,7 @@ export class PcmRecorder {
         }
         throw error;
       }
-      const parsed = await readBudgetedJson(handle, { maxBytes: INDEX_JSON_MAX_BYTES, label: INDEX_FILE_NAME });
+      const parsed = await readBudgetedJson(handle, { maxBytes: INDEX_JSON_MAX_BYTES, label: INDEX_FILE_NAME, metadataBudget });
       if (
         !parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
         !parsed.sessions || typeof parsed.sessions !== "object" || Array.isArray(parsed.sessions)
@@ -1320,14 +1347,84 @@ function cloneNativeInputStatsRecord(record) {
   };
 }
 
-async function readBudgetedJson(handle, { maxBytes, label }) {
+async function readBudgetedJson(handle, { maxBytes, label, metadataBudget = null }) {
   const file = await handle.getFile();
   if (!Number.isSafeInteger(file.size) || file.size > maxBytes) {
     throw new Error(`${label} is ${formatBytes(file.size)}, above the ${formatBytes(maxBytes)} recovery budget`);
   }
-  const value = JSON.parse(await file.text());
+  chargeRecoveryMetadata(metadataBudget, file.size);
+  const text = await file.text();
+  try {
+    admitUniqueJsonMembers(text, label);
+  } catch (error) {
+    if (metadataBudget && error.code === "ambiguous-recovery-json") metadataBudget.ambiguous = true;
+    throw error;
+  }
+  const value = JSON.parse(text);
   assertJsonDepth(value, JSON_MAX_DEPTH, label);
+  // Charge expanded block descriptions before retaining/reconstructing sessions.
+  const chunks = Array.isArray(value?.chunks) ? value.chunks : [];
+  const blocks = (Array.isArray(value?.blocks) ? value.blocks.length : 0) +
+    chunks.reduce((sum, chunk) => sum + (Array.isArray(chunk?.blocks) ? chunk.blocks.length : 0), 0);
+  chargeRecoveryMetadata(metadataBudget, blocks * RETAINED_BLOCK_METADATA_BYTES);
   return value;
+}
+
+function markRecoveredSessionIncomplete(session, message) {
+  session.exportableManifest = false;
+  session.exportableWav = false;
+  session.nonExportableReason = message;
+  session.warnings.push({ code: "scan-incomplete", message, fatal: true });
+}
+
+function assertRecoveryMetadataComplete(budget) {
+  if (budget.ambiguous) throw new Error("Recovery JSON has ambiguous object members; export refused");
+  if (budget.exhausted) throw new Error("Recovery metadata budget exceeded; export refused");
+}
+
+// Admission only: JSON.parse remains the grammar/value decoder. Walk raw tokens
+// first so duplicate names cannot disappear, and decode names with JSON.parse
+// itself to treat escaped-equivalent spellings identically. State is scoped to
+// live containers; equal names in different objects remain valid.
+function admitUniqueJsonMembers(text, label) {
+  const containers = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === "{" || char === "[") {
+      if (containers.length >= JSON_MAX_DEPTH) throw new Error(`${label} nests deeper than ${JSON_MAX_DEPTH} levels`);
+      containers.push(char === "{" ? new Set() : null);
+    } else if (char === "}" || char === "]") {
+      containers.pop();
+    } else if (char === '"') {
+      const start = i;
+      for (i += 1; i < text.length; i += 1) {
+        if (text[i] === "\\") i += 1;
+        else if (text[i] === '"') break;
+      }
+      if (i >= text.length) throw new SyntaxError("Unterminated recovery JSON string");
+      let next = i + 1;
+      while (/[ \t\r\n]/.test(text[next] ?? "") && next < text.length) next += 1;
+      const keys = containers.at(-1);
+      if (keys && text[next] === ":") {
+        const key = JSON.parse(text.slice(start, i + 1));
+        if (keys.has(key)) {
+          const error = new Error("Recovery JSON contains duplicate object members");
+          error.code = "ambiguous-recovery-json";
+          throw error;
+        }
+        keys.add(key);
+      }
+    }
+  }
+}
+
+function chargeRecoveryMetadata(budget, bytes) {
+  if (!budget) return;
+  if (budget.exhausted || bytes > budget.remaining) {
+    budget.exhausted = true;
+    throw new Error("Recovery total metadata budget exceeded");
+  }
+  budget.remaining -= bytes;
 }
 
 function assertJsonDepth(value, maxDepth, label) {
@@ -1348,7 +1445,7 @@ function assertJsonDepth(value, maxDepth, label) {
   }
 }
 
-async function readCheckpointChunkMetadata(root, sessionId, chunkMetadata) {
+async function readCheckpointChunkMetadata(root, sessionId, chunkMetadata, metadataBudget) {
   if (!chunkMetadata || typeof chunkMetadata !== "object") {
     throw new Error("Invalid chunk metadata checkpoint");
   }
@@ -1361,6 +1458,7 @@ async function readCheckpointChunkMetadata(root, sessionId, chunkMetadata) {
     const fileName = `${sessionId}-chunk-${String(index).padStart(5, "0")}.f32`;
     const metadataHandle = await root.getFileHandle(`${fileName}.json`);
     const metadata = await readBudgetedJson(metadataHandle, {
+      metadataBudget,
       maxBytes: CHUNK_METADATA_JSON_MAX_BYTES,
       label: `${fileName}.json`,
     });
@@ -1512,6 +1610,7 @@ async function listRecordingArtifacts(root, indexedSessionIds = [], targetSessio
 
 async function buildRecoveredSession({
   root,
+  metadataBudget,
   sessionId,
   indexEntry,
   manifestFileName,
@@ -1533,7 +1632,7 @@ async function buildRecoveredSession({
   if (manifestFileName) {
     try {
       const handle = await root.getFileHandle(manifestFileName);
-      const parsed = await readBudgetedJson(handle, { maxBytes: MANIFEST_JSON_MAX_BYTES, label: manifestFileName });
+      const parsed = await readBudgetedJson(handle, { maxBytes: MANIFEST_JSON_MAX_BYTES, label: manifestFileName, metadataBudget });
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error("manifest is not a JSON object");
       }
@@ -1558,7 +1657,7 @@ async function buildRecoveredSession({
   if (manifest?.chunkMetadata) {
     try {
       const inlineChunks = Array.isArray(manifest.chunks) ? manifest.chunks : [];
-      const committedChunks = await readCheckpointChunkMetadata(root, sessionId, manifest.chunkMetadata);
+      const committedChunks = await readCheckpointChunkMetadata(root, sessionId, manifest.chunkMetadata, metadataBudget);
       if (committedChunks.length + inlineChunks.length > MAX_RECOVERY_CHUNKS) {
         throw new Error(`more than ${MAX_RECOVERY_CHUNKS} chunks are referenced`);
       }

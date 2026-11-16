@@ -29,7 +29,7 @@ use futures_util::{Sink, SinkExt, Stream as MessageStream, StreamExt};
 use serde::Serialize;
 use tokio::{
     net::TcpListener,
-    sync::broadcast,
+    sync::{broadcast, watch},
     task::{JoinHandle, JoinSet},
     time::{Instant, MissedTickBehavior},
 };
@@ -91,6 +91,7 @@ struct AppState {
     stream_info: StreamStarted,
     blocks: broadcast::Sender<Arc<AudioBlock>>,
     native_stats: Arc<NativeInputStats>,
+    capture_fault: watch::Receiver<bool>,
 }
 
 struct SourceRuntime {
@@ -316,6 +317,7 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
         sample_format: "f32-interleaved",
     };
 
+    let (capture_fault_tx, capture_fault) = watch::channel(false);
     let mut source_runtime = SourceRuntime {
         input_stream: None,
         sine_task: None,
@@ -333,6 +335,7 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
                 args.clone(),
                 block_tx.clone(),
                 native_stats.clone(),
+                capture_fault_tx,
             )?);
         }
     };
@@ -342,6 +345,7 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
         stream_info,
         blocks: block_tx,
         native_stats,
+        capture_fault,
     };
     let public_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("public");
     let app = Router::new()
@@ -473,6 +477,11 @@ async fn send_stream<S: Sink<Message> + Unpin>(
     state: &AppState,
     deadline: Duration,
 ) {
+    let mut fault = state.capture_fault.clone();
+    if *fault.borrow() {
+        send_device_lost(&mut sender, deadline).await;
+        return;
+    }
     let Ok(started) = serde_json::to_string(&state.stream_info) else {
         return;
     };
@@ -486,8 +495,17 @@ async fn send_stream<S: Sink<Message> + Unpin>(
         NATIVE_STATS_INTERVAL,
     );
     stats_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut fault_closed = false;
     loop {
+        if *fault.borrow() {
+            send_device_lost(&mut sender, deadline).await;
+            return;
+        }
         tokio::select! {
+            biased;
+            changed = fault.changed(), if !fault_closed => {
+                fault_closed = changed.is_err();
+            }
             _ = stats_interval.tick() => {
                 if !send_native_stats(&mut sender, &state.native_stats, deadline).await {
                     break;
@@ -516,6 +534,17 @@ async fn send_stream<S: Sink<Message> + Unpin>(
                 }
             }
         }
+    }
+}
+
+async fn send_device_lost<S: Sink<Message> + Unpin>(sender: &mut S, deadline: Duration) {
+    let error = StreamError {
+        event_type: "stream-error",
+        code: "device-lost",
+        message: "Native input capture failed; restart the input bridge and reconnect".into(),
+    };
+    if let Ok(json) = serde_json::to_string(&error) {
+        send_with_deadline(sender, Message::Text(json.into()), deadline).await;
     }
 }
 
@@ -607,6 +636,7 @@ fn start_input_source(
     args: ServeArgs,
     block_tx: broadcast::Sender<Arc<AudioBlock>>,
     native_stats: Arc<NativeInputStats>,
+    capture_fault: watch::Sender<bool>,
 ) -> Result<Stream> {
     let host = cpal::default_host();
     let device = select_input_device(&host, args.device.as_deref())?;
@@ -628,6 +658,7 @@ fn start_input_source(
         std::sync::mpsc::sync_channel::<Vec<f32>>(INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS);
     let err_fn = move |error| {
         eprintln!("Input stream error: {error}");
+        note_capture_failure(&capture_fault);
     };
 
     // First-slice callback path: allocation is acceptable for this PoC, but it is
@@ -694,6 +725,18 @@ fn start_input_source(
     });
 
     Ok(stream)
+}
+
+// A retained, capacity-one notification: callback storms cannot queue work and
+// clients connecting after failure observe the same terminal capture generation.
+fn note_capture_failure(fault: &watch::Sender<bool>) {
+    fault.send_if_modified(|failed| {
+        if *failed {
+            return false;
+        }
+        *failed = true;
+        true
+    });
 }
 
 fn send_input_samples(
@@ -1114,6 +1157,7 @@ mod tests {
             },
             blocks: broadcast::channel(1).0,
             native_stats: Arc::new(NativeInputStats::new(Source::Sine, 0)),
+            capture_fault: watch::channel(false).1,
         }
     }
 
@@ -1133,6 +1177,46 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capture_failure_is_terminal_for_current_and_future_clients() {
+        let mut state = client_state();
+        let (fault, receiver) = watch::channel(false);
+        state.capture_fault = receiver;
+        let (sink, reader, mut messages, _close, dropped) = client_fixture(0);
+        let task = tokio::spawn(websocket_client(
+            sink,
+            reader,
+            state.clone(),
+            Duration::from_secs(1),
+        ));
+        fixture_message(&mut messages).await;
+        fixture_message(&mut messages).await;
+        state.blocks.send(test_block()).unwrap();
+        assert!(matches!(
+            fixture_message(&mut messages).await,
+            Message::Binary(_)
+        ));
+        note_capture_failure(&fault);
+        note_capture_failure(&fault);
+        let message = fixture_message(&mut messages).await;
+        let value: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+        assert_eq!(value["code"], "device-lost");
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(state.blocks.receiver_count(), 0);
+        assert!(messages.try_recv().is_err());
+        let (sink, reader, mut messages, _close, dropped) = client_fixture(0);
+        websocket_client(sink, reader, state, Duration::from_secs(1)).await;
+        let value: Value =
+            serde_json::from_str(fixture_message(&mut messages).await.to_text().unwrap()).unwrap();
+        assert_eq!(value["code"], "device-lost");
+        assert!(messages.try_recv().is_err());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

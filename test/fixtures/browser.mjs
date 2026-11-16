@@ -59,8 +59,14 @@ export async function appFixture(t) {
   class Node {
     disconnected = false;
     messages = [];
+    handlers = new Map();
+    portHandlers = new Map();
+    addEventListener(type, handler) { this.handlers.set(type, handler); }
+    removeEventListener(type, handler) { if (this.handlers.get(type) === handler) this.handlers.delete(type); }
     port = {
-      addEventListener() {}, start() {},
+      addEventListener: (type, handler) => this.portHandlers.set(type, handler),
+      removeEventListener: (type, handler) => { if (this.portHandlers.get(type) === handler) this.portHandlers.delete(type); },
+      start() {},
       postMessage: (message) => this.messages.push(message),
     };
     constructor(context) { this.context = context; nodes.push(this); }
