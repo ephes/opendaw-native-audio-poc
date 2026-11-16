@@ -227,3 +227,8 @@ maps keyed by array name; totals remain exact and omissions equal total minus
 retained samples. Status and offline inspection use totals. Historical manifests
 without these maps still use array lengths. Recovery exports preserve integrity
 samples and totals; any retained integrity failure still fails inspection.
+
+Monitor port status and counter-reset messages are admitted only from the current
+monitor attempt. Retiring an attempt detaches its listeners; queued old callbacks
+cannot rebaseline recording counters. A current `processorerror` retires the
+monitor/context once and exposes Start Monitor for retry without ending capture.

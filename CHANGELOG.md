@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fence retired monitor messages and processor faults; close failed processors once and permit a fresh monitor retry, including faults during resume.
+
 - Retire crashed/message-corrupt Workers and monitors once, release pending UI controls, ignore stale messages and offer a fresh OPFS recovery scan.
 - Add opt-in `just smoke-opfs-recovery`: kill synthetic recording Workers at real PCM/sidecar/manifest publication barriers, verify trusted metadata prefix, preserved audio/writer release, and a corruption negative control. No new CI jobs.
 

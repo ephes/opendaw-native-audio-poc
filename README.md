@@ -170,7 +170,7 @@ just inspect-recording ./native-pcm-...-manifest.json
 
 The inspector checks the manifest stream shape, continuity arrays, chunk/block frame and byte math, top-level frame/block totals, and native input drop deltas. It fails on gaps, overlaps, discontinuities, channel mismatches, invalid blocks, malformed chunk metadata, fatal recovery warnings, and native dropped callback buffers/frames/events when the zero-drop expectation is enabled. It reports monitor underruns/overflows, WebSocket lag events, monitor counter resets, and write-backlog high-water counters as warnings because those are browser/monitor observability signals rather than direct proof of native input loss.
 
-Monitor startup shares one owned attempt while the worklet module loads and audio resumes. Disconnect or stream replacement cancels publication and closes that attempt; load/resume failures show an error and enable Start Monitor for retry.
+Monitor startup shares one owned attempt while the worklet module loads and audio resumes. Disconnect or stream replacement cancels publication and closes that attempt; load/resume failures show an error and enable Start Monitor for retry. Each node owns its message and processor-fault listeners; retirement detaches them and ignores already queued stale callbacks. A current `processorerror` closes the failed monitor once and enables Start Monitor for retry, including faults during resume. Recording capture remains independent.
 
 WebSocket reconnects supersede the previous connection. Only the current socket may publish connection state, stream configuration, native input stats, errors, or PCM; delayed events from an old socket are ignored.
 

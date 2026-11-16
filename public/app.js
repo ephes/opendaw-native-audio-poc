@@ -216,7 +216,11 @@ function ensureWorker() {
 function releaseMonitor(attempt) {
   if (!attempt || attempt.closed) return;
   attempt.closed = true;
-  attempt.node?.disconnect();
+  if (attempt.node) {
+    attempt.node.port.removeEventListener("message", attempt.onMessage);
+    attempt.node.removeEventListener("processorerror", attempt.onFault);
+    attempt.node.disconnect();
+  }
   if (attempt.context && attempt.context.state !== "closed") {
     attempt.context.close().catch(() => {});
   }
@@ -250,7 +254,17 @@ function startMonitor() {
         outputChannelCount: [2],
       });
       attempt.node = node;
-      node.port.addEventListener("message", handleWorkletMessage);
+      attempt.onMessage = (event) => {
+        if (current()) handleWorkletMessage(event);
+      };
+      attempt.onFault = () => {
+        if (!current()) return;
+        stopMonitor();
+        els.streamSummary.textContent = "Monitor processor failed; Start Monitor to retry";
+        els.monitor.disabled = !sharedBuffer;
+      };
+      node.port.addEventListener("message", attempt.onMessage);
+      node.addEventListener("processorerror", attempt.onFault);
       node.port.start();
       node.connect(context.destination);
       node.port.postMessage({

@@ -99,3 +99,64 @@ test("channel selection during resume reaches the owned node", async (t) => {
   resume.resolve();
   await result;
 });
+
+async function monitor(f) {
+  const start = f.click("#monitor");
+  f.contexts.at(-1).load.resolve();
+  await start;
+  await settle();
+  return f.nodes.at(-1);
+}
+
+test("retired worklet messages cannot rebaseline the replacement recording", async (t) => {
+  const f = await appFixture(t);
+  f.stream();
+  const old = await monitor(f);
+  const late = old.portHandlers.get("message");
+  f.stream();
+  const current = await monitor(f);
+  const before = f.worker.messages.length;
+  late({ data: { type: "status" } });
+  late({ data: { type: "counters-reset" } });
+  assert.equal(f.worker.messages.length, before);
+  assert.equal(old.portHandlers.size, 0);
+  current.portHandlers.get("message")({ data: { type: "counters-reset" } });
+  assert.equal(f.worker.messages.at(-1).type, "recording-counters-reset");
+});
+
+test("processor fault releases once, permits retry and fences retired faults", async (t) => {
+  const f = await appFixture(t);
+  f.stream();
+  const old = await monitor(f);
+  const fault = old.handlers.get("processorerror");
+  assert.equal(typeof fault, "function");
+  fault(); fault();
+  assert.equal(old.context.closes, 1);
+  assert.equal(old.disconnected, true);
+  assert.equal(old.handlers.size, 0);
+  assert.equal(old.portHandlers.size, 0);
+  assert.equal(f.elements.get("#monitor").disabled, false);
+  assert.match(f.elements.get("#stream-summary").textContent, /processor.*failed/i);
+  const current = await monitor(f);
+  fault();
+  assert.equal(current.context.closes, 0);
+  assert.equal(f.elements.get("#monitor").textContent, "Monitoring");
+});
+
+test("processor fault during resume cannot publish failed monitor", async (t) => {
+  const f = await appFixture(t);
+  f.stream();
+  const resume = deferred();
+  const start = f.click("#monitor");
+  f.contexts[0].resumeResult = resume.promise;
+  f.contexts[0].load.resolve();
+  await settle();
+  const fault = f.nodes[0].handlers.get("processorerror");
+  assert.equal(typeof fault, "function");
+  fault();
+  resume.resolve();
+  await start;
+  assert.equal(f.elements.get("#monitor").textContent, "Start Monitor");
+  assert.equal(f.elements.get("#monitor").disabled, false);
+  assert.equal(f.contexts[0].closes, 1);
+});
