@@ -615,7 +615,7 @@ function updateRecoveryControls(session = selectedRecoverySession()) {
   els.recoverySession.disabled = !(recoveryResult?.sessions?.length) || recoveryScanPending;
   els.recoveryRefresh.disabled = recoveryScanPending;
   els.recoveryExportManifest.disabled =
-    !canUseSelected || exportPending || recordingActive || selectedActive || selectedOpenInMemory || recoveryScanPending;
+    !canUseSelected || session.exportableManifest === false || exportPending || recordingActive || selectedActive || selectedOpenInMemory || recoveryScanPending;
   els.recoveryExportWav.disabled =
     !canUseSelected ||
     exportPending ||
@@ -632,7 +632,7 @@ function updateRecoveryControls(session = selectedRecoverySession()) {
     selectedOpenInMemory ||
     !session.exportableWav ||
     recoveryScanPending;
-  els.recoveryDelete.disabled = !canUseSelected || selectedActive || recoveryScanPending;
+  els.recoveryDelete.disabled = !canUseSelected || session.metadataReadOnly === true || selectedActive || recoveryScanPending;
 }
 
 function recoveryMetric(label, value) {

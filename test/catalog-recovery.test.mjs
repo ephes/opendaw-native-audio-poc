@@ -34,7 +34,9 @@ for (const failure of ["malformed", "shape", "read", "permission", "getFile-not-
     const id = "native-pcm-saved";
     const bytes = encoder.encode(failure === "malformed" ? "{truncated" : failure === "shape" ? '{"sessions":[]}' : JSON.stringify(catalog({ [id]: {} })));
     root.files.set(INDEX, bytes);
-    root.files.set(`${id}-manifest.json`, encoder.encode("{}"));
+    root.files.set(`${id}-manifest.json`, encoder.encode(JSON.stringify({
+      type: "opendaw-native-audio-poc-recording", version: 1, sessionId: id,
+    })));
     const getHandle = root.getFileHandle.bind(root);
     root.getFileHandle = async (name, options) => {
       if (name === INDEX && !["malformed", "shape"].includes(failure) && !options?.create) {
@@ -469,3 +471,25 @@ test("unique escaped names and repeated names in separate objects retain existin
   assert.equal((await recorder.exportRecoveredSelectedChannelWav(id, 0)).blob.size, 52);
   assert.deepEqual(root.files, before);
 });
+
+for (const change of [{ version: 999 }, { version: 1.5 }, { type: "foreign-recording" }, { sessionId: "native-pcm-foreign" }]) {
+  test(`recovery retains read-only artifacts with incompatible manifest ${JSON.stringify(change)}`, async () => {
+    const { recorder, root } = fixture();
+    await recorder.start(stream); await record(recorder); await recorder.stop();
+    const id = recorder.session.sessionId;
+    const name = `${id}-manifest.json`;
+    const original = decode(root.files.get(name));
+    root.files.set(name, encoder.encode(JSON.stringify({ ...original, ...change })));
+    const before = new Map([...root.files].map(([name, bytes]) => [name, bytes.slice()]));
+    const scan = await recorder.scanRecoverySessions();
+    const session = scan.sessions.find(s => s.sessionId === id);
+    assert.ok(session);
+    assert.equal(session.exportableWav, false);
+    assert.equal(session.exportableManifest, false);
+    assert.ok(session.warnings.some(w => w.code === "manifest-contract-error" && w.fatal));
+    await assert.rejects(recorder.exportRecoveredSelectedChannelWav(id, 0), /manifest.*read-only/i);
+    await assert.rejects(recorder.exportRecoveredManifest(id), /manifest.*read-only/i);
+    await assert.rejects(recorder.deleteRecoveredSession(id), /manifest.*read-only/i);
+    assert.deepEqual(root.files, before);
+  });
+}

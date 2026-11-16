@@ -485,3 +485,18 @@ test("inspectManifest rejects an uncommitted chunk after close failure", () => {
   assert.equal(result.ok, false);
   assert.match(result.errors.join("\n"), /chunks\[0\].*failed to close.*uncommitted/);
 });
+
+for (const recovered of [false, true]) {
+  test(`inspector refuses unsupported ${recovered ? "recovered" : "ordinary"} schemas before interpretation`, () => {
+    const current = recovered ? createRecoveredManifest() : createStoppedManifest();
+    for (const version of [999, 1.5, "1", null]) {
+      const manifest = { ...current, version };
+      const result = inspectManifest(manifest);
+      assert.equal(result.ok, false);
+      assert.match(result.errors.join("\n"), /Unsupported manifest schema/);
+      assert.equal(result.summary.frames, 0);
+    }
+    const result = inspectManifest(current);
+    assert.doesNotMatch(result.errors.join("\n"), /Unsupported manifest schema/);
+  });
+}

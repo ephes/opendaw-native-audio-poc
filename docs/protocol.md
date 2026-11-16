@@ -271,3 +271,5 @@ before counter mutation with a bounded `invalid-native-stats` error and recordin
 integrity evidence. Reconnect/reconfiguration clears the cursor baseline.
 Native drop counter decreases during capture are refused by the recorder;
 previous observed loss is retained and an integrity failure prevents a zero-loss verdict.
+
+Recording manifest schema admission is exact: `opendaw-native-audio-poc-recording` version 1 and offline `opendaw-native-audio-poc-recovered-recording` version 1. Future, fractional or string versions are unsupported. OPFS ordinary manifests must match the artifact session identity before interpreting chunk/integrity fields; incompatible files are retained read-only with `manifest-contract-error` and no recovery export or deletion.

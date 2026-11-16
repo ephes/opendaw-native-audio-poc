@@ -718,6 +718,7 @@ export class PcmRecorder {
       await this.deleteIndexSession(sessionId);
       return this.scanRecoverySessions();
     }
+    if (session.metadataReadOnly) throw new Error(session.nonExportableReason);
     if (this.session?.sessionId === sessionId) {
       await this.closeCurrentChunk({ allowCloseFailure: true, skipPersist: true }).catch((error) => {
         this.setError(`Failed to close current chunk before delete: ${error.message}`);
@@ -770,6 +771,7 @@ export class PcmRecorder {
       indexWarnings: warnings,
     });
     assertRecoveryMetadataComplete(metadataBudget);
+    if (session.metadataReadOnly) throw new Error(session.nonExportableReason);
     return session;
   }
 
@@ -1644,12 +1646,18 @@ async function buildRecoveredSession({
   let manifest = null;
   let manifestParseError = "";
   let manifestOwnershipError = false;
+  let manifestContractError = false;
   if (manifestFileName) {
     try {
       const handle = await root.getFileHandle(manifestFileName);
       const parsed = await readBudgetedJson(handle, { maxBytes: MANIFEST_JSON_MAX_BYTES, label: manifestFileName, metadataBudget });
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error("manifest is not a JSON object");
+      }
+      if (parsed.type !== "opendaw-native-audio-poc-recording" || parsed.version !== 1 ||
+          parsed.sessionId !== sessionId) {
+        manifestContractError = true;
+        throw new Error("Manifest schema or session identity is unsupported; manifest is read-only");
       }
       if (Array.isArray(parsed.chunks) && parsed.chunks.length > MAX_RECOVERY_CHUNKS) {
         throw new Error(`${parsed.chunks.length} chunks exceed the ${MAX_RECOVERY_CHUNKS} chunk budget`);
@@ -1662,9 +1670,9 @@ async function buildRecoveredSession({
     } catch (error) {
       manifestParseError = error.message;
       warnings.push({
-        code: "manifest-read-error",
+        code: manifestContractError ? "manifest-contract-error" : "manifest-read-error",
         message: `Could not read ${manifestFileName}: ${error.message}`,
-        fatal: error.message === "Manifest references chunks outside its session",
+        fatal: manifestContractError || error.message === "Manifest references chunks outside its session",
       });
     }
   }
@@ -1799,7 +1807,9 @@ async function buildRecoveredSession({
   );
   const shapeKnown = channels > 0 && sampleRate > 0 && sampleFormat === "f32-interleaved";
   let nonExportableReason = "";
-  if (manifestOwnershipError) {
+  if (manifestContractError) {
+    nonExportableReason = "manifest schema or session identity is unsupported; manifest is read-only";
+  } else if (manifestOwnershipError) {
     nonExportableReason = "manifest references chunks outside its session";
   } else if (chunkMetadataError) {
     nonExportableReason = "recording metadata could not be read completely";
@@ -1840,7 +1850,8 @@ async function buildRecoveredSession({
     recoveredFrames,
     recoveredBytes,
     durationSeconds: sampleRate ? recoveredFrames / sampleRate : 0,
-    exportableManifest: true,
+    metadataReadOnly: manifestContractError,
+    exportableManifest: !manifestContractError,
     exportableWav: !nonExportableReason,
     nonExportableReason,
     warnings,

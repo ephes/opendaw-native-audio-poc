@@ -55,6 +55,7 @@ export function inspectManifest(manifest, options = {}) {
   summary.recovered = manifest.recovered === true || manifest.recoveryWarnings !== undefined;
 
   validateManifestIdentity(manifest, errors, summary);
+  if (errors.length) return { ok: false, errors, warnings, summary };
   inspectManifestState(warnings, summary);
   validateStreamShape(manifest, options, errors, summary);
   inspectRecovery(manifest, errors, warnings, summary);
@@ -215,8 +216,8 @@ function validateManifestIdentity(manifest, errors, summary) {
   if (summary.type !== expectedType) {
     errors.push(`type must be ${expectedType} when recovered is ${summary.recovered}`);
   }
-  if (typeof manifest.version !== "number") {
-    errors.push("version must be a number");
+  if (manifest.version !== 1) {
+    errors.push("Unsupported manifest schema: version must be exactly 1 for this manifest type");
   }
 }
 
