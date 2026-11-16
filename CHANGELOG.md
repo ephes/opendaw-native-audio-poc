@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Retain observed native loss on counter regression; advertise the acquisition source in stream-started and refuse mismatched source/regressing cursor stats before evidence mutation.
+
 - Admit one pending export across controls/Worker and validate WAV scalar geometry and exact binary payload size before Blob construction.
 
 - Fence recovery scans/deletions by ordered generations and clean up download URLs/anchors even when activation fails.

@@ -56,6 +56,13 @@ export class PcmRecorder {
   setNativeInputStats(stats) {
     const normalized = normalizeNativeInputStats(stats);
     const previous = this.nativeInputStats;
+    if (normalized.available && previous.available &&
+        ["nativeDroppedBlocks", "nativeDroppedFrames", "nativeDropEvents"]
+          .some((key) => normalized[key] < previous[key]) &&
+        (this.state === "recording" || this.state === "stopping")) {
+      this.noteInvalidBlock("Native drop counter regressed; previous loss evidence retained");
+      return;
+    }
     this.nativeInputStats = normalized;
     if (
       this.session?.nativeInputStats &&

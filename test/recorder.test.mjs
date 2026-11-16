@@ -1210,3 +1210,20 @@ test("small current and recovered WAV exports have identical exact headers and s
   assert.equal(header.getUint32(40, true), 4 * 4);
   assert.deepEqual([...new Float32Array(bytes, 44)], [-0.5, -1, -0.5, -1]);
 });
+
+test("native counter regression cannot erase observed recording loss", async () => {
+  const { recorder } = storedRecorder();
+  const stats = (drops) => ({ source: "input", nativeDroppedBlocks: drops,
+    nativeDroppedFrames: drops * 240, nativeDropEvents: drops,
+    bridgeQueueCapacityBlocks: 64, atFrame: 1000 });
+  recorder.setNativeInputStats(stats(10));
+  await recorder.start(stream);
+  recorder.setNativeInputStats(stats(15));
+  recorder.setNativeInputStats(stats(1));
+  await recorder.stop();
+  const manifest = recorder.buildManifest();
+  assert.equal(recorder.nativeInputDeltas().nativeDroppedBlocksDuringRecording, 5);
+  assert.equal(manifest.nativeInputStats.stop.nativeDroppedBlocks, 15);
+  assert.match(manifest.integrity.invalidBlocks[0].reason, /Native drop counter regressed/);
+  assert.equal(inspectManifest(manifest, { expectNativeDropsZero: true }).ok, false);
+});

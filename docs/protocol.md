@@ -9,6 +9,7 @@ JSON messages describe device and stream state:
 ```json
 {
   "type": "stream-started",
+  "source": "sine",
   "sampleRate": 48000,
   "channels": 12,
   "framesPerBlock": 960,
@@ -260,3 +261,13 @@ monitor/context once and exposes Start Monitor for retry without ending capture.
 Page/Worker recovery requests are ordered by a Worker-owned generation, included in `recovery-sessions`; superseded results are discarded. Scans requested during deletion wait for the mutation.
 
 The Worker emits `export-status` with `pending: true/false` around one admitted export. Duplicate pending exports are ignored before queueing; success emits one `download`, failure emits `recording-error`, and both release admission. Page retirement releases local pending state.
+
+`stream-started.source` is required and is exactly `sine` or `input`, matching
+the actual acquisition source. Stats are accepted only after configuration,
+with the same source and a nondecreasing `atFrame` within that configuration
+and socket generation (equal cursors are valid). A changed source is a stream
+replacement even when PCM geometry is unchanged. Incompatible stats are refused
+before counter mutation with a bounded `invalid-native-stats` error and recording
+integrity evidence. Reconnect/reconfiguration clears the cursor baseline.
+Native drop counter decreases during capture are refused by the recorder;
+previous observed loss is retained and an integrity failure prevents a zero-loss verdict.

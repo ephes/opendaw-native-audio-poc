@@ -136,6 +136,13 @@ function handleSocketMessage(event) {
         postMessage({ type: "error", code: "invalid-control", message: "Stream configuration refused" });
       }
     } else if (message.type === "native-input-stats") {
+      if (!streamInfo || message.source !== streamInfo.source ||
+          (nativeInputStats && message.atFrame < nativeInputStats.atFrame)) {
+        if (streamInfo) recorder.noteInvalidBlock("Native stats source or frame cursor disagrees with stream generation");
+        postMessage({ type: "error", code: "invalid-native-stats",
+          message: "Native stats source or frame cursor disagrees with stream generation" });
+        return;
+      }
       nativeInputStats = message;
       if (streamInfo) recorder.setNativeInputStats(message);
       postMessage({ type: "native-input-stats", stats: nativeInputStats });
@@ -154,7 +161,7 @@ function validateControl(message) {
   if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error();
   const integer = (value, max, min = 0) => Number.isSafeInteger(value) && value >= min && value <= max;
   if (message.type === "stream-started") {
-    if (!integer(message.channels, 64, 1) || !integer(message.sampleRate, 384000, 1) ||
+    if (!["sine", "input"].includes(message.source) || !integer(message.channels, 64, 1) || !integer(message.sampleRate, 384000, 1) ||
         !integer(message.framesPerBlock, 65536, 1) || message.sampleFormat !== "f32-interleaved" ||
         ringCapacity(message) * message.channels * RING_BUFFER_BYTES_PER_SAMPLE + STATE_BYTES > MAX_RING_BYTES) {
       throw new Error();
@@ -181,7 +188,7 @@ function ringCapacity(info) {
 
 function configureStream(info) {
   const recordingBusy = recordingStartsPending || recorder.state === "recording" || recorder.state === "stopping";
-  if (streamInfo && ["sampleRate", "channels", "framesPerBlock", "sampleFormat"]
+  if (streamInfo && ["source", "sampleRate", "channels", "framesPerBlock", "sampleFormat"]
     .every((key) => streamInfo[key] === info[key])) {
     if (!recordingBusy) pcmRefused = false;
     return;
@@ -202,6 +209,8 @@ function configureStream(info) {
   const state = new Int32Array(buffer, 0, STATE_INTS);
   pcmRefused = false;
   streamInfo = info;
+  nativeInputStats = null;
+  recorder.setNativeInputStats(null);
   sharedBuffer = buffer;
   stateView = state;
   Atomics.store(stateView, STATE.WRITE_FRAME, 0);
