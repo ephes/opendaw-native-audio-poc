@@ -331,6 +331,14 @@ A failed chunk close ends the recording in `error` with no `stoppedAt`. The inco
 
 Recovered manifests are explicit recovery artifacts. They include `recovered: true`, `recoveredAt`, structured `recoveryWarnings` with warning code and fatal/non-fatal status, original start/stop information, native input stats from the original manifest when present, reconstructed frame/byte/chunk totals, and per-chunk validation results. Abandoned sessions are not silently treated as clean stops; a missing `stoppedAt`, missing native input stats in an older manifest, missing chunks, truncated chunks, unknown stream shape, unmanifested chunks, or manifest/file-size mismatch is reported as a warning. WAV export fails rather than zero-padding missing or corrupt audio. A trailing unmanifested empty/truncated chunk can be skipped with an explicit warning so already-closed chunks remain exportable.
 
+OPFS index, manifest and checkpoint JSON must have unique object member names at
+every depth. Admission checks raw names before decoding, so escaped-equivalent
+names (for example `sessionId` and `sess\u0069onId`) are duplicates too. Ambiguous
+metadata marks discovery incomplete and refuses recovery manifest/WAV export and
+deletion; the index stays read-only. Preserve the original files for manual repair
+or compatible tooling. Unique historical metadata is admitted without rewriting;
+the same name in separate objects is valid.
+
 Every scan and selected-session recovery export shares one 256 MiB metadata
 budget across the index, manifests and checkpoint sidecars. Each file's UTF-8
 byte size is charged before reading text; each admitted block description also

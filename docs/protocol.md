@@ -194,7 +194,11 @@ references in order, validating the chunk index, file name, completion
 timestamp and block-list presence, then appends the inline chunks; an
 incomplete metadata read is fatal for WAV export. Exported manifests retain
 full inline block evidence, and legacy inline-only manifests remain supported. Recovery checks each OPFS JSON
-file's size and nesting depth before using it. A shared 256 MiB scan/export
+file's size and nesting depth before using it. A raw-token admission pass
+requires unique object member names at every depth (including decoded escaped
+equivalents) before JSON.parse consumes index/manifest/checkpoint metadata.
+Ambiguity makes discovery incomplete, refuses recovery export/deletion and
+preserves saved bytes; unique historical records need no rewrite. A shared 256 MiB scan/export
 allowance charges index/manifest/sidecar byte sizes before text reads plus 256
 accounting bytes per retained block description. Exhaustion means incomplete
 evidence: no trusted export or deletion, no saved-file changes. The budgets, recovery and

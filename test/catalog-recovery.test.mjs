@@ -399,3 +399,56 @@ test("one metadata budget spans index, manifests and checkpoint block descriptio
   recorder.recoveryMetadataMaxBytes = 1;
   await assert.rejects(recorder.exportRecoveredManifest(first), /metadata.*budget/i);
 });
+
+for (const target of ["manifest-sessionId", "manifest-chunks", "manifest-version", "index-version", "checkpoint-block"]) {
+  for (const reverse of [false, true]) {
+    for (const escaped of [false, true]) {
+      test(`ambiguous recovery ${target}, reverse=${reverse}, escaped=${escaped} preserves files`, async () => {
+        const { recorder, root } = fixture();
+        await recorder.start(stream);
+        await record(recorder);
+        await recorder.stop();
+        const id = recorder.session.sessionId;
+        const name = target.startsWith("manifest") ? `${id}-manifest.json`
+          : target.startsWith("index") ? INDEX : `${id}-chunk-00000.f32.json`;
+        const object = decode(root.files.get(name));
+        const key = target === "checkpoint-block" ? "frameStart" : target.split("-")[1];
+        const owner = target === "checkpoint-block" ? object.blocks[0] : object;
+        const actual = JSON.stringify(owner[key]);
+        const alternate = key === "sessionId" ? '"native-pcm-other"' : key === "chunks" ? '[{}]' : '99';
+        const spelling = escaped ? `"${key[0]}\\u${key.charCodeAt(1).toString(16).padStart(4, "0")}${key.slice(2)}"` : JSON.stringify(key);
+        const original = `${JSON.stringify(key)}:${actual}`;
+        const duplicate = `${spelling}:${alternate}`;
+        const raw = JSON.stringify(object).replace(original, reverse ? `${duplicate},${original}` : `${original},${duplicate}`);
+        root.files.set(name, encoder.encode(raw));
+        const before = new Map([...root.files].map(([name, bytes]) => [name, bytes.slice()]));
+        const scan = await recorder.scanRecoverySessions();
+        assert.equal(scan.complete, false);
+        assert.match(scan.error, /ambiguous|duplicate/i);
+        assert.ok(scan.sessions.every((s) => !s.exportableManifest && !s.exportableWav));
+        await assert.rejects(recorder.exportRecoveredManifest(id), /ambiguous|duplicate/i);
+        await assert.rejects(recorder.exportRecoveredSelectedChannelWav(id, 0), /ambiguous|duplicate/i);
+        await assert.rejects(recorder.deleteRecoveredSession(id), /ambiguous|duplicate/i);
+        assert.deepEqual(root.files, before);
+      });
+    }
+  }
+}
+
+test("unique escaped names and repeated names in separate objects retain existing metadata", async () => {
+  const { recorder, root } = fixture();
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.stop();
+  const id = recorder.session.sessionId;
+  const name = `${id}-manifest.json`;
+  const manifest = decode(root.files.get(name));
+  manifest.extension = { first: { key: '\\"{}[]: , "key":0' }, second: { key: "é🎵" } };
+  root.files.set(name, encoder.encode(JSON.stringify(manifest).replace('"version":', '"vers\\u0069on":')));
+  const before = new Map([...root.files].map(([name, bytes]) => [name, bytes.slice()]));
+  assert.equal((await recorder.scanRecoverySessions()).complete, true);
+  const exported = JSON.parse(await (await recorder.exportRecoveredManifest(id)).blob.text());
+  assert.deepEqual(exported.originalManifest.extension, manifest.extension);
+  assert.equal((await recorder.exportRecoveredSelectedChannelWav(id, 0)).blob.size, 52);
+  assert.deepEqual(root.files, before);
+});

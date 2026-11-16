@@ -550,8 +550,10 @@ export class PcmRecorder {
       sessions.push(session);
     }
 
-    if (metadataBudget.exhausted) {
-      const message = "Recovery scan incomplete: total metadata budget exceeded; export and deletion refused";
+    if (metadataBudget.exhausted || metadataBudget.ambiguous) {
+      const message = metadataBudget.ambiguous
+        ? "Recovery scan incomplete: ambiguous JSON object members; export and deletion refused"
+        : "Recovery scan incomplete: total metadata budget exceeded; export and deletion refused";
       scanWarnings.push(message);
       for (const session of sessions) {
         session.exportableManifest = false;
@@ -563,7 +565,7 @@ export class PcmRecorder {
     sessions.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
     return {
       available: true,
-      complete: artifacts.complete && !metadataBudget.exhausted,
+      complete: artifacts.complete && !metadataBudget.exhausted && !metadataBudget.ambiguous,
       warnings: scanWarnings,
       error: scanWarnings.join("; "),
       scannedAt,
@@ -726,7 +728,7 @@ export class PcmRecorder {
     const root = this.root;
     const metadataBudget = { remaining: this.recoveryMetadataMaxBytes, exhausted: false };
     const { index, warnings } = await this.readIndex(metadataBudget);
-    if (metadataBudget.exhausted) throw new Error("Recovery metadata budget exceeded; export refused");
+    assertRecoveryMetadataComplete(metadataBudget);
     const indexed = Object.hasOwn(index.sessions, sessionId);
     // OPFS has no prefix query: enumerate bounded names, but read only the
     // requested session's exact artifacts, including unmanifested tail chunks.
@@ -748,7 +750,7 @@ export class PcmRecorder {
       activeSessionHasOpenChunk: Boolean(this.currentChunk),
       indexWarnings: warnings,
     });
-    if (metadataBudget.exhausted) throw new Error("Recovery metadata budget exceeded; export refused");
+    assertRecoveryMetadataComplete(metadataBudget);
     return session;
   }
 
@@ -1347,7 +1349,14 @@ async function readBudgetedJson(handle, { maxBytes, label, metadataBudget = null
     throw new Error(`${label} is ${formatBytes(file.size)}, above the ${formatBytes(maxBytes)} recovery budget`);
   }
   chargeRecoveryMetadata(metadataBudget, file.size);
-  const value = JSON.parse(await file.text());
+  const text = await file.text();
+  try {
+    admitUniqueJsonMembers(text, label);
+  } catch (error) {
+    if (metadataBudget && error.code === "ambiguous-recovery-json") metadataBudget.ambiguous = true;
+    throw error;
+  }
+  const value = JSON.parse(text);
   assertJsonDepth(value, JSON_MAX_DEPTH, label);
   // Charge expanded block descriptions before retaining/reconstructing sessions.
   const chunks = Array.isArray(value?.chunks) ? value.chunks : [];
@@ -1355,6 +1364,47 @@ async function readBudgetedJson(handle, { maxBytes, label, metadataBudget = null
     chunks.reduce((sum, chunk) => sum + (Array.isArray(chunk?.blocks) ? chunk.blocks.length : 0), 0);
   chargeRecoveryMetadata(metadataBudget, blocks * RETAINED_BLOCK_METADATA_BYTES);
   return value;
+}
+
+function assertRecoveryMetadataComplete(budget) {
+  if (budget.ambiguous) throw new Error("Recovery JSON has ambiguous object members; export refused");
+  if (budget.exhausted) throw new Error("Recovery metadata budget exceeded; export refused");
+}
+
+// Admission only: JSON.parse remains the grammar/value decoder. Walk raw tokens
+// first so duplicate names cannot disappear, and decode names with JSON.parse
+// itself to treat escaped-equivalent spellings identically. State is scoped to
+// live containers; equal names in different objects remain valid.
+function admitUniqueJsonMembers(text, label) {
+  const containers = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === "{" || char === "[") {
+      if (containers.length >= JSON_MAX_DEPTH) throw new Error(`${label} nests deeper than ${JSON_MAX_DEPTH} levels`);
+      containers.push(char === "{" ? new Set() : null);
+    } else if (char === "}" || char === "]") {
+      containers.pop();
+    } else if (char === '"') {
+      const start = i;
+      for (i += 1; i < text.length; i += 1) {
+        if (text[i] === "\\") i += 1;
+        else if (text[i] === '"') break;
+      }
+      if (i >= text.length) throw new SyntaxError("Unterminated recovery JSON string");
+      let next = i + 1;
+      while (/[ \t\r\n]/.test(text[next] ?? "") && next < text.length) next += 1;
+      const keys = containers.at(-1);
+      if (keys && text[next] === ":") {
+        const key = JSON.parse(text.slice(start, i + 1));
+        if (keys.has(key)) {
+          const error = new Error("Recovery JSON contains duplicate object members");
+          error.code = "ambiguous-recovery-json";
+          throw error;
+        }
+        keys.add(key);
+      }
+    }
+  }
 }
 
 function chargeRecoveryMetadata(budget, bytes) {

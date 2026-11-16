@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Refuse duplicate persisted JSON object names, including escaped equivalents, before recovery decoding; keep ambiguous inventories incomplete and preserve original files without export/deletion authorization.
+
 - Bound aggregate recovery metadata reads and retained block descriptions across all sessions; mark exhausted inventories incomplete and refuse exports/deletion while preserving files.
 
 - Propagate CPAL callback faults through a bounded retained notification to terminal `device-lost` delivery and recorder interruption, preserving committed audio and allowing explicit reconnect after bridge restart.
