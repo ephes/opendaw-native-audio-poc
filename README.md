@@ -280,9 +280,12 @@ Export Selected WAV writes one mono 32-bit float WAV for the selected source cha
 and recovered export refuse NaN or Infinity in that channel with a bounded
 chunk-frame/channel diagnostic, leaving the original chunks unchanged. Finite
 samples outside [-1, 1], signed zero and subnormals remain unchanged. The
-resulting mono WAV is assembled as a browser `Blob`; exporting very long channels
-can still be memory-intensive. All-channel WAV export is intentionally left out
-of this slice.
+resulting mono WAV is assembled as a browser `Blob`, so both exports first admit
+the request against a fixed 256 MiB working-memory envelope and refuse longer
+recordings before reading any PCM (see Known limits). With the default 64 MiB
+chunks this caps a selected-channel export at roughly 25 million frames, about
+8.7 minutes at 48 kHz. All-channel WAV export is intentionally left out of this
+slice.
 
 The top status counters show cumulative native dropped cpal callback buffers, dropped frames, and drop events from the Rust backend. The recording status panel also shows native dropped callback buffers/frames/events during the active recording. These counters are separate from WebSocket PCM blocks, browser-side gaps/overlaps, WebSocket lag, and monitor underrun/overflow counters.
 
@@ -367,7 +370,7 @@ Known limits:
 - OPFS has no normal user-visible filesystem path. Use the recovery/delete UI to inspect and remove PoC recording artifacts.
 - A browser/tab crash may leave the currently-open OPFS writable absent or truncated; recovery surfaces this as warnings and does not hide corruption.
 - OPFS write throughput is not backpressured into the WebSocket stream. The recorder serializes writes, displays pending/high-water backlog bytes, and records repeated write-backlog warnings at 64 MiB high-water increments, but extreme storage stalls can still end the session.
-- Selected-channel WAV export still assembles one mono Blob and can be memory-intensive for very long sessions.
+- Current and recovered selected-channel WAV exports assemble one mono Blob. Before any PCM `arrayBuffer()` read, export requires `2 * totalFrames * 4 + largestChunkFrames * channels * 4 + 88 <= 256 MiB`: retained mono parts, Blob-copy headroom, the largest full multichannel source chunk, and two 44-byte headers. Chunk geometry/totals and each file size are checked before materialization. This conservative working-memory admission is separate from the 4 GiB RIFF limit and is not a browser heap guarantee (metadata, runtime overhead and garbage collection are additional). Refusal preserves raw OPFS chunks; keep them and use compatible tooling to export a shorter recording. Streaming and all-channel WAV export remain out of scope.
 - Browser background throttling and tab lifecycle behavior are not fully proven.
 - `frameStart` is the bridge aggregation timeline, not a hardware clock timestamp.
 - Native input drop counters are cumulative observability counters, not recovery data. If they increase, audio was lost before browser delivery; the browser cannot reconstruct those missing frames.
@@ -485,6 +488,13 @@ Nonbrowser clients must explicitly send the same Origin header as the served
 page. There is no missing-Origin bypass. This protects against unrelated browser
 pages; it does not authenticate local programs, which can forge these headers.
 COOP/COEP response headers provide isolation, not WebSocket authorization.
+
+The bridge admits at most eight WebSocket clients per server, including pending
+upgrades. Trusted requests beyond that cap receive HTTP 503 immediately, before
+creating a PCM subscription or reader/sender tasks. Close an existing connection
+and explicitly retry Connect. A permit remains owned through both reader and
+sender teardown; failed upgrades, disconnects, send deadlines and cancellation
+release it. Existing clients keep receiving audio when an excess client is refused.
 
 ### Bounded recorder admission and diagnostics
 

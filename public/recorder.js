@@ -4,6 +4,8 @@ const CHUNK_TARGET_BYTES = 64 * 1024 * 1024;
 // Bounds one chunk's block list so its metadata always fits the recovery budget.
 const MAX_BLOCKS_PER_CHUNK = 65_536;
 const BYTES_PER_SAMPLE = 4;
+// Mono parts + a Blob copy + the largest full source chunk + two WAV headers.
+const WAV_EXPORT_MEMORY_MAX_BYTES = 256 * 1024 * 1024;
 const STATUS_INTERVAL_MS = 500;
 const BACKLOG_WARNING_BYTES = 64 * 1024 * 1024;
 const PENDING_PCM_CEILING_BYTES = 64 * 1024 * 1024;
@@ -478,11 +480,15 @@ export class PcmRecorder {
     await this.writeChain;
     const session = this.buildManifest();
     const root = this.root;
+    assertWavExportMemory(session.chunks, session.channels, session.totalRecordedFrames);
 
     const channelParts = [];
     for (const chunk of session.chunks) {
       const fileHandle = await root.getFileHandle(chunk.fileName);
       const file = await fileHandle.getFile();
+      if (file.size !== chunk.frames * session.channels * BYTES_PER_SAMPLE) {
+        throw new Error(`Chunk ${chunk.fileName} changed during export`);
+      }
       const buffer = await file.arrayBuffer();
       const samples = new Float32Array(buffer);
       const expectedSamples = chunk.frames * session.channels;
@@ -656,8 +662,10 @@ export class PcmRecorder {
     }
 
     const root = this.root;
+    const chunks = session.chunks.filter((entry) => entry.validForWav);
+    assertWavExportMemory(chunks, session.channels, session.recoveredFrames);
     const channelParts = [];
-    for (const chunk of session.chunks.filter((entry) => entry.validForWav)) {
+    for (const chunk of chunks) {
       const fileHandle = await root.getFileHandle(chunk.fileName);
       const file = await fileHandle.getFile();
       if (file.size !== chunk.bytes) {
@@ -1982,4 +1990,34 @@ function appendEvent(record, name, event) {
 
 function eventCount(record, name) {
   return record.eventCounts?.[name] ?? record[name].length;
+}
+
+function assertWavExportMemory(chunks, channels, totalFrames) {
+  const validCount = (value) => Number.isSafeInteger(value) && value >= 0;
+  if (!Number.isSafeInteger(channels) || channels < 1 || !validCount(totalFrames)) {
+    throw new Error("Invalid WAV export geometry; raw OPFS chunks are unchanged");
+  }
+  let frames = 0;
+  let largestSourceBytes = 0;
+  for (const chunk of chunks) {
+    const sourceBytes = chunk.frames * channels * BYTES_PER_SAMPLE;
+    frames += chunk.frames;
+    if (!validCount(chunk.frames) || !validCount(sourceBytes) || !validCount(frames)) {
+      throw new Error("Invalid WAV export geometry; raw OPFS chunks are unchanged");
+    }
+    largestSourceBytes = Math.max(largestSourceBytes, sourceBytes);
+  }
+  if (frames !== totalFrames) {
+    throw new Error("WAV export frame totals do not match chunks; raw OPFS chunks are unchanged");
+  }
+  const monoBytes = totalFrames * BYTES_PER_SAMPLE;
+  if (!validCount(monoBytes) || monoBytes + 36 > 0xffff_ffff) {
+    throw new Error("Selected-channel WAV is larger than the 4 GiB RIFF limit");
+  }
+  const workingBytes = 2 * monoBytes + largestSourceBytes + 2 * 44;
+  if (!validCount(workingBytes) || workingBytes > WAV_EXPORT_MEMORY_MAX_BYTES) {
+    throw new Error(
+      "WAV export exceeds the 256 MiB working-memory limit. Export a shorter recording with compatible tooling; raw OPFS chunks are unchanged.",
+    );
+  }
 }

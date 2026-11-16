@@ -230,6 +230,13 @@ page. There is no missing-Origin bypass. This protects against unrelated browser
 pages; it does not authenticate local programs, which can forge these headers.
 COOP/COEP response headers provide isolation, not WebSocket authorization.
 
+The bridge admits at most eight WebSocket clients per server, including pending
+upgrades. Trusted requests beyond that cap receive HTTP 503 immediately, before
+creating a PCM subscription or reader/sender tasks. Close an existing connection
+and explicitly retry Connect. A permit remains owned through both reader and
+sender teardown; failed upgrades, disconnects, send deadlines and cancellation
+release it. Existing clients keep receiving audio when an excess client is refused.
+
 ### Bounded recorder admission and diagnostics
 
 Pending PCM, including the write in progress, is limited to 64 MiB. A block
