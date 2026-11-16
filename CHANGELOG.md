@@ -4,6 +4,7 @@
 
 - Fence page/Worker connection commands and replies by generation, retiring already-posted stream buffers/state on Disconnect without discarding recovery or recording messages.
 - Settle WebSocket constructor refusal as a fixed retryable connection error before retiring the previous transport, preserving Worker recovery/recording ownership.
+- Deliver the bridge's `device-lost` explanation on the terminal `socket-state` so the connection-generation fence does not hide it from the page.
 - Bound handshake plus first valid stream configuration with one ten-second startup deadline; detach retired socket listeners and allow explicit retry after timeout.
 - Preserve the selected recovery WAV channel across inventory refreshes for the same session/channel count; reset on changed geometry or session identity.
 

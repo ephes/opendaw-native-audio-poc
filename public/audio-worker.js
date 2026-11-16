@@ -195,8 +195,12 @@ function handleSocketMessage(event) {
       postConnectionMessage({ type: "native-input-stats", stats: nativeInputStats });
     } else if (message.type === "stream-error") {
       if (message.code === "device-lost") {
-        terminateConnection(socket, "device-lost");
-      } else if (streamInfo) recorder.noteWebSocketLag({ code: message.code, message: message.message });
+        // The terminal socket-state retires this generation on the page, so
+        // the bridge's explanation travels on that message itself.
+        terminateConnection(socket, "device-lost", { code: message.code, message: message.message });
+        return;
+      }
+      if (streamInfo) recorder.noteWebSocketLag({ code: message.code, message: message.message });
       postConnectionMessage({ type: "error", message: message.message, code: message.code }, generation);
     }
     return;

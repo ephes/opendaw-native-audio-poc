@@ -126,6 +126,27 @@ test("page leaves connecting after constructor refusal and permits retry with re
   assert.notEqual(f.worker.messages.at(-1).generation, generation);
 });
 
+test("device-lost explanation reaches the page on the terminal socket-state", async (t) => {
+  const w = await workerFixture(t);
+  w.socket.emit("open");
+  w.socket.emit("message", started);
+  const generation = w.messages.findLast(m => m.type === "socket-state").generation;
+  const before = w.messages.length;
+  w.socket.emit("message", JSON.stringify({ type: "stream-error", code: "device-lost", message: "Input capture failed" }));
+  const replies = w.messages.slice(before).filter(m => ["socket-state", "error"].includes(m.type));
+  assert.deepEqual(replies, [{ type: "socket-state", state: "device-lost", generation,
+    code: "device-lost", message: "Input capture failed" }]);
+
+  const f = await appFixture(t);
+  f.click("#connect");
+  const page = f.worker.messages.at(-1).generation;
+  f.worker.emit({ type: "socket-state", state: "open", generation: page });
+  f.worker.emit({ ...replies[0], generation: page });
+  assert.equal(f.elements.get("#socket-state").textContent, "device-lost");
+  assert.equal(f.elements.get("#stream-summary").textContent, "Input capture failed");
+  assert.equal(f.elements.get("#connect").textContent, "Connect");
+});
+
 for (const phase of ["handshake", "configuration"]) {
   test(`startup deadline covers stalled ${phase} and ignores late events after retry`, async (t) => {
     const timers = new Map();

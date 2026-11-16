@@ -302,6 +302,10 @@ replacement or transport termination clears it. Expiry closes only that attempt,
 detaches its listeners and emits `socket-state: error`, code
 `connection-startup-timeout`. Queued callbacks from a retired attempt cannot
 configure or terminate its replacement.
+A native `device-lost` fault is reported as the terminal `socket-state:
+device-lost` itself, carrying `code: "device-lost"` and the bridge's `message`,
+so the page shows the bridge's explanation although the terminal state retires
+the generation; no separate transport `error` reply follows it.
 
 Recovery inventory rendering preserves the selected zero-based WAV channel only
 when the session ID and channel count are unchanged and the channel remains in
