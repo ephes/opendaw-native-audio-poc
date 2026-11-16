@@ -36,7 +36,13 @@ JSON messages describe device and stream state:
 }
 ```
 
-The current Rust server sends `stream-started` when a WebSocket client connects, then sends an initial `native-input-stats` event, then sends additional stats events about once per second. It sends `stream-error` when the server detects a client-side stream delivery problem such as a lagging WebSocket receiver. `device-lost` is reserved for a later backend path that can report input-device loss through the protocol. Per-channel browser meters are computed in the Worker from received PCM blocks rather than sent as JSON.
+The current Rust server sends `stream-started` when a WebSocket client connects, then sends an initial `native-input-stats` event, then sends additional stats events about once per second. It sends `stream-error` when the server detects a client-side stream delivery problem such as a lagging WebSocket receiver. A CPAL stream callback error is terminal for that capture generation: a retained,
+capacity-one notification causes `stream-error` with `code: "device-lost"`, then
+ends client delivery. Every send retains its existing deadline. Later clients
+receive `device-lost` before stream-started; restart the input bridge and reconnect
+explicitly. The Worker closes its socket, refuses later PCM and interrupts the
+recorder exactly once through its lifecycle queue, draining admitted writes and
+preserving committed chunks. This error is not a WebSocket lag sample. Per-channel browser meters are computed in the Worker from received PCM blocks rather than sent as JSON.
 
 `native-input-stats` is a cumulative backend observability event. It does not change the binary PCM block layout and older clients can ignore it. Fields:
 

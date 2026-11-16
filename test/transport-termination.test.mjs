@@ -18,7 +18,7 @@ function pcm(frameStart) {
   [0.25, -0.5, 0.75, -1].forEach((v, i) => view.setFloat32(16 + i * 4, v, true));
   return buffer;
 }
-for (const event of ["close", "error"]) {
+for (const event of ["close", "error", "device-lost"]) {
   test(`${event} interrupts recording once, flushes PCM and permits reconnect`, async (t) => {
     const root = memoryStorage();
     let chunkCloses = 0;
@@ -40,7 +40,12 @@ for (const event of ["close", "error"]) {
     const status = () => f.messages.filter((m) => m.type === "recording-status").at(-1)?.status;
     await until(() => status()?.state === "recording");
     for (const frame of [0, 2, 4]) f.socket.emit("message", pcm(frame));
-    f.socket.emit(event);
+    if (event === "device-lost") {
+      const fault = JSON.stringify({ type: "stream-error", code: "device-lost", message: "Input capture failed" });
+      f.socket.emit("message", fault);
+      f.socket.emit("message", fault);
+      f.socket.emit("message", pcm(6));
+    } else f.socket.emit(event);
     f.socket.emit("close"); f.socket.emit("error");
     assert.equal(new Int32Array(buffer)[STATE.CONNECTED], 0);
     // Reconnect before the queued interruption drains: counters/session ownership must survive.

@@ -137,7 +137,9 @@ function handleSocketMessage(event) {
       if (streamInfo) recorder.setNativeInputStats(message);
       postMessage({ type: "native-input-stats", stats: nativeInputStats });
     } else if (message.type === "stream-error") {
-      if (streamInfo) recorder.noteWebSocketLag({ code: message.code, message: message.message });
+      if (message.code === "device-lost") {
+        terminateConnection(socket, "device-lost");
+      } else if (streamInfo) recorder.noteWebSocketLag({ code: message.code, message: message.message });
       postMessage({ type: "error", message: message.message, code: message.code });
     }
     return;

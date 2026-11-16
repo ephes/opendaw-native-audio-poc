@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Propagate CPAL callback faults through a bounded retained notification to terminal `device-lost` delivery and recorder interruption, preserving committed audio and allowing explicit reconnect after bridge restart.
+
 - Fence retired monitor messages and processor faults; close failed processors once and permit a fresh monitor retry, including faults during resume.
 
 - Retire crashed/message-corrupt Workers and monitors once, release pending UI controls, ignore stale messages and offer a fresh OPFS recovery scan.
