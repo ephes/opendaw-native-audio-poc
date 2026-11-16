@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Admit current and recovered selected-channel WAV exports within a 256 MiB working-memory envelope before reading PCM; include mono retention, Blob-copy headroom and the largest multichannel source chunk, and preserve raw OPFS audio on refusal.
+
 - Refuse duplicate persisted JSON object names, including escaped equivalents, before recovery decoding; keep ambiguous inventories incomplete and preserve original files without export/deletion authorization.
 
 - Bound aggregate recovery metadata reads and retained block descriptions across all sessions; mark exhausted inventories incomplete while preserving files. Sessions read before exhaustion stay exportable, later sessions are listed from names only, and deletion (which needs only the name inventory) remains possible to free budget.

@@ -1124,3 +1124,89 @@ for (const action of ["clear", "delete"]) {
     assert.deepEqual([...root.files.keys()], ["native-pcm-recordings-index.json"]);
   });
 }
+
+// Metadata-only export fixtures never allocate the advertised PCM payload.
+for (const shape of [
+  { name: "retained mono and Blob copy", channels: 1, frames: Array(40).fill(1_000_000) },
+  { name: "largest multichannel source", channels: 64, frames: [2_000_000] },
+]) {
+  for (const recovered of [false, true]) {
+    test(`${recovered ? "recovered" : "current"} WAV admits ${shape.name} before any PCM read`, async () => {
+      const recorder = createRecorder();
+      const chunks = shape.frames.map((frames, index) => ({
+        fileName: `synthetic-${index}.f32`, frames,
+        bytes: frames * shape.channels * 4, validForWav: true,
+      }));
+      const totalFrames = shape.frames.reduce((a, b) => a + b, 0);
+      assert.ok(totalFrames * 4 + 36 < 0xffff_ffff, "fixture is legal RIFF");
+      const session = {
+        sessionId: "native-pcm-memory-fixture", sampleRate: 48000, channels: shape.channels,
+        chunks, totalRecordedFrames: totalFrames, recoveredFrames: totalFrames, exportableWav: true,
+      };
+      recorder.session = session;
+      recorder.state = "stopped";
+      recorder.buildManifest = () => session;
+      recorder.findRecoveredSession = async () => session;
+      let reads = 0;
+      recorder.root = {
+        async getFileHandle(name) {
+          return { async getFile() {
+            return {
+              size: chunks.find((chunk) => chunk.fileName === name).bytes,
+              async arrayBuffer() { reads += 1; throw new Error("PCM read before admission"); },
+            };
+          } };
+        },
+      };
+      const before = structuredClone(session);
+      await assert.rejects(
+        recovered ? recorder.exportRecoveredSelectedChannelWav(session.sessionId, 0)
+          : recorder.exportSelectedChannelWav(0),
+        /256 MiB.*memory.*raw OPFS chunks.*unchanged/i,
+      );
+      assert.equal(reads, 0);
+      assert.deepEqual(session, before);
+    });
+  }
+}
+
+test("current WAV refuses an unexpectedly large file before arrayBuffer", async () => {
+  const { recorder, root } = storedRecorder();
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.stop();
+  const getFileHandle = root.getFileHandle.bind(root);
+  let reads = 0;
+  root.getFileHandle = async (name, options) => {
+    if (!name.endsWith(".f32")) return getFileHandle(name, options);
+    return { async getFile() {
+      return { size: 512 * 1024 * 1024,
+        async arrayBuffer() { reads += 1; throw new Error("unexpected PCM read"); } };
+    } };
+  };
+  await assert.rejects(recorder.exportSelectedChannelWav(0), /changed during export/);
+  assert.equal(reads, 0);
+});
+
+test("small current and recovered WAV exports have identical exact headers and samples", async (t) => {
+  const { recorder, root } = storedRecorder();
+  navigatorProperty(t, "storage", { getDirectory: async () => root });
+  await recorder.start(stream);
+  await record(recorder);
+  await recorder.closeCurrentChunk();
+  await record(recorder, 2);
+  await recorder.stop();
+  const current = await recorder.exportSelectedChannelWav(1);
+  const reloaded = storedRecorder(root).recorder;
+  const recovered = await reloaded.exportRecoveredSelectedChannelWav(recorder.session.sessionId, 1);
+  const bytes = await current.blob.arrayBuffer();
+  assert.deepEqual(await recovered.blob.arrayBuffer(), bytes);
+  assert.equal(bytes.byteLength, 44 + 4 * 4);
+  const header = new DataView(bytes);
+  assert.equal(header.getUint32(4, true), 36 + 4 * 4);
+  assert.equal(header.getUint16(20, true), 3);
+  assert.equal(header.getUint16(22, true), 1);
+  assert.equal(header.getUint32(24, true), 48000);
+  assert.equal(header.getUint32(40, true), 4 * 4);
+  assert.deepEqual([...new Float32Array(bytes, 44)], [-0.5, -1, -0.5, -1]);
+});
