@@ -56,6 +56,7 @@ let recordingStartPending = false;
 let socketStateValue = "closed";
 let recoveryResult = null;
 let recoveryScanPending = false;
+let exportPending = false;
 let nativeInputStats = defaultNativeInputStats();
 
 els.connect.addEventListener("click", () => {
@@ -84,10 +85,10 @@ els.recordReset.addEventListener("click", () => {
   worker?.postMessage({ type: "recording-reset" });
 });
 els.exportManifest.addEventListener("click", () => {
-  worker?.postMessage({ type: "export-manifest" });
+  requestExport({ type: "export-manifest" });
 });
 els.exportWav.addEventListener("click", () => {
-  worker?.postMessage({
+  requestExport({
     type: "export-selected-wav",
     channelIndex: Number(els.wavChannel.value),
   });
@@ -99,7 +100,7 @@ els.recoveryExportManifest.addEventListener("click", () => {
   if (!session) {
     return;
   }
-  worker?.postMessage({
+  requestExport({
     type: "export-recovered-manifest",
     sessionId: session.sessionId,
   });
@@ -109,7 +110,7 @@ els.recoveryExportWav.addEventListener("click", () => {
   if (!session) {
     return;
   }
-  worker?.postMessage({
+  requestExport({
     type: "export-recovered-wav",
     sessionId: session.sessionId,
     channelIndex: Number(els.recoveryWavChannel.value),
@@ -196,6 +197,7 @@ function ensureWorker() {
       streamInfo = null;
       recordingStartPending = false;
       recoveryScanPending = false;
+      exportPending = false;
       nativeInputStats = defaultNativeInputStats();
       const guidance = "Audio worker failed; capture may be interrupted. Use Scan Recovery to inspect retained OPFS audio, then reconnect. The open chunk may be lost.";
       // The replacement recorder owns no live session. Exports must use the
@@ -328,6 +330,9 @@ function handleWorkerMessage(event) {
     renderRecordingStatus();
   } else if (message.type === "recording-error") {
     els.recordError.textContent = message.message;
+  } else if (message.type === "export-status") {
+    exportPending = message.pending;
+    renderRecordingStatus();
   } else if (message.type === "download") {
     try {
       downloadBlob(message.blob, message.filename);
@@ -486,11 +491,24 @@ function renderRecordingStatus() {
   els.recordStart.disabled = !connected || recorderBusy;
   els.recordStop.disabled = !activeRecording;
   els.recordReset.disabled = !hasRecording || status.state === "recording" || status.state === "stopping";
-  els.exportManifest.disabled = !canExport;
-  els.exportWav.disabled = !canExport;
+  els.exportManifest.disabled = !canExport || exportPending;
+  els.exportWav.disabled = !canExport || exportPending;
   els.wavChannel.disabled = !canExport;
   els.connect.disabled = recorderBusy || !window.crossOriginIsolated;
   updateRecoveryControls();
+}
+
+function requestExport(message) {
+  if (!worker || exportPending) return;
+  exportPending = true;
+  renderRecordingStatus();
+  try {
+    worker.postMessage(message);
+  } catch (error) {
+    exportPending = false;
+    renderRecordingStatus();
+    els.recordError.textContent = `Export failed: ${error.message}`;
+  }
 }
 
 function scanRecovery() {
@@ -597,9 +615,10 @@ function updateRecoveryControls(session = selectedRecoverySession()) {
   els.recoverySession.disabled = !(recoveryResult?.sessions?.length) || recoveryScanPending;
   els.recoveryRefresh.disabled = recoveryScanPending;
   els.recoveryExportManifest.disabled =
-    !canUseSelected || recordingActive || selectedActive || selectedOpenInMemory || recoveryScanPending;
+    !canUseSelected || exportPending || recordingActive || selectedActive || selectedOpenInMemory || recoveryScanPending;
   els.recoveryExportWav.disabled =
     !canUseSelected ||
+    exportPending ||
     recordingActive ||
     selectedActive ||
     selectedOpenInMemory ||
@@ -607,6 +626,7 @@ function updateRecoveryControls(session = selectedRecoverySession()) {
     recoveryScanPending;
   els.recoveryWavChannel.disabled =
     !canUseSelected ||
+    exportPending ||
     recordingActive ||
     selectedActive ||
     selectedOpenInMemory ||

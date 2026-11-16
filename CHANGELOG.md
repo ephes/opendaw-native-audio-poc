@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Admit one pending export across controls/Worker and validate WAV scalar geometry and exact binary payload size before Blob construction.
+
 - Fence recovery scans/deletions by ordered generations and clean up download URLs/anchors even when activation fails.
 
 - Limit native WebSocket fanout to eight admitted/pending clients; reject excess trusted handshakes with HTTP 503 before subscribing to PCM, and release permits after failed upgrades or complete connection teardown, including cancellation.

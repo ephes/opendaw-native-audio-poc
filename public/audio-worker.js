@@ -22,6 +22,7 @@ let lastMeterPost = 0;
 let nativeInputStats = null;
 let recordingStartsPending = 0;
 let pcmRefused = false;
+let exportPending = false;
 let recoveryGeneration = 0;
 let recoveryQueue = Promise.resolve();
 let recorder = new PcmRecorder({
@@ -287,13 +288,19 @@ function runRecorderAction(action) {
 }
 
 function runExport(action) {
-  action()
+  if (exportPending) return;
+  exportPending = true;
+  postMessage({ type: "export-status", pending: true });
+  Promise.resolve().then(action)
     .then((result) => {
       postMessage({ type: "download", filename: result.filename, blob: result.blob });
     })
     .catch((error) => {
       postMessage({ type: "recording-error", message: error.message });
       postMessage({ type: "recording-status", status: recorder.status() });
+    }).finally(() => {
+      exportPending = false;
+      postMessage({ type: "export-status", pending: false });
     });
 }
 

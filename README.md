@@ -512,3 +512,5 @@ without these maps still use array lengths. Recovery exports preserve integrity
 samples and totals; any retained integrity failure still fails inspection.
 
 Recovery scans and deletions share ordered request generations. Only the newest result is published, so an older scan cannot restore a deleted session. Download activation failures remove the temporary anchor and revoke its URL immediately; successful downloads retain a ten-second grace period. OPFS artifacts remain available for retry.
+
+All manifest/WAV export controls share one pending owner in the page and Worker, admitted before lifecycle enqueue. Repeated requests are ignored until completion/failure; Worker retirement releases the page owner. Recording controls remain available. WAV construction requires safe integer frame counts, a positive integer sample rate whose byte rate fits uint32, and binary parts with exactly four bytes per declared frame.
