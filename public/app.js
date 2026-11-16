@@ -124,6 +124,8 @@ els.recoveryDelete.addEventListener("click", () => {
     `Delete OPFS files for ${session.sessionId}? This removes its manifest, chunks, and index entry.`,
   );
   if (confirmed) {
+    recoveryScanPending = true;
+    renderRecovery();
     worker?.postMessage({
       type: "delete-recovered-session",
       sessionId: session.sessionId,
@@ -327,7 +329,11 @@ function handleWorkerMessage(event) {
   } else if (message.type === "recording-error") {
     els.recordError.textContent = message.message;
   } else if (message.type === "download") {
-    downloadBlob(message.blob, message.filename);
+    try {
+      downloadBlob(message.blob, message.filename);
+    } catch (error) {
+      els.recordError.textContent = `Download failed: ${error.message}. Retained OPFS audio is unchanged.`;
+    }
   } else if (message.type === "recovery-sessions") {
     recoveryResult = message.result;
     recoveryScanPending = false;
@@ -641,13 +647,23 @@ function formatShape(session) {
 
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.append(anchor);
-  anchor.click();
-  anchor.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  let anchor;
+  let activated = false;
+  try {
+    anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.append(anchor);
+    anchor.click();
+    activated = true;
+  } finally {
+    try {
+      anchor?.remove();
+    } finally {
+      if (activated) window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      else URL.revokeObjectURL(url);
+    }
+  }
 }
 
 function formatDuration(seconds) {

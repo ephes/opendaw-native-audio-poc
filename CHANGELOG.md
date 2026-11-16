@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fence recovery scans/deletions by ordered generations and clean up download URLs/anchors even when activation fails.
+
 - Limit native WebSocket fanout to eight admitted/pending clients; reject excess trusted handshakes with HTTP 503 before subscribing to PCM, and release permits after failed upgrades or complete connection teardown, including cancellation.
 
 - Admit current and recovered selected-channel WAV exports within a 256 MiB working-memory envelope before reading PCM; include mono retention, Blob-copy headroom and the largest multichannel source chunk, and preserve raw OPFS audio on refusal.

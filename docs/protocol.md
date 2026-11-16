@@ -256,3 +256,5 @@ Monitor port status and counter-reset messages are admitted only from the curren
 monitor attempt. Retiring an attempt detaches its listeners; queued old callbacks
 cannot rebaseline recording counters. A current `processorerror` retires the
 monitor/context once and exposes Start Monitor for retry without ending capture.
+
+Page/Worker recovery requests are ordered by a Worker-owned generation, included in `recovery-sessions`; superseded results are discarded. Scans requested during deletion wait for the mutation.

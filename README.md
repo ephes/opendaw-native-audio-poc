@@ -510,3 +510,5 @@ maps keyed by array name; totals remain exact and omissions equal total minus
 retained samples. Status and offline inspection use totals. Historical manifests
 without these maps still use array lengths. Recovery exports preserve integrity
 samples and totals; any retained integrity failure still fails inspection.
+
+Recovery scans and deletions share ordered request generations. Only the newest result is published, so an older scan cannot restore a deleted session. Download activation failures remove the temporary anchor and revoke its URL immediately; successful downloads retain a ten-second grace period. OPFS artifacts remain available for retry.

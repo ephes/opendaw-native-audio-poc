@@ -22,6 +22,8 @@ let lastMeterPost = 0;
 let nativeInputStats = null;
 let recordingStartsPending = 0;
 let pcmRefused = false;
+let recoveryGeneration = 0;
+let recoveryQueue = Promise.resolve();
 let recorder = new PcmRecorder({
   readCounters,
   postMessage: (message) => postMessage(message),
@@ -296,32 +298,32 @@ function runExport(action) {
 }
 
 function runRecoveryScan() {
-  recorder
-    .scanRecoverySessions()
-    .then((result) => {
-      postMessage({ type: "recovery-sessions", result });
-    })
-    .catch((error) => {
-      postMessage({
-        type: "recovery-sessions",
-        result: {
-          available: false,
-          error: error.message,
-          scannedAt: new Date().toISOString(),
-          sessions: [],
-        },
-      });
-    });
+  runRecoveryAction(() => recorder.scanRecoverySessions());
 }
 
 function runDeleteRecoveredSession(sessionId) {
-  recorder
-    .deleteRecoveredSession(sessionId)
-    .then((result) => {
-      postMessage({ type: "recovery-sessions", result });
-    })
-    .catch((error) => {
+  runRecoveryAction(() => recorder.deleteRecoveredSession(sessionId), true);
+}
+
+function runRecoveryAction(action, mutation = false) {
+  const generation = ++recoveryGeneration;
+  // A scan requested during deletion must read after that mutation completes.
+  recoveryQueue = recoveryQueue.then(action).catch(async (error) => {
+    if (mutation) {
       postMessage({ type: "recording-error", message: error.message });
-      runRecoveryScan();
-    });
+      return recorder.scanRecoverySessions();
+    }
+    return { available: false, error: error.message,
+      scannedAt: new Date().toISOString(), sessions: [] };
+  }).then((result) => {
+    if (generation === recoveryGeneration) {
+      postMessage({ type: "recovery-sessions", generation, result });
+    }
+  }).catch((error) => {
+    if (generation === recoveryGeneration) {
+      postMessage({ type: "recovery-sessions", generation, result: {
+        available: false, error: error.message, sessions: [],
+      } });
+    }
+  });
 }
