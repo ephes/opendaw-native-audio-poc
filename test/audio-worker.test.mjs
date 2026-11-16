@@ -10,6 +10,7 @@ test("superseded sockets cannot publish events or modify the current stream", as
   class FakeSocket {
     constructor() { this.handlers = new Map(); sockets.push(this); }
     addEventListener(type, handler) { this.handlers.set(type, handler); }
+    removeEventListener(type, handler) { if (this.handlers.get(type) === handler) this.handlers.delete(type); }
     close() { this.emit("close"); }
     emit(type, data) { this.handlers.get(type)?.({ data }); }
   }
@@ -26,7 +27,7 @@ test("superseded sockets cannot publish events or modify the current stream", as
     });
   }
   await import("../public/audio-worker.js");
-  const send = (type) => receive({ data: { type, url: "ws://synthetic.invalid/ws" } });
+  const send = (type) => receive({ data: { type, generation: 1, url: "ws://synthetic.invalid/ws" } });
   const stream = { type: "stream-started", source: "sine", channels: 2, sampleRate: 48000, framesPerBlock: 1, sampleFormat: "f32-interleaved" };
   send("connect");
   const a = sockets[0];
@@ -76,7 +77,7 @@ test("superseded sockets cannot publish events or modify the current stream", as
     assert.equal(Atomics.load(state, STATE.READ_FRAME) >>> 0, (boundary + 1) >>> 0);
   }
   b.emit("error");
-  assert.deepEqual(messages.at(-1), { type: "socket-state", state: "error" });
+  assert.deepEqual(messages.at(-1), { type: "socket-state", state: "error", generation: 1 });
   const terminatedCount = messages.length;
   b.emit("close");
   assert.equal(state[STATE.CONNECTED], 0);

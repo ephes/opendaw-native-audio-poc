@@ -10,10 +10,14 @@ import {
 } from "./ring-buffer.js";
 
 const CAPACITY_SECONDS = 2;
+const CONNECTION_STARTUP_TIMEOUT_MS = 10_000;
 const MAX_CONTROL_CHARS = 4096;
 const MAX_RING_BYTES = 64 * 1024 * 1024;
 
 let socket = null;
+let connectionGeneration = null;
+let startupTimer = null;
+let detachSocketListeners = null;
 let sharedBuffer = null;
 let stateView = null;
 let sampleView = null;
@@ -33,9 +37,9 @@ let recorder = new PcmRecorder({
 self.addEventListener("message", (event) => {
   const message = event.data;
   if (message.type === "connect") {
-    connect(message.url);
+    connect(message.url, message.generation);
   } else if (message.type === "disconnect") {
-    disconnect();
+    if (message.generation === connectionGeneration) disconnect();
   } else if (message.type === "recording-start") {
     if (pcmRefused) {
       postMessage({ type: "recording-status", status: recorder.status() });
@@ -68,32 +72,70 @@ self.addEventListener("message", (event) => {
   }
 });
 
-function connect(url) {
+function connect(url, generation) {
+  let connection;
+  try {
+    connection = new WebSocket(url);
+  } catch {
+    postMessage({ type: "socket-state", state: "error", generation,
+      code: "connection-construction-failed", message: "WebSocket connection could not be created; retry Connect." });
+    return;
+  }
   disconnect();
-  const connection = new WebSocket(url);
   socket = connection;
-  socket.binaryType = "arraybuffer";
-  socket.addEventListener("open", () => {
-    if (socket !== connection) return;
-    postMessage({ type: "socket-state", state: "open" });
-  });
-  socket.addEventListener("close", () => terminateConnection(connection, "closed"));
-  socket.addEventListener("error", () => terminateConnection(connection, "error"));
-  socket.addEventListener("message", (event) => {
-    if (socket !== connection) return;
-    handleSocketMessage(event);
-  });
+  connectionGeneration = generation;
+  connection.binaryType = "arraybuffer";
+  const listeners = {
+    open: () => {
+      if (socket !== connection) return;
+      postConnectionMessage({ type: "socket-state", state: "open" });
+    },
+    close: () => terminateConnection(connection, "closed"),
+    error: () => terminateConnection(connection, "error"),
+    message: (event) => {
+      if (socket !== connection) return;
+      handleSocketMessage(event);
+    },
+  };
+  for (const [type, listener] of Object.entries(listeners)) {
+    connection.addEventListener(type, listener);
+  }
+  detachSocketListeners = () => {
+    for (const [type, listener] of Object.entries(listeners)) {
+      connection.removeEventListener(type, listener);
+    }
+  };
+  const timer = setTimeout(() => {
+    if (socket !== connection || startupTimer !== timer) return;
+    terminateConnection(connection, "error", {
+      code: "connection-startup-timeout", message: "WebSocket startup timed out; retry Connect.",
+    });
+  }, CONNECTION_STARTUP_TIMEOUT_MS);
+  startupTimer = timer;
 }
 
-function terminateConnection(connection, state) {
+function terminateConnection(connection, state, detail = {}) {
   if (socket !== connection) return;
   // Capture counters before disconnect clears this stream; the lifecycle queue
   // also covers a Start that has not finished creating its session yet.
+  const generation = connectionGeneration;
   disconnect(state);
-  postMessage({ type: "socket-state", state });
+  postMessage({ type: "socket-state", state, generation, ...detail });
+}
+
+function postConnectionMessage(message, generation = connectionGeneration) {
+  postMessage({ ...message, generation });
+}
+
+function clearStartupDeadline() {
+  clearTimeout(startupTimer);
+  startupTimer = null;
 }
 
 function disconnect(reason = "disconnected") {
+  clearStartupDeadline();
+  detachSocketListeners?.();
+  detachSocketListeners = null;
   if (socket) {
     runRecorderAction(() => recorder.interrupt(`WebSocket transport ${reason}; recording interrupted`));
   }
@@ -103,6 +145,7 @@ function disconnect(reason = "disconnected") {
     socket = null;
     previous.close();
   }
+  connectionGeneration = null;
   sharedBuffer = null;
   stateView = null;
   sampleView = null;
@@ -112,6 +155,7 @@ function disconnect(reason = "disconnected") {
 }
 
 function handleSocketMessage(event) {
+  const generation = connectionGeneration;
   if (typeof event.data === "string") {
     let message;
     try {
@@ -119,7 +163,7 @@ function handleSocketMessage(event) {
       message = JSON.parse(event.data);
       validateControl(message);
     } catch {
-      postMessage({ type: "error", code: "invalid-control", message: "Invalid or unsupported stream control" });
+      postConnectionMessage({ type: "error", code: "invalid-control", message: "Invalid or unsupported stream control" });
       return;
     }
     if (message.type === "stream-started") {
@@ -133,7 +177,7 @@ function handleSocketMessage(event) {
         }
         configureStream(message);
       } catch {
-        postMessage({ type: "error", code: "invalid-control", message: "Stream configuration refused" });
+        postConnectionMessage({ type: "error", code: "invalid-control", message: "Stream configuration refused" });
       }
     } else if (message.type === "native-input-stats") {
       // Stats can precede a stream-started deferred behind a pending Start.
@@ -142,18 +186,22 @@ function handleSocketMessage(event) {
       if (message.source !== streamInfo.source ||
           (nativeInputStats && message.atFrame < nativeInputStats.atFrame)) {
         recorder.noteInvalidBlock("Native stats source or frame cursor disagrees with stream generation");
-        postMessage({ type: "error", code: "invalid-native-stats",
+        postConnectionMessage({ type: "error", code: "invalid-native-stats",
           message: "Native stats source or frame cursor disagrees with stream generation" });
         return;
       }
       nativeInputStats = message;
       recorder.setNativeInputStats(message);
-      postMessage({ type: "native-input-stats", stats: nativeInputStats });
+      postConnectionMessage({ type: "native-input-stats", stats: nativeInputStats });
     } else if (message.type === "stream-error") {
       if (message.code === "device-lost") {
-        terminateConnection(socket, "device-lost");
-      } else if (streamInfo) recorder.noteWebSocketLag({ code: message.code, message: message.message });
-      postMessage({ type: "error", message: message.message, code: message.code });
+        // The terminal socket-state retires this generation on the page, so
+        // the bridge's explanation travels on that message itself.
+        terminateConnection(socket, "device-lost", { code: message.code, message: message.message });
+        return;
+      }
+      if (streamInfo) recorder.noteWebSocketLag({ code: message.code, message: message.message });
+      postConnectionMessage({ type: "error", message: message.message, code: message.code }, generation);
     }
     return;
   }
@@ -212,6 +260,7 @@ function configureStream(info) {
   const state = new Int32Array(buffer, 0, STATE_INTS);
   pcmRefused = false;
   streamInfo = info;
+  clearStartupDeadline();
   nativeInputStats = null;
   recorder.setNativeInputStats(null);
   sharedBuffer = buffer;
@@ -227,7 +276,7 @@ function configureStream(info) {
   Atomics.store(stateView, STATE.FRAMES_PER_BLOCK, info.framesPerBlock);
   Atomics.store(stateView, STATE.RECEIVED_BLOCKS, 0);
   sampleView = createRingBufferViews(sharedBuffer, stateView).sampleView;
-  postMessage({ type: "shared-buffer", sharedBuffer, stream: info });
+  postConnectionMessage({ type: "shared-buffer", sharedBuffer, stream: info });
 }
 
 function writePcmBlock(buffer) {
@@ -246,7 +295,7 @@ function writePcmBlock(buffer) {
     } else {
       recorder.noteInvalidBlock(block.message);
     }
-    postMessage({ type: "error", message: block.message });
+    postConnectionMessage({ type: "error", message: block.message });
     return;
   }
 
@@ -273,7 +322,7 @@ function maybePostMeters(samples, frameCount, channels) {
       }
     }
   }
-  postMessage({ type: "meters", peak });
+  postConnectionMessage({ type: "meters", peak });
 }
 
 function readCounters() {

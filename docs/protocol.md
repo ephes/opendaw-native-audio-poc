@@ -279,3 +279,35 @@ Recording manifest schema admission is exact: `opendaw-native-audio-poc-recordin
 The offline inspector validates unique session-owned chunk filename/index identities before timeline calculations. It admits at most 10,000 chunks and 1,000,000 combined chunk/block/recovery-warning entries before inspecting entries. Diagnostic results retain 100 errors and 100 warnings of at most 500 characters each, with exact omitted counts and an unchanged failed verdict; displayed scalar strings use the same character ceiling.
 
 Page recovery scan/delete requests also carry `requestId`, echoed in each result. The page rejects results from older requests, including messages posted before a newer mutation was requested but delivered afterwards. Export/download errors remain visible after terminal export-status releases admission, until retry, Worker retirement, a later `recording-error`, or a `recording-status` that changes the recorder state or reports a new `lastError`; an old export error never masks current acquisition errors.
+
+
+### Page/Worker connection ownership
+
+This internal protocol does not change native WebSocket wire messages. The page
+assigns each `connect` a new `generation`; `disconnect` carries the generation it
+retires. The Worker echoes it on `socket-state`, `shared-buffer`, `meters`,
+`native-input-stats` and transport `error` replies. Only matching current replies
+are admitted by the page, and disconnect or a terminal socket state retires the
+page generation synchronously. Worker identity remains an independent fence.
+Recording, recovery and export replies retain their existing lifecycle/request
+ownership and are not discarded with the connection.
+
+WebSocket construction precedes retirement of the old transport. Constructor
+refusal emits `socket-state: error`, code `connection-construction-failed`, for
+the requested generation with a fixed retry message; it leaves the Worker and
+previous transport intact. A constructed transport owns one 10,000 ms timer
+through handshake and first successfully installed `stream-started`. `open` or
+invalid control does not extend/cancel it. Successful configuration, disconnect,
+replacement or transport termination clears it. Expiry closes only that attempt,
+detaches its listeners and emits `socket-state: error`, code
+`connection-startup-timeout`. Queued callbacks from a retired attempt cannot
+configure or terminate its replacement.
+A native `device-lost` fault is reported as the terminal `socket-state:
+device-lost` itself, carrying `code: "device-lost"` and the bridge's `message`,
+so the page shows the bridge's explanation although the terminal state retires
+the generation; no separate transport `error` reply follows it.
+
+Recovery inventory rendering preserves the selected zero-based WAV channel only
+when the session ID and channel count are unchanged and the channel remains in
+range. A changed identity/count resets to channel zero; removal clears selection.
+Pending scans disable recovery actions without changing the retained selection.

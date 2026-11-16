@@ -63,7 +63,7 @@ for (const event of ["close", "error", "device-lost"]) {
     wrongView.setUint32(8, 4, true); // Four mono frames retain the 32-byte wire length.
     current.emit("message", wrongChannels);
     assert.deepEqual(f.messages.at(-1), {
-      type: "error", message: "PCM block channel mismatch: expected 2, got 1",
+      type: "error", generation: 2, message: "PCM block channel mismatch: expected 2, got 1",
     });
     assert.equal(status().recordedFrames, 6);
     assert.equal(chunkCloses, 1);
