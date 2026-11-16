@@ -273,3 +273,5 @@ Native drop counter decreases during capture are refused by the recorder;
 previous observed loss is retained and an integrity failure prevents a zero-loss verdict.
 
 Recording manifest schema admission is exact: `opendaw-native-audio-poc-recording` version 1 and offline `opendaw-native-audio-poc-recovered-recording` version 1. Future, fractional or string versions are unsupported. OPFS ordinary manifests must match the artifact session identity before interpreting chunk/integrity fields; incompatible files are retained read-only with `manifest-contract-error` and no recovery export or deletion.
+
+The offline inspector validates unique session-owned chunk filename/index identities before timeline calculations. It admits at most 10,000 chunks and 1,000,000 combined chunk/block/recovery-warning entries before inspecting entries. Diagnostic results retain 100 errors and 100 warnings of at most 500 characters each, with exact omitted counts and an unchanged failed verdict; displayed scalar strings use the same character ceiling.

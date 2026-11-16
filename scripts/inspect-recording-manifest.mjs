@@ -2,6 +2,24 @@ import fs from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 const BYTES_PER_SAMPLE = 4;
+const MAX_DIAGNOSTICS = 100;
+const MAX_DIAGNOSTIC_CHARS = 500;
+const MAX_INSPECTOR_CHUNKS = 10_000;
+const MAX_INSPECTION_ENTRIES = 1_000_000;
+
+function diagnosticSink() {
+  return {
+    items: [], omitted: 0,
+    get length() { return this.items.length + this.omitted; },
+    push(...messages) {
+      for (const message of messages) {
+        if (this.items.length < MAX_DIAGNOSTICS) this.items.push(String(message).slice(0, MAX_DIAGNOSTIC_CHARS));
+        else this.omitted++;
+      }
+    },
+  };
+}
+
 const DEFAULT_SAMPLE_FORMAT = "f32-interleaved";
 const CONTINUITY_ARRAYS = [
   "gaps",
@@ -22,8 +40,10 @@ const NATIVE_DROP_FIELDS = [
 ];
 
 export function inspectManifest(manifest, options = {}) {
-  const errors = [];
-  const warnings = [];
+  const errors = diagnosticSink();
+  const warnings = diagnosticSink();
+  const finish = () => ({ ok: errors.length === 0, errors: errors.items, warnings: warnings.items,
+    omittedErrors: errors.omitted, omittedWarnings: warnings.omitted, summary });
   const summary = {
     recovered: false,
     recoveryWarnings: 0,
@@ -39,12 +59,8 @@ export function inspectManifest(manifest, options = {}) {
   };
 
   if (!isObject(manifest)) {
-    return {
-      ok: false,
-      errors: ["Manifest must be a JSON object"],
-      warnings,
-      summary,
-    };
+    errors.push("Manifest must be a JSON object");
+    return finish();
   }
 
   summary.type = stringOrNull(manifest.type);
@@ -55,7 +71,11 @@ export function inspectManifest(manifest, options = {}) {
   summary.recovered = manifest.recovered === true || manifest.recoveryWarnings !== undefined;
 
   validateManifestIdentity(manifest, errors, summary);
-  if (errors.length) return { ok: false, errors, warnings, summary };
+  if (errors.length) return finish();
+  admitInspectionWork(manifest, errors);
+  if (errors.length) return finish();
+  validateChunkIdentities(manifest, errors);
+  if (errors.length) return finish();
   inspectManifestState(warnings, summary);
   validateStreamShape(manifest, options, errors, summary);
   inspectRecovery(manifest, errors, warnings, summary);
@@ -75,12 +95,7 @@ export function inspectManifest(manifest, options = {}) {
     summary.durationSeconds = summary.frames / summary.sampleRate;
   }
 
-  return {
-    ok: errors.length === 0,
-    errors,
-    warnings,
-    summary,
-  };
+  return finish();
 }
 
 export function formatInspectionReport(result) {
@@ -134,6 +149,8 @@ export function formatInspectionReport(result) {
       lines.push(`- ${error}`);
     }
   }
+  if (result.omittedWarnings) lines.push(`Warnings omitted: ${result.omittedWarnings}`);
+  if (result.omittedErrors) lines.push(`Errors omitted: ${result.omittedErrors}`);
   return `${lines.join("\n")}\n`;
 }
 
@@ -356,6 +373,47 @@ function integrityEventCount(integrity, name, entries, errors) {
   return count;
 }
 
+function admitInspectionWork(manifest, errors) {
+  const chunks = Array.isArray(manifest.chunks) ? manifest.chunks : [];
+  if (chunks.length > MAX_INSPECTOR_CHUNKS) {
+    errors.push(`Manifest exceeds the ${MAX_INSPECTOR_CHUNKS} chunk budget`);
+    return;
+  }
+  let entries = chunks.length + (Array.isArray(manifest.recoveryWarnings) ? manifest.recoveryWarnings.length : 0);
+  for (const chunk of chunks) {
+    if (entries > MAX_INSPECTION_ENTRIES) break;
+    if (Array.isArray(chunk?.blocks)) entries += chunk.blocks.length;
+  }
+  if (entries > MAX_INSPECTION_ENTRIES) {
+    errors.push(`Manifest exceeds the ${MAX_INSPECTION_ENTRIES} aggregate inspection work budget; no entries inspected`);
+  }
+}
+
+function validateChunkIdentities(manifest, errors) {
+  if (!Array.isArray(manifest.chunks)) return;
+  const names = new Set();
+  const indices = new Set();
+  const sessionId = manifest.sessionId;
+  if (typeof sessionId !== "string" || !sessionId.startsWith("native-pcm-") ||
+      sessionId.length <= "native-pcm-".length || /[/\\]/.test(sessionId)) {
+    errors.push("Invalid chunk session identity");
+    return;
+  }
+  for (const [position, chunk] of manifest.chunks.entries()) {
+    if (!isObject(chunk)) continue; // The structural validator reports this.
+    const index = chunk.index;
+    if (!Number.isSafeInteger(index) || index < 0 ||
+        chunk.fileName !== `${sessionId}-chunk-${String(index).padStart(5, "0")}.f32`) {
+      errors.push(`chunks[${position}] has invalid chunk artifact identity`);
+    }
+    if (names.has(chunk.fileName) || indices.has(index)) {
+      errors.push(`chunks[${position}] has duplicate chunk artifact identity`);
+    }
+    names.add(chunk.fileName);
+    indices.add(index);
+  }
+}
+
 function inspectChunks(manifest, errors, warnings) {
   if (!Array.isArray(manifest.chunks)) {
     errors.push("chunks must be an array");
@@ -411,7 +469,7 @@ function inspectChunks(manifest, errors, warnings) {
     }
 
     if (stringOrNull(chunk.sampleFormat) !== null && chunk.sampleFormat !== DEFAULT_SAMPLE_FORMAT) {
-      errors.push(`${prefix}.sampleFormat expected ${DEFAULT_SAMPLE_FORMAT}, got ${chunk.sampleFormat}`);
+      errors.push(`${prefix}.sampleFormat expected ${DEFAULT_SAMPLE_FORMAT}, got ${formatValue(chunk.sampleFormat)}`);
     }
     if (channels !== null && finiteNumberOrNull(chunk.channels) !== null && chunk.channels !== channels) {
       errors.push(`${prefix}.channels expected ${channels}, got ${chunk.channels}`);
@@ -542,7 +600,7 @@ function inspectRecoveredChunkSummary(chunk, prefix, errors, warnings) {
     return;
   }
   if (chunk.expectedBytes !== null && chunk.expectedBytes !== undefined && chunk.expectedBytes !== chunk.bytes) {
-    errors.push(`${prefix}.bytes expected recovered expectedBytes ${chunk.expectedBytes}, got ${chunk.bytes}`);
+    errors.push(`${prefix}.bytes expected recovered expectedBytes ${formatValue(chunk.expectedBytes)}, got ${formatValue(chunk.bytes)}`);
   }
   if (
     chunk.manifestFrames !== null &&
@@ -551,7 +609,7 @@ function inspectRecoveredChunkSummary(chunk, prefix, errors, warnings) {
     chunk.frames !== undefined &&
     chunk.manifestFrames !== chunk.frames
   ) {
-    errors.push(`${prefix}.frames expected recovered manifestFrames ${chunk.manifestFrames}, got ${chunk.frames}`);
+    errors.push(`${prefix}.frames expected recovered manifestFrames ${formatValue(chunk.manifestFrames)}, got ${formatValue(chunk.frames)}`);
   }
   warnings.push(`${prefix} has recovered chunk metadata without block lists; raw .f32 files were not inspected`);
 }
@@ -727,7 +785,7 @@ function finiteNumberOrNull(value) {
 }
 
 function stringOrNull(value) {
-  return typeof value === "string" ? value : null;
+  return typeof value === "string" ? value.slice(0, MAX_DIAGNOSTIC_CHARS) : null;
 }
 
 function isObject(value) {
@@ -753,7 +811,10 @@ function formatNumber(value) {
 }
 
 function formatValue(value) {
-  return value === null ? "null" : JSON.stringify(value);
+  if (value === null) return "null";
+  if (typeof value === "string") return JSON.stringify(value.slice(0, MAX_DIAGNOSTIC_CHARS));
+  if (typeof value === "object") return "<non-scalar>";
+  return String(value);
 }
 
 function usage() {

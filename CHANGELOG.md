@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Require unique session-owned inspector chunk identities and bound aggregate inspection work and retained diagnostics, reporting omitted counts without losing failed verdicts.
+
 - Refuse unsupported inspector manifest versions and retain OPFS manifests with incompatible schema/session identity as fatal read-only recovery entries.
 
 - Retain observed native loss on counter regression; advertise the acquisition source in stream-started and refuse mismatched source/regressing cursor stats before evidence mutation.
