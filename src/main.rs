@@ -907,6 +907,13 @@ fn find_supported_input_config(
         })
 }
 
+// Count sample copies/moves at their operation sites for deterministic work
+// regressions; thread-local ownership keeps parallel tests independent.
+#[cfg(test)]
+thread_local! {
+    static AGGREGATION_SAMPLE_MOVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn aggregate_input_blocks(
     sample_rx: std::sync::mpsc::Receiver<Vec<f32>>,
     block_tx: broadcast::Sender<Arc<AudioBlock>>,
@@ -914,21 +921,30 @@ fn aggregate_input_blocks(
     frames_per_block: u32,
 ) {
     let block_samples = usize::from(channels) * frames_per_block as usize;
-    let mut pending = Vec::with_capacity(block_samples * 2);
+    let mut pending = Vec::with_capacity(block_samples);
     let mut frame_start = 0_u64;
 
-    while let Ok(mut samples) = sample_rx.recv() {
-        pending.append(&mut samples);
-        while pending.len() >= block_samples {
-            let samples: Vec<f32> = pending.drain(0..block_samples).collect();
-            let block = Arc::new(AudioBlock {
-                frame_start,
-                frame_count: frames_per_block,
-                channels,
-                samples,
-            });
-            let _ = block_tx.send(block);
-            frame_start += u64::from(frames_per_block);
+    while let Ok(samples) = sample_rx.recv() {
+        let mut remaining = samples.as_slice();
+        while !remaining.is_empty() {
+            let take = (block_samples - pending.len()).min(remaining.len());
+            // Copy each accepted sample exactly once, into its final block.
+            // The cursor advances without shifting the callback's remainder.
+            #[cfg(test)]
+            AGGREGATION_SAMPLE_MOVES.update(|count| count + take);
+            pending.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if pending.len() == block_samples {
+                let samples = std::mem::replace(&mut pending, Vec::with_capacity(block_samples));
+                let block = Arc::new(AudioBlock {
+                    frame_start,
+                    frame_count: frames_per_block,
+                    channels,
+                    samples,
+                });
+                let _ = block_tx.send(block);
+                frame_start += u64::from(frames_per_block);
+            }
         }
     }
 }
@@ -1061,52 +1077,96 @@ mod tests {
     }
 
     #[test]
-    fn callback_partitions_match_concatenation_oracle() {
-        let frames_per_block = 4;
+    fn aggregation_sample_moves_are_linear_in_callback_size() {
         for channels in [1_u16, 2, 5] {
-            for partitions in [
-                vec![],
-                vec![0],
-                vec![1, 1, 1, 1, 1, 1, 1, 1, 1],
-                vec![3, 7, 0, 2, 6, 1],
-                vec![12],
-                vec![4, 4],
-                vec![2, 1],
-            ] {
-                let total_samples = partitions.iter().sum::<usize>() * usize::from(channels);
-                let source: Vec<f32> = (0..total_samples)
-                    .map(|index| (index as f32 - 17.0) / 8.0)
-                    .collect();
-                let block_samples = frames_per_block as usize * usize::from(channels);
-                let expected: Vec<_> = source.chunks_exact(block_samples).collect();
-                let (sample_tx, sample_rx) = std::sync::mpsc::channel();
-                let mut offset = 0;
-                for frames in &partitions {
-                    let end = offset + frames * usize::from(channels);
-                    sample_tx.send(source[offset..end].to_vec()).unwrap();
-                    offset = end;
-                }
-                drop(sample_tx);
-                let (blocks, mut output) = broadcast::channel(expected.len() + 1);
-                aggregate_input_blocks(sample_rx, blocks, channels, frames_per_block);
-                for (index, samples) in expected.iter().enumerate() {
-                    let block = output.try_recv().expect("every full block is broadcast");
-                    assert_eq!(
-                        block.frame_start,
-                        index as u64 * u64::from(frames_per_block)
-                    );
-                    assert_eq!(block.frame_count, frames_per_block);
-                    assert_eq!(block.channels, channels);
-                    assert_eq!(
-                        block.samples, *samples,
-                        "callback partitions: {partitions:?}"
+            for frames_per_block in [1, 2, 7, 960] {
+                for partitions in [vec![8192], vec![1, 8192, 2], vec![3, 0, 1, 8188]] {
+                    let total_samples = partitions.iter().sum::<usize>() * usize::from(channels);
+                    let (sample_tx, sample_rx) = std::sync::mpsc::channel();
+                    for frames in partitions {
+                        sample_tx
+                            .send(vec![0.25; frames * usize::from(channels)])
+                            .unwrap();
+                    }
+                    drop(sample_tx);
+                    let (blocks, output) = broadcast::channel(1);
+                    drop(output);
+                    AGGREGATION_SAMPLE_MOVES.set(0);
+                    aggregate_input_blocks(sample_rx, blocks, channels, frames_per_block);
+                    let moved = AGGREGATION_SAMPLE_MOVES.get();
+                    assert!(
+                        moved <= total_samples,
+                        "{channels} channels / {frames_per_block} frames: {moved} sample moves for {total_samples} inputs"
                     );
                 }
-                // Closure discards the incomplete tail, including an all-tail stream.
-                assert!(matches!(
-                    output.try_recv(),
-                    Err(broadcast::error::TryRecvError::Closed)
-                ));
+            }
+        }
+    }
+
+    #[test]
+    fn callback_partitions_match_concatenation_oracle() {
+        for frames_per_block in [1, 4, 7, 960] {
+            for channels in [1_u16, 2, 5] {
+                for partitions in [
+                    vec![],
+                    vec![0],
+                    vec![1, 1, 1, 1, 1, 1, 1, 1, 1],
+                    vec![3, 7, 0, 2, 6, 1],
+                    vec![12],
+                    vec![8192, 1, 3],
+                    vec![4, 4],
+                    vec![2, 1],
+                ] {
+                    let total_samples = partitions.iter().sum::<usize>() * usize::from(channels);
+                    let source: Vec<f32> = (0..total_samples)
+                        .map(|index| match index % 5 {
+                            0 => -0.0,
+                            1 => f32::from_bits(1),
+                            _ => (index as f32 - 17.0) / 8.0,
+                        })
+                        .collect();
+                    let block_samples = frames_per_block as usize * usize::from(channels);
+                    let expected: Vec<_> = source.chunks_exact(block_samples).collect();
+                    let (sample_tx, sample_rx) = std::sync::mpsc::channel();
+                    let mut offset = 0;
+                    for frames in &partitions {
+                        let end = offset + frames * usize::from(channels);
+                        sample_tx.send(source[offset..end].to_vec()).unwrap();
+                        offset = end;
+                    }
+                    drop(sample_tx);
+                    let (blocks, mut output) = broadcast::channel(expected.len() + 1);
+                    aggregate_input_blocks(sample_rx, blocks, channels, frames_per_block);
+                    for (index, samples) in expected.iter().enumerate() {
+                        let block = output.try_recv().expect("every full block is broadcast");
+                        assert_eq!(
+                            block.frame_start,
+                            index as u64 * u64::from(frames_per_block)
+                        );
+                        assert_eq!(block.frame_count, frames_per_block);
+                        assert_eq!(block.channels, channels);
+                        assert_eq!(
+                            block.samples, *samples,
+                            "callback partitions: {partitions:?}"
+                        );
+                        let oracle = AudioBlock {
+                            frame_start: index as u64 * u64::from(frames_per_block),
+                            frame_count: frames_per_block,
+                            channels,
+                            samples: samples.to_vec(),
+                        };
+                        assert_eq!(
+                            encode_pcm_block(&block),
+                            encode_pcm_block(&oracle),
+                            "exact headers/PCM, including signed zero and subnormals"
+                        );
+                    }
+                    // Closure discards the incomplete tail, including an all-tail stream.
+                    assert!(matches!(
+                        output.try_recv(),
+                        Err(broadcast::error::TryRecvError::Closed)
+                    ));
+                }
             }
         }
     }

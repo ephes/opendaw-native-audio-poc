@@ -98,8 +98,8 @@ notification followed by the available PCM; the two-second send deadline still
 ends stalled clients. For 31 channels and 65,536 frames/block, `C = 8`; ordinary
 12-channel, 960-frame streaming keeps `C = 256`. No wire fields change. These are
 retained PCM/encoded byte bounds, not a whole-process memory limit: allocator
-slack, queue metadata, control traffic, the callback queue and browser allocations
-are separate.
+slack, queue metadata, control traffic, callback/aggregation buffers and browser
+allocations are separate.
 
 ## PCM Blocks
 
@@ -152,6 +152,15 @@ For native input, PCM `frameStart` starts at zero and advances by the size of
 each emitted full block in the **accepted-sample** timeline. Rejected callback
 buffers therefore do not create PCM frame-index gaps; native loss must be read
 from the stats counters and source `atFrame`, not inferred from PCM continuity.
+
+Splitting advances a cursor through each accepted callback and copies each sample
+once into its final output block. Publishing transfers ownership of that block;
+no emitted block shifts the remaining callback samples. This bounds aggregation
+work linearly in accepted samples, including `framesPerBlock = 1`. Pending carry
+between callbacks holds fewer than `framesPerBlock * channels` samples; its
+allocation is one block, independent of callback length. Synthetic tests count
+sample moves and compare exact PCM/header bytes across callback partitions,
+including signed zero, subnormals, one-frame blocks and discarded partial tails.
 
 For 12 channels at 48 kHz, raw throughput is modest:
 

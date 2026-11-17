@@ -75,9 +75,18 @@ flush immediately, have a finite byte limit, and retain the two-second send
 deadline. A slow receiver can therefore report `server-client-lagged` sooner at
 large geometries; it resumes from retained blocks, or disconnects on a stalled
 send. This budget covers PCM payloads and encoding/write-buffer bytes, excluding
-allocator/queue bookkeeping, control traffic, callback buffers and the browser's
-separate monitor/recording allocations. Geometry and fanout arithmetic are checked
+allocator/queue bookkeeping, control traffic, callback/aggregation buffers and
+the browser's separate monitor/recording allocations. Geometry and fanout
+arithmetic are checked
 before listener/device startup; insufficient headroom refuses startup.
+
+Native callback aggregation copies each accepted sample once into its final
+output block, advancing a cursor through each callback instead of shifting a
+pending suffix after every emission. Work is linear in callback sample count,
+even with one-frame output blocks. Cross-callback carry is smaller than one
+block; only full blocks are broadcast and the final partial tail is discarded.
+PCM frame indices retain the accepted-sample timeline; native drop counters
+remain the source of capture-loss evidence.
 
 The server defaults to `http://127.0.0.1:4545` and exposes its PCM WebSocket at `/ws`. Use `--port` to choose another port and `--frames-per-block` to change the WebSocket block size. The page is served with COOP/COEP headers so `SharedArrayBuffer` is available.
 
