@@ -50,6 +50,7 @@ const CONNECTION_REPLIES = new Set(["socket-state", "shared-buffer", "meters", "
 let audioContext = null;
 let workletNode = null;
 let monitorAttempt = null;
+const MONITOR_STARTUP_TIMEOUT_MS = 10_000;
 let sharedBuffer = null;
 let stateView = null;
 let streamInfo = null;
@@ -232,6 +233,8 @@ function ensureWorker() {
 function releaseMonitor(attempt) {
   if (!attempt || attempt.closed) return;
   attempt.closed = true;
+  clearTimeout(attempt.timer);
+  attempt.retire();
   if (attempt.node) {
     attempt.node.port.removeEventListener("message", attempt.onMessage);
     attempt.node.removeEventListener("processorerror", attempt.onFault);
@@ -254,15 +257,22 @@ function stopMonitor() {
 function startMonitor() {
   if (!sharedBuffer) return Promise.resolve();
   if (monitorAttempt) return monitorAttempt.promise;
-  const attempt = { buffer: sharedBuffer, info: streamInfo, context: null, node: null };
+  const attempt = { buffer: sharedBuffer, info: streamInfo, context: null, node: null, starting: true };
+  attempt.retired = new Promise(resolve => { attempt.retire = resolve; });
   monitorAttempt = attempt;
   els.monitor.disabled = true;
   attempt.promise = (async () => {
     const current = () => monitorAttempt === attempt && sharedBuffer === attempt.buffer;
+    attempt.timer = setTimeout(() => {
+      if (!current() || !attempt.starting) return;
+      stopMonitor();
+      els.streamSummary.textContent = "Monitor startup timed out; Start Monitor to retry";
+      els.monitor.disabled = !sharedBuffer;
+    }, MONITOR_STARTUP_TIMEOUT_MS);
     try {
       const context = new AudioContext({ sampleRate: attempt.info.sampleRate });
       attempt.context = context;
-      await context.audioWorklet.addModule("/bridge-processor.js");
+      await Promise.race([context.audioWorklet.addModule("/bridge-processor.js"), attempt.retired]);
       if (!current()) return;
       const node = new AudioWorkletNode(context, "native-bridge-processor", {
         numberOfInputs: 0,
@@ -287,7 +297,7 @@ function startMonitor() {
         type: "configure", sharedBuffer: attempt.buffer,
         left: Number(els.leftChannel.value), right: Number(els.rightChannel.value),
       });
-      await context.resume();
+      await Promise.race([context.resume(), attempt.retired]);
       if (!current()) return;
       audioContext = context;
       workletNode = node;
@@ -300,6 +310,8 @@ function startMonitor() {
       }
       releaseMonitor(attempt);
     } finally {
+      attempt.starting = false;
+      clearTimeout(attempt.timer);
       if (!current()) releaseMonitor(attempt);
       if (!monitorAttempt || monitorAttempt === attempt) {
         els.monitor.disabled = !sharedBuffer || Boolean(workletNode);

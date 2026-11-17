@@ -160,3 +160,75 @@ test("processor fault during resume cannot publish failed monitor", async (t) =>
   assert.equal(f.elements.get("#monitor").disabled, false);
   assert.equal(f.contexts[0].closes, 1);
 });
+
+for (const phase of ["load", "resume"]) {
+  test(`total monitor deadline expires stalled ${phase} and fences late settlement after retry`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const f = await appFixture(t);
+    f.stream();
+    const messages = f.worker.messages.slice();
+    const first = f.click("#monitor"), duplicate = f.click("#monitor");
+    const old = f.contexts[0], resume = deferred();
+    t.mock.timers.tick(6_000);
+    if (phase === "resume") {
+      old.resumeResult = resume.promise;
+      old.load.resolve();
+      await settle();
+    }
+    t.mock.timers.tick(3_999);
+    await settle();
+    assert.equal(f.elements.get("#monitor").disabled, true);
+    t.mock.timers.tick(1);
+    await settle();
+    assert.equal(f.elements.get("#monitor").disabled, false);
+    assert.equal(f.elements.get("#monitor").textContent, "Start Monitor");
+    assert.match(f.elements.get("#stream-summary").textContent, /timed out.*retry/i);
+    assert.equal(old.closes, 1);
+    assert.ok(f.nodes.every(n => n.disconnected));
+    assert.ok(f.nodes.every(n => n.handlers.size === 0 && n.portHandlers.size === 0));
+    await Promise.all([first, duplicate]); // Settles even if the browser promise never does.
+    const retry = f.click("#monitor");
+    const current = f.contexts[1];
+    current.load.resolve();
+    await retry;
+    old.load.resolve(); resume.resolve();
+    await settle();
+    t.mock.timers.tick(10_000);
+    await settle();
+    assert.equal(f.contexts.length, 2);
+    assert.equal(f.nodes.filter(n => !n.disconnected).length, 1);
+    assert.equal(current.closes, 0);
+    assert.equal(old.closes, 1);
+    assert.equal(f.elements.get("#monitor").textContent, "Monitoring");
+    assert.deepEqual(f.worker.messages, messages, "monitor timeout must not change recorder/transport ownership");
+  });
+}
+
+test("disconnect settles a pending monitor and clears only its deadline", async (t) => {
+  const timers = new Map();
+  let nextTimer = 0;
+  const f = await appFixture(t, {
+    setTimeout(callback, delay) { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
+    clearTimeout(id) { timers.delete(id); },
+  });
+  f.stream();
+  const pending = f.click("#monitor");
+  assert.equal(timers.size, 1);
+  const staleTimer = [...timers.values()][0];
+  assert.equal(staleTimer.delay, 10_000);
+  f.click("#connect");
+  assert.equal(timers.size, 0);
+  await pending;
+  f.stream();
+  const current = f.click("#monitor");
+  staleTimer.callback();
+  await settle();
+  assert.equal(timers.size, 1);
+  assert.equal(f.contexts[1].closes, 0);
+  f.contexts[1].load.resolve();
+  await current;
+  assert.equal(timers.size, 0);
+  staleTimer.callback();
+  await settle();
+  assert.equal(f.elements.get("#monitor").textContent, "Monitoring");
+});

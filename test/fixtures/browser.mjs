@@ -17,7 +17,7 @@ export function deferred() {
   return { promise, resolve, reject };
 }
 
-export async function appFixture(t) {
+export async function appFixture(t, values = {}) {
   class Element {
     value = "";
     children = [];
@@ -89,6 +89,7 @@ export async function appFixture(t) {
     location: { protocol: "http:", host: "synthetic.invalid" },
     Worker: FixtureWorker, AudioContext: Context, AudioWorkletNode: Node,
     Option: class { constructor(text, value) { this.text = text; this.value = value; } },
+    ...values,
   });
   await import(`../../public/app.js?fixture=${crypto.randomUUID()}`);
   const stream = (sharedBuffer = new SharedArrayBuffer(256 + 16)) => {
