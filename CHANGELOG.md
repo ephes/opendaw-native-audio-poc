@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Observe current monitor AudioContext state; expose user-gesture Resume Monitor after suspension/interruption and Start Monitor after closure or failed/timed-out resume. Keep recovery single-flight, fence retired events and preserve recording/session ownership and monitor counters.
+
+- Bound browser monitor module loading and resume with one ten-second total startup deadline; settle retired waits, close owned resources and fence late completion so Start Monitor can retry independently of recording.
+
 - Split accepted native callback samples with a cursor and one block of carry, copying samples once instead of repeatedly shifting a pending suffix. Preserve exact PCM, full-block output, accepted-sample frame indices and final-tail discard.
 
 - Bound native PCM broadcast retention by a checked 256 MiB fanout budget, including producer and eight-client raw/encoding/socket headroom; round queue capacity down and release raw PCM before bounded socket sends. Large blocks retain fewer than 256 queued blocks, with existing lag/deadline behavior.

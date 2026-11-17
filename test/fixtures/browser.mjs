@@ -17,7 +17,7 @@ export function deferred() {
   return { promise, resolve, reject };
 }
 
-export async function appFixture(t) {
+export async function appFixture(t, values = {}) {
   class Element {
     value = "";
     children = [];
@@ -54,11 +54,20 @@ export async function appFixture(t) {
     resumeResult = Promise.resolve();
     state = "suspended";
     closes = 0;
+    resumes = 0;
+    handlers = new Map();
+    resumeState = "running";
+    addEventListener(type, handler) { this.handlers.set(type, handler); }
+    removeEventListener(type, handler) { if (this.handlers.get(type) === handler) this.handlers.delete(type); }
+    setState(state) { this.state = state; this.handlers.get("statechange")?.(); }
     destination = {};
     audioWorklet = { addModule: () => this.load.promise };
     constructor() { contexts.push(this); }
-    resume() { return this.resumeResult; }
-    async close() { this.closes++; this.state = "closed"; }
+    resume() {
+      this.resumes++;
+      return this.resumeResult.then(() => { if (this.state !== "closed") this.setState(this.resumeState); });
+    }
+    async close() { this.closes++; this.setState("closed"); }
   }
   class Node {
     disconnected = false;
@@ -89,6 +98,7 @@ export async function appFixture(t) {
     location: { protocol: "http:", host: "synthetic.invalid" },
     Worker: FixtureWorker, AudioContext: Context, AudioWorkletNode: Node,
     Option: class { constructor(text, value) { this.text = text; this.value = value; } },
+    ...values,
   });
   await import(`../../public/app.js?fixture=${crypto.randomUUID()}`);
   const stream = (sharedBuffer = new SharedArrayBuffer(256 + 16)) => {
