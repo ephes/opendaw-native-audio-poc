@@ -44,6 +44,10 @@ const MAX_FRAMES_PER_BLOCK: u32 = 65_536;
 const MAX_RING_BYTES: u64 = 64 * 1024 * 1024;
 const RING_STATE_BYTES: u64 = 256;
 const PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS: usize = 256;
+// Covers the largest server frame header (14 bytes) plus one unflushed
+// automatic pong (up to 2 + 125 bytes) with slack, so a pending pong cannot make
+// tungstenite reject the next full PCM frame with WriteBufferFull.
+const WEBSOCKET_FRAME_HEADROOM_BYTES: u64 = 256;
 const MAX_PCM_FANOUT_BYTES: u64 = 256 * 1024 * 1024;
 const INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS: usize = 64;
 const MAX_WEBSOCKET_CLIENTS: usize = 8;
@@ -398,7 +402,7 @@ fn pcm_retention(channels: u16, frames: u32, budget: u64) -> Result<PcmRetention
     // PCM blocks must allow stream-started, stats and error messages.
     let socket_bytes = encoded_bytes
         .max(4096)
-        .checked_add(128)
+        .checked_add(WEBSOCKET_FRAME_HEADROOM_BYTES)
         .context("WebSocket buffer overflow")?;
     // Arc payloads in the ring are shared, not multiplied by receiver count.
     // Conservatively reserve one extra raw payload per client, one encoding,
@@ -914,6 +918,15 @@ thread_local! {
     static AGGREGATION_SAMPLE_MOVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The only place aggregation moves or copies samples. Any new copy path in
+/// `aggregate_input_blocks` must go through this helper so the linear-work
+/// regression test keeps counting every sample move.
+fn copy_aggregation_samples(pending: &mut Vec<f32>, samples: &[f32]) {
+    #[cfg(test)]
+    AGGREGATION_SAMPLE_MOVES.update(|count| count + samples.len());
+    pending.extend_from_slice(samples);
+}
+
 fn aggregate_input_blocks(
     sample_rx: std::sync::mpsc::Receiver<Vec<f32>>,
     block_tx: broadcast::Sender<Arc<AudioBlock>>,
@@ -930,9 +943,7 @@ fn aggregate_input_blocks(
             let take = (block_samples - pending.len()).min(remaining.len());
             // Copy each accepted sample exactly once, into its final block.
             // The cursor advances without shifting the callback's remainder.
-            #[cfg(test)]
-            AGGREGATION_SAMPLE_MOVES.update(|count| count + take);
-            pending.extend_from_slice(&remaining[..take]);
+            copy_aggregation_samples(&mut pending, &remaining[..take]);
             remaining = &remaining[take..];
             if pending.len() == block_samples {
                 let samples = std::mem::replace(&mut pending, Vec::with_capacity(block_samples));

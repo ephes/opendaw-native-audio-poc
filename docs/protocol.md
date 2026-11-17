@@ -83,7 +83,7 @@ transport loss as an interrupted session, retaining flushed recoverable audio.
 
 Broadcast retention is bounded by both 256 blocks and a 256 MiB PCM byte budget.
 For payload size `P = channels * framesPerBlock * 4`, encoded size `E = P + 16`
-and socket limit `W = max(E, 4096) + 128`, reserve `P + 8 * (P + E + W)`
+and socket limit `W = max(E, 4096) + 256` (frame header plus one pending pong), reserve `P + 8 * (P + E + W)`
 bytes for a producer block and all eight admitted clients. Each client's reserve
 covers an out-of-ring raw `Arc`, one encoding and its WebSocket write buffer;
 encoding releases the raw reference before awaiting the send. Shared ring payloads
@@ -159,7 +159,8 @@ no emitted block shifts the remaining callback samples. This bounds aggregation
 work linearly in accepted samples, including `framesPerBlock = 1`. Pending carry
 between callbacks holds fewer than `framesPerBlock * channels` samples; its
 allocation is one block, independent of callback length. Synthetic tests count
-sample moves and compare exact PCM/header bytes across callback partitions,
+sample moves at the single copy helper that all aggregation copies must use, and
+compare exact PCM/header bytes across callback partitions,
 including signed zero, subnormals, one-frame blocks and discarded partial tails.
 
 For 12 channels at 48 kHz, raw throughput is modest:
