@@ -44,6 +44,11 @@ const MAX_FRAMES_PER_BLOCK: u32 = 65_536;
 const MAX_RING_BYTES: u64 = 64 * 1024 * 1024;
 const RING_STATE_BYTES: u64 = 256;
 const PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS: usize = 256;
+// Covers the largest server frame header (14 bytes) plus one unflushed
+// automatic pong (up to 2 + 125 bytes) with slack, so a pending pong cannot make
+// tungstenite reject the next full PCM frame with WriteBufferFull.
+const WEBSOCKET_FRAME_HEADROOM_BYTES: u64 = 256;
+const MAX_PCM_FANOUT_BYTES: u64 = 256 * 1024 * 1024;
 const INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS: usize = 64;
 const MAX_WEBSOCKET_CLIENTS: usize = 8;
 const CLIENT_SEND_DEADLINE: Duration = Duration::from_secs(2);
@@ -94,6 +99,7 @@ struct AppState {
     native_stats: Arc<NativeInputStats>,
     capture_fault: watch::Receiver<bool>,
     client_permits: Arc<Semaphore>,
+    max_write_buffer_bytes: usize,
 }
 
 struct SourceRuntime {
@@ -304,7 +310,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
 }
 
 fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
-    let (block_tx, _) = broadcast::channel::<Arc<AudioBlock>>(PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS);
+    let retention = pcm_retention(args.channels, args.frames_per_block, MAX_PCM_FANOUT_BYTES)?;
+    let (block_tx, _) = broadcast::channel::<Arc<AudioBlock>>(retention.capacity_blocks);
+    println!(
+        "PCM fanout: {} blocks, {} retained bytes including client headroom",
+        retention.capacity_blocks, retention.retained_bytes
+    );
     let native_stats = Arc::new(NativeInputStats::new(
         args.source,
         match args.source {
@@ -345,6 +356,7 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
     };
 
     let state = AppState {
+        max_write_buffer_bytes: retention.max_write_buffer_bytes,
         authority: loopback_authority(args.port),
         stream_info,
         blocks: block_tx,
@@ -371,6 +383,56 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
         .with_state(state);
 
     Ok((app, source_runtime))
+}
+
+struct PcmRetention {
+    capacity_blocks: usize,
+    max_write_buffer_bytes: usize,
+    retained_bytes: u64,
+}
+
+fn pcm_retention(channels: u16, frames: u32, budget: u64) -> Result<PcmRetention> {
+    let pcm_bytes = u64::from(channels)
+        .checked_mul(u64::from(frames))
+        .and_then(|samples| samples.checked_mul(4))
+        .filter(|bytes| *bytes > 0)
+        .context("invalid PCM payload size")?;
+    let encoded_bytes = pcm_bytes.checked_add(16).context("PCM encoding overflow")?;
+    // Include the WebSocket header and bounded control/pong headroom. Even tiny
+    // PCM blocks must allow stream-started, stats and error messages.
+    let socket_bytes = encoded_bytes
+        .max(4096)
+        .checked_add(WEBSOCKET_FRAME_HEADROOM_BYTES)
+        .context("WebSocket buffer overflow")?;
+    // Arc payloads in the ring are shared, not multiplied by receiver count.
+    // Conservatively reserve one extra raw payload per client, one encoding,
+    // one bounded socket write buffer, and one producer block outside the ring.
+    let reserved = pcm_bytes
+        .checked_add(encoded_bytes)
+        .and_then(|bytes| bytes.checked_add(socket_bytes))
+        .and_then(|bytes| bytes.checked_mul(MAX_WEBSOCKET_CLIENTS as u64))
+        .and_then(|bytes| bytes.checked_add(pcm_bytes))
+        .context("PCM client headroom overflow")?;
+    let available_blocks = budget
+        .checked_sub(reserved)
+        .context("PCM fanout budget cannot cover client headroom")?
+        / pcm_bytes;
+    let ceiling = available_blocks.min(PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS as u64);
+    if ceiling == 0 {
+        bail!("PCM fanout budget cannot retain one block");
+    }
+    // Tokio rounds requested capacities UP; choose a power of two DOWN so its
+    // actual ring cannot retain more PCM than the checked byte budget allows.
+    let capacity_blocks = 1_usize << ceiling.ilog2();
+    let retained_bytes = (capacity_blocks as u64)
+        .checked_mul(pcm_bytes)
+        .and_then(|bytes| bytes.checked_add(reserved))
+        .context("PCM retention overflow")?;
+    Ok(PcmRetention {
+        capacity_blocks,
+        max_write_buffer_bytes: usize::try_from(socket_bytes)?,
+        retained_bytes,
+    })
 }
 
 fn validate_serve_args(args: &ServeArgs) -> Result<()> {
@@ -409,6 +471,7 @@ fn validate_serve_args(args: &ServeArgs) -> Result<()> {
     if block_bytes > MAX_RING_BYTES || ring_bytes > MAX_RING_BYTES {
         bail!("stream geometry exceeds the 64 MiB monitor ring byte limit (including metadata)");
     }
+    pcm_retention(args.channels, args.frames_per_block, MAX_PCM_FANOUT_BYTES)?;
     Ok(())
 }
 
@@ -448,7 +511,9 @@ async fn ws_handler(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     // Axum drops this closure (and its permit) if the HTTP upgrade fails.
-    ws.on_upgrade(move |socket| websocket_stream(socket, state, permit))
+    ws.write_buffer_size(0)
+        .max_write_buffer_size(state.max_write_buffer_bytes)
+        .on_upgrade(move |socket| websocket_stream(socket, state, permit))
         .into_response()
 }
 
@@ -536,6 +601,8 @@ async fn send_stream<S: Sink<Message> + Unpin>(
                 match result {
                     Ok(block) => {
                         let payload = encode_pcm_block(&block);
+                        // No raw Arc may outlive encoding while this send stalls.
+                        drop(block);
                         if !send_with_deadline(&mut sender, Message::Binary(payload.into()), deadline).await {
                             break;
                         }
@@ -844,6 +911,22 @@ fn find_supported_input_config(
         })
 }
 
+// Count sample copies/moves at their operation sites for deterministic work
+// regressions; thread-local ownership keeps parallel tests independent.
+#[cfg(test)]
+thread_local! {
+    static AGGREGATION_SAMPLE_MOVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The only place aggregation moves or copies samples. Any new copy path in
+/// `aggregate_input_blocks` must go through this helper so the linear-work
+/// regression test keeps counting every sample move.
+fn copy_aggregation_samples(pending: &mut Vec<f32>, samples: &[f32]) {
+    #[cfg(test)]
+    AGGREGATION_SAMPLE_MOVES.update(|count| count + samples.len());
+    pending.extend_from_slice(samples);
+}
+
 fn aggregate_input_blocks(
     sample_rx: std::sync::mpsc::Receiver<Vec<f32>>,
     block_tx: broadcast::Sender<Arc<AudioBlock>>,
@@ -851,21 +934,28 @@ fn aggregate_input_blocks(
     frames_per_block: u32,
 ) {
     let block_samples = usize::from(channels) * frames_per_block as usize;
-    let mut pending = Vec::with_capacity(block_samples * 2);
+    let mut pending = Vec::with_capacity(block_samples);
     let mut frame_start = 0_u64;
 
-    while let Ok(mut samples) = sample_rx.recv() {
-        pending.append(&mut samples);
-        while pending.len() >= block_samples {
-            let samples: Vec<f32> = pending.drain(0..block_samples).collect();
-            let block = Arc::new(AudioBlock {
-                frame_start,
-                frame_count: frames_per_block,
-                channels,
-                samples,
-            });
-            let _ = block_tx.send(block);
-            frame_start += u64::from(frames_per_block);
+    while let Ok(samples) = sample_rx.recv() {
+        let mut remaining = samples.as_slice();
+        while !remaining.is_empty() {
+            let take = (block_samples - pending.len()).min(remaining.len());
+            // Copy each accepted sample exactly once, into its final block.
+            // The cursor advances without shifting the callback's remainder.
+            copy_aggregation_samples(&mut pending, &remaining[..take]);
+            remaining = &remaining[take..];
+            if pending.len() == block_samples {
+                let samples = std::mem::replace(&mut pending, Vec::with_capacity(block_samples));
+                let block = Arc::new(AudioBlock {
+                    frame_start,
+                    frame_count: frames_per_block,
+                    channels,
+                    samples,
+                });
+                let _ = block_tx.send(block);
+                frame_start += u64::from(frames_per_block);
+            }
         }
     }
 }
@@ -891,6 +981,60 @@ mod tests {
         connect_async,
         tungstenite::{Error as WsError, Message as ClientMessage, client::IntoClientRequest},
     };
+
+    #[test]
+    fn fanout_retention_bounds_extreme_geometry_and_rounding() {
+        for channels in 1..=MAX_CHANNELS {
+            for sample_rate in [1, 48_000, 262_144, MAX_SAMPLE_RATE] {
+                for frames in [1, 960, MAX_FRAMES_PER_BLOCK] {
+                    let ring_bytes = (u64::from(frames) * 8)
+                        .max(u64::from(sample_rate) * 2)
+                        .next_power_of_two()
+                        * u64::from(channels)
+                        * 4
+                        + RING_STATE_BYTES;
+                    if ring_bytes > MAX_RING_BYTES {
+                        continue;
+                    }
+                    let args = ServeArgs {
+                        source: Source::Sine,
+                        device: None,
+                        channels,
+                        sample_rate,
+                        frames_per_block: frames,
+                        port: 0,
+                    };
+                    validate_serve_args(&args).unwrap();
+                    let plan = pcm_retention(channels, frames, MAX_PCM_FANOUT_BYTES).unwrap();
+                    assert!(
+                        plan.retained_bytes <= MAX_PCM_FANOUT_BYTES,
+                        "{channels} channels / {frames} frames: {} bytes",
+                        plan.retained_bytes
+                    );
+                    assert!(plan.capacity_blocks.is_power_of_two());
+                    assert!(plan.capacity_blocks <= PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS);
+                }
+            }
+        }
+        let largest = pcm_retention(31, 65_536, MAX_PCM_FANOUT_BYTES).unwrap();
+        assert_eq!(largest.capacity_blocks, 8);
+        assert_eq!(
+            pcm_retention(12, 960, MAX_PCM_FANOUT_BYTES)
+                .unwrap()
+                .capacity_blocks,
+            256
+        );
+        // Keep exactly three blocks' worth of room: Tokio rounds up to a power
+        // of two, so requesting three would exceed this injected byte budget.
+        let base = pcm_retention(2, 1, MAX_PCM_FANOUT_BYTES).unwrap();
+        let reserved = base.retained_bytes - base.capacity_blocks as u64 * 8;
+        let small = pcm_retention(2, 1, reserved + 3 * 8).unwrap();
+        assert_eq!(small.capacity_blocks, 2);
+        assert!(small.retained_bytes <= reserved + 3 * 8);
+        assert!(pcm_retention(2, 1, reserved + 7).is_err());
+        assert!(pcm_retention(0, 1, MAX_PCM_FANOUT_BYTES).is_err());
+        assert!(pcm_retention(1, 0, MAX_PCM_FANOUT_BYTES).is_err());
+    }
 
     #[test]
     fn cli_geometry_matches_worker_admission() {
@@ -944,52 +1088,96 @@ mod tests {
     }
 
     #[test]
-    fn callback_partitions_match_concatenation_oracle() {
-        let frames_per_block = 4;
+    fn aggregation_sample_moves_are_linear_in_callback_size() {
         for channels in [1_u16, 2, 5] {
-            for partitions in [
-                vec![],
-                vec![0],
-                vec![1, 1, 1, 1, 1, 1, 1, 1, 1],
-                vec![3, 7, 0, 2, 6, 1],
-                vec![12],
-                vec![4, 4],
-                vec![2, 1],
-            ] {
-                let total_samples = partitions.iter().sum::<usize>() * usize::from(channels);
-                let source: Vec<f32> = (0..total_samples)
-                    .map(|index| (index as f32 - 17.0) / 8.0)
-                    .collect();
-                let block_samples = frames_per_block as usize * usize::from(channels);
-                let expected: Vec<_> = source.chunks_exact(block_samples).collect();
-                let (sample_tx, sample_rx) = std::sync::mpsc::channel();
-                let mut offset = 0;
-                for frames in &partitions {
-                    let end = offset + frames * usize::from(channels);
-                    sample_tx.send(source[offset..end].to_vec()).unwrap();
-                    offset = end;
-                }
-                drop(sample_tx);
-                let (blocks, mut output) = broadcast::channel(expected.len() + 1);
-                aggregate_input_blocks(sample_rx, blocks, channels, frames_per_block);
-                for (index, samples) in expected.iter().enumerate() {
-                    let block = output.try_recv().expect("every full block is broadcast");
-                    assert_eq!(
-                        block.frame_start,
-                        index as u64 * u64::from(frames_per_block)
-                    );
-                    assert_eq!(block.frame_count, frames_per_block);
-                    assert_eq!(block.channels, channels);
-                    assert_eq!(
-                        block.samples, *samples,
-                        "callback partitions: {partitions:?}"
+            for frames_per_block in [1, 2, 7, 960] {
+                for partitions in [vec![8192], vec![1, 8192, 2], vec![3, 0, 1, 8188]] {
+                    let total_samples = partitions.iter().sum::<usize>() * usize::from(channels);
+                    let (sample_tx, sample_rx) = std::sync::mpsc::channel();
+                    for frames in partitions {
+                        sample_tx
+                            .send(vec![0.25; frames * usize::from(channels)])
+                            .unwrap();
+                    }
+                    drop(sample_tx);
+                    let (blocks, output) = broadcast::channel(1);
+                    drop(output);
+                    AGGREGATION_SAMPLE_MOVES.set(0);
+                    aggregate_input_blocks(sample_rx, blocks, channels, frames_per_block);
+                    let moved = AGGREGATION_SAMPLE_MOVES.get();
+                    assert!(
+                        moved <= total_samples,
+                        "{channels} channels / {frames_per_block} frames: {moved} sample moves for {total_samples} inputs"
                     );
                 }
-                // Closure discards the incomplete tail, including an all-tail stream.
-                assert!(matches!(
-                    output.try_recv(),
-                    Err(broadcast::error::TryRecvError::Closed)
-                ));
+            }
+        }
+    }
+
+    #[test]
+    fn callback_partitions_match_concatenation_oracle() {
+        for frames_per_block in [1, 4, 7, 960] {
+            for channels in [1_u16, 2, 5] {
+                for partitions in [
+                    vec![],
+                    vec![0],
+                    vec![1, 1, 1, 1, 1, 1, 1, 1, 1],
+                    vec![3, 7, 0, 2, 6, 1],
+                    vec![12],
+                    vec![8192, 1, 3],
+                    vec![4, 4],
+                    vec![2, 1],
+                ] {
+                    let total_samples = partitions.iter().sum::<usize>() * usize::from(channels);
+                    let source: Vec<f32> = (0..total_samples)
+                        .map(|index| match index % 5 {
+                            0 => -0.0,
+                            1 => f32::from_bits(1),
+                            _ => (index as f32 - 17.0) / 8.0,
+                        })
+                        .collect();
+                    let block_samples = frames_per_block as usize * usize::from(channels);
+                    let expected: Vec<_> = source.chunks_exact(block_samples).collect();
+                    let (sample_tx, sample_rx) = std::sync::mpsc::channel();
+                    let mut offset = 0;
+                    for frames in &partitions {
+                        let end = offset + frames * usize::from(channels);
+                        sample_tx.send(source[offset..end].to_vec()).unwrap();
+                        offset = end;
+                    }
+                    drop(sample_tx);
+                    let (blocks, mut output) = broadcast::channel(expected.len() + 1);
+                    aggregate_input_blocks(sample_rx, blocks, channels, frames_per_block);
+                    for (index, samples) in expected.iter().enumerate() {
+                        let block = output.try_recv().expect("every full block is broadcast");
+                        assert_eq!(
+                            block.frame_start,
+                            index as u64 * u64::from(frames_per_block)
+                        );
+                        assert_eq!(block.frame_count, frames_per_block);
+                        assert_eq!(block.channels, channels);
+                        assert_eq!(
+                            block.samples, *samples,
+                            "callback partitions: {partitions:?}"
+                        );
+                        let oracle = AudioBlock {
+                            frame_start: index as u64 * u64::from(frames_per_block),
+                            frame_count: frames_per_block,
+                            channels,
+                            samples: samples.to_vec(),
+                        };
+                        assert_eq!(
+                            encode_pcm_block(&block),
+                            encode_pcm_block(&oracle),
+                            "exact headers/PCM, including signed zero and subnormals"
+                        );
+                    }
+                    // Closure discards the incomplete tail, including an all-tail stream.
+                    assert!(matches!(
+                        output.try_recv(),
+                        Err(broadcast::error::TryRecvError::Closed)
+                    ));
+                }
             }
         }
     }
@@ -1168,6 +1356,9 @@ mod tests {
 
     fn client_state() -> AppState {
         AppState {
+            max_write_buffer_bytes: pcm_retention(2, 1, MAX_PCM_FANOUT_BYTES)
+                .unwrap()
+                .max_write_buffer_bytes,
             authority: "127.0.0.1:1".into(),
             stream_info: StreamStarted {
                 event_type: "stream-started",
@@ -1248,6 +1439,85 @@ mod tests {
         assert_eq!(value["code"], "device-lost");
         assert!(messages.try_recv().is_err());
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tiny_fanout_budget_lags_without_retaining_inflight_raw_pcm() {
+        let mut state = client_state();
+        let base = pcm_retention(2, 1, MAX_PCM_FANOUT_BYTES).unwrap();
+        let reserved = base.retained_bytes - base.capacity_blocks as u64 * 8;
+        let plan = pcm_retention(2, 1, reserved + 3 * 8).unwrap();
+        state.blocks = broadcast::channel(plan.capacity_blocks).0;
+        state.max_write_buffer_bytes = plan.max_write_buffer_bytes;
+        let (sink, reader, mut slow_messages, _close, dropped) = client_fixture(3);
+        let slow = tokio::spawn(websocket_client(
+            sink,
+            reader,
+            state.client_permits.clone().try_acquire_owned().unwrap(),
+            state.clone(),
+            Duration::from_millis(100),
+        ));
+        let (sink, reader, mut messages, close, _) = client_fixture(0);
+        let healthy = tokio::spawn(websocket_client(
+            sink,
+            reader,
+            state.client_permits.clone().try_acquire_owned().unwrap(),
+            state.clone(),
+            Duration::from_secs(1),
+        ));
+        for channel in [&mut slow_messages, &mut messages] {
+            fixture_message(channel).await;
+            fixture_message(channel).await;
+        }
+        let first = test_block();
+        let retained = Arc::downgrade(&first);
+        state.blocks.send(first).unwrap();
+        assert!(matches!(
+            fixture_message(&mut slow_messages).await,
+            Message::Binary(_)
+        ));
+        assert!(matches!(
+            fixture_message(&mut messages).await,
+            Message::Binary(_)
+        ));
+        // No yield: both subscriptions fall behind this two-slot ring.
+        for frame_start in 1..=3 {
+            let mut block = (*test_block()).clone();
+            block.frame_start = frame_start;
+            state.blocks.send(Arc::new(block)).unwrap();
+        }
+        assert!(
+            retained.upgrade().is_none(),
+            "stalled encoding retained raw PCM"
+        );
+        let lag: Value =
+            serde_json::from_str(fixture_message(&mut messages).await.to_text().unwrap()).unwrap();
+        assert_eq!(lag["code"], "server-client-lagged");
+        for frame in [2_u64, 3] {
+            let Message::Binary(payload) = fixture_message(&mut messages).await else {
+                panic!("expected retained PCM");
+            };
+            assert_eq!(
+                payload.as_ref(),
+                encode_pcm_block(&AudioBlock {
+                    frame_start: frame,
+                    ..(*test_block()).clone()
+                })
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(2), slow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(state.blocks.receiver_count(), 1);
+        close.send(Ok(Message::Close(None))).unwrap();
+        healthy.await.unwrap();
+        assert_eq!(
+            state.client_permits.available_permits(),
+            MAX_WEBSOCKET_CLIENTS
+        );
+        assert_eq!(state.blocks.receiver_count(), 0);
     }
 
     #[tokio::test]

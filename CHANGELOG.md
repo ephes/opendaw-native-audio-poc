@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Split accepted native callback samples with a cursor and one block of carry, copying samples once instead of repeatedly shifting a pending suffix. Preserve exact PCM, full-block output, accepted-sample frame indices and final-tail discard.
+
+- Bound native PCM broadcast retention by a checked 256 MiB fanout budget, including producer and eight-client raw/encoding/socket headroom; round queue capacity down and release raw PCM before bounded socket sends. Large blocks retain fewer than 256 queued blocks, with existing lag/deadline behavior.
+
 - Fence page/Worker connection commands and replies by generation, retiring already-posted stream buffers/state on Disconnect without discarding recovery or recording messages.
 - Settle WebSocket constructor refusal as a fixed retryable connection error before retiring the previous transport, preserving Worker recovery/recording ownership.
 - Deliver the bridge's `device-lost` explanation on the terminal `socket-state` so the connection-generation fence does not hide it from the page.
