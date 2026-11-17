@@ -65,6 +65,20 @@ The CLI checks geometry and byte arithmetic before binding a listener or opening
 a source/device. The individual maxima cannot all be used together; for example,
 31 channels at 262144 Hz with 65536 frames/block fits, while 32 channels does not.
 
+Native PCM fanout has a 256 MiB retained-byte budget. Broadcast capacity is the
+largest power of two, at most 256 blocks, that fits after reserving one producer
+payload and per-client raw/encoded/socket-buffer headroom for all eight clients.
+At the 31-channel example above this is eight blocks; the default 12-channel,
+960-frame geometry retains 256. The shared `Arc` payload is counted once per
+queue slot, with extra headroom for blocks held outside the queue. Socket writes
+flush immediately, have a finite byte limit, and retain the two-second send
+deadline. A slow receiver can therefore report `server-client-lagged` sooner at
+large geometries; it resumes from retained blocks, or disconnects on a stalled
+send. This budget covers PCM payloads and encoding/write-buffer bytes, excluding
+allocator/queue bookkeeping, control traffic, callback buffers and the browser's
+separate monitor/recording allocations. Geometry and fanout arithmetic are checked
+before listener/device startup; insufficient headroom refuses startup.
+
 The server defaults to `http://127.0.0.1:4545` and exposes its PCM WebSocket at `/ws`. Use `--port` to choose another port and `--frames-per-block` to change the WebSocket block size. The page is served with COOP/COEP headers so `SharedArrayBuffer` is available.
 
 Development shorthand:

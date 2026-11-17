@@ -44,6 +44,7 @@ const MAX_FRAMES_PER_BLOCK: u32 = 65_536;
 const MAX_RING_BYTES: u64 = 64 * 1024 * 1024;
 const RING_STATE_BYTES: u64 = 256;
 const PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS: usize = 256;
+const MAX_PCM_FANOUT_BYTES: u64 = 256 * 1024 * 1024;
 const INPUT_BRIDGE_QUEUE_CAPACITY_BLOCKS: usize = 64;
 const MAX_WEBSOCKET_CLIENTS: usize = 8;
 const CLIENT_SEND_DEADLINE: Duration = Duration::from_secs(2);
@@ -94,6 +95,7 @@ struct AppState {
     native_stats: Arc<NativeInputStats>,
     capture_fault: watch::Receiver<bool>,
     client_permits: Arc<Semaphore>,
+    max_write_buffer_bytes: usize,
 }
 
 struct SourceRuntime {
@@ -304,7 +306,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
 }
 
 fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
-    let (block_tx, _) = broadcast::channel::<Arc<AudioBlock>>(PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS);
+    let retention = pcm_retention(args.channels, args.frames_per_block, MAX_PCM_FANOUT_BYTES)?;
+    let (block_tx, _) = broadcast::channel::<Arc<AudioBlock>>(retention.capacity_blocks);
+    println!(
+        "PCM fanout: {} blocks, {} retained bytes including client headroom",
+        retention.capacity_blocks, retention.retained_bytes
+    );
     let native_stats = Arc::new(NativeInputStats::new(
         args.source,
         match args.source {
@@ -345,6 +352,7 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
     };
 
     let state = AppState {
+        max_write_buffer_bytes: retention.max_write_buffer_bytes,
         authority: loopback_authority(args.port),
         stream_info,
         blocks: block_tx,
@@ -371,6 +379,56 @@ fn build_app(args: ServeArgs) -> Result<(Router, SourceRuntime)> {
         .with_state(state);
 
     Ok((app, source_runtime))
+}
+
+struct PcmRetention {
+    capacity_blocks: usize,
+    max_write_buffer_bytes: usize,
+    retained_bytes: u64,
+}
+
+fn pcm_retention(channels: u16, frames: u32, budget: u64) -> Result<PcmRetention> {
+    let pcm_bytes = u64::from(channels)
+        .checked_mul(u64::from(frames))
+        .and_then(|samples| samples.checked_mul(4))
+        .filter(|bytes| *bytes > 0)
+        .context("invalid PCM payload size")?;
+    let encoded_bytes = pcm_bytes.checked_add(16).context("PCM encoding overflow")?;
+    // Include the WebSocket header and bounded control/pong headroom. Even tiny
+    // PCM blocks must allow stream-started, stats and error messages.
+    let socket_bytes = encoded_bytes
+        .max(4096)
+        .checked_add(128)
+        .context("WebSocket buffer overflow")?;
+    // Arc payloads in the ring are shared, not multiplied by receiver count.
+    // Conservatively reserve one extra raw payload per client, one encoding,
+    // one bounded socket write buffer, and one producer block outside the ring.
+    let reserved = pcm_bytes
+        .checked_add(encoded_bytes)
+        .and_then(|bytes| bytes.checked_add(socket_bytes))
+        .and_then(|bytes| bytes.checked_mul(MAX_WEBSOCKET_CLIENTS as u64))
+        .and_then(|bytes| bytes.checked_add(pcm_bytes))
+        .context("PCM client headroom overflow")?;
+    let available_blocks = budget
+        .checked_sub(reserved)
+        .context("PCM fanout budget cannot cover client headroom")?
+        / pcm_bytes;
+    let ceiling = available_blocks.min(PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS as u64);
+    if ceiling == 0 {
+        bail!("PCM fanout budget cannot retain one block");
+    }
+    // Tokio rounds requested capacities UP; choose a power of two DOWN so its
+    // actual ring cannot retain more PCM than the checked byte budget allows.
+    let capacity_blocks = 1_usize << ceiling.ilog2();
+    let retained_bytes = (capacity_blocks as u64)
+        .checked_mul(pcm_bytes)
+        .and_then(|bytes| bytes.checked_add(reserved))
+        .context("PCM retention overflow")?;
+    Ok(PcmRetention {
+        capacity_blocks,
+        max_write_buffer_bytes: usize::try_from(socket_bytes)?,
+        retained_bytes,
+    })
 }
 
 fn validate_serve_args(args: &ServeArgs) -> Result<()> {
@@ -409,6 +467,7 @@ fn validate_serve_args(args: &ServeArgs) -> Result<()> {
     if block_bytes > MAX_RING_BYTES || ring_bytes > MAX_RING_BYTES {
         bail!("stream geometry exceeds the 64 MiB monitor ring byte limit (including metadata)");
     }
+    pcm_retention(args.channels, args.frames_per_block, MAX_PCM_FANOUT_BYTES)?;
     Ok(())
 }
 
@@ -448,7 +507,9 @@ async fn ws_handler(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     // Axum drops this closure (and its permit) if the HTTP upgrade fails.
-    ws.on_upgrade(move |socket| websocket_stream(socket, state, permit))
+    ws.write_buffer_size(0)
+        .max_write_buffer_size(state.max_write_buffer_bytes)
+        .on_upgrade(move |socket| websocket_stream(socket, state, permit))
         .into_response()
 }
 
@@ -536,6 +597,8 @@ async fn send_stream<S: Sink<Message> + Unpin>(
                 match result {
                     Ok(block) => {
                         let payload = encode_pcm_block(&block);
+                        // No raw Arc may outlive encoding while this send stalls.
+                        drop(block);
                         if !send_with_deadline(&mut sender, Message::Binary(payload.into()), deadline).await {
                             break;
                         }
@@ -893,6 +956,60 @@ mod tests {
     };
 
     #[test]
+    fn fanout_retention_bounds_extreme_geometry_and_rounding() {
+        for channels in 1..=MAX_CHANNELS {
+            for sample_rate in [1, 48_000, 262_144, MAX_SAMPLE_RATE] {
+                for frames in [1, 960, MAX_FRAMES_PER_BLOCK] {
+                    let ring_bytes = (u64::from(frames) * 8)
+                        .max(u64::from(sample_rate) * 2)
+                        .next_power_of_two()
+                        * u64::from(channels)
+                        * 4
+                        + RING_STATE_BYTES;
+                    if ring_bytes > MAX_RING_BYTES {
+                        continue;
+                    }
+                    let args = ServeArgs {
+                        source: Source::Sine,
+                        device: None,
+                        channels,
+                        sample_rate,
+                        frames_per_block: frames,
+                        port: 0,
+                    };
+                    validate_serve_args(&args).unwrap();
+                    let plan = pcm_retention(channels, frames, MAX_PCM_FANOUT_BYTES).unwrap();
+                    assert!(
+                        plan.retained_bytes <= MAX_PCM_FANOUT_BYTES,
+                        "{channels} channels / {frames} frames: {} bytes",
+                        plan.retained_bytes
+                    );
+                    assert!(plan.capacity_blocks.is_power_of_two());
+                    assert!(plan.capacity_blocks <= PCM_BROADCAST_QUEUE_CAPACITY_BLOCKS);
+                }
+            }
+        }
+        let largest = pcm_retention(31, 65_536, MAX_PCM_FANOUT_BYTES).unwrap();
+        assert_eq!(largest.capacity_blocks, 8);
+        assert_eq!(
+            pcm_retention(12, 960, MAX_PCM_FANOUT_BYTES)
+                .unwrap()
+                .capacity_blocks,
+            256
+        );
+        // Keep exactly three blocks' worth of room: Tokio rounds up to a power
+        // of two, so requesting three would exceed this injected byte budget.
+        let base = pcm_retention(2, 1, MAX_PCM_FANOUT_BYTES).unwrap();
+        let reserved = base.retained_bytes - base.capacity_blocks as u64 * 8;
+        let small = pcm_retention(2, 1, reserved + 3 * 8).unwrap();
+        assert_eq!(small.capacity_blocks, 2);
+        assert!(small.retained_bytes <= reserved + 3 * 8);
+        assert!(pcm_retention(2, 1, reserved + 7).is_err());
+        assert!(pcm_retention(0, 1, MAX_PCM_FANOUT_BYTES).is_err());
+        assert!(pcm_retention(1, 0, MAX_PCM_FANOUT_BYTES).is_err());
+    }
+
+    #[test]
     fn cli_geometry_matches_worker_admission() {
         let cases: Vec<Value> =
             serde_json::from_str(include_str!("../test/fixtures/stream-geometry.json")).unwrap();
@@ -1168,6 +1285,9 @@ mod tests {
 
     fn client_state() -> AppState {
         AppState {
+            max_write_buffer_bytes: pcm_retention(2, 1, MAX_PCM_FANOUT_BYTES)
+                .unwrap()
+                .max_write_buffer_bytes,
             authority: "127.0.0.1:1".into(),
             stream_info: StreamStarted {
                 event_type: "stream-started",
@@ -1248,6 +1368,85 @@ mod tests {
         assert_eq!(value["code"], "device-lost");
         assert!(messages.try_recv().is_err());
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn tiny_fanout_budget_lags_without_retaining_inflight_raw_pcm() {
+        let mut state = client_state();
+        let base = pcm_retention(2, 1, MAX_PCM_FANOUT_BYTES).unwrap();
+        let reserved = base.retained_bytes - base.capacity_blocks as u64 * 8;
+        let plan = pcm_retention(2, 1, reserved + 3 * 8).unwrap();
+        state.blocks = broadcast::channel(plan.capacity_blocks).0;
+        state.max_write_buffer_bytes = plan.max_write_buffer_bytes;
+        let (sink, reader, mut slow_messages, _close, dropped) = client_fixture(3);
+        let slow = tokio::spawn(websocket_client(
+            sink,
+            reader,
+            state.client_permits.clone().try_acquire_owned().unwrap(),
+            state.clone(),
+            Duration::from_millis(100),
+        ));
+        let (sink, reader, mut messages, close, _) = client_fixture(0);
+        let healthy = tokio::spawn(websocket_client(
+            sink,
+            reader,
+            state.client_permits.clone().try_acquire_owned().unwrap(),
+            state.clone(),
+            Duration::from_secs(1),
+        ));
+        for channel in [&mut slow_messages, &mut messages] {
+            fixture_message(channel).await;
+            fixture_message(channel).await;
+        }
+        let first = test_block();
+        let retained = Arc::downgrade(&first);
+        state.blocks.send(first).unwrap();
+        assert!(matches!(
+            fixture_message(&mut slow_messages).await,
+            Message::Binary(_)
+        ));
+        assert!(matches!(
+            fixture_message(&mut messages).await,
+            Message::Binary(_)
+        ));
+        // No yield: both subscriptions fall behind this two-slot ring.
+        for frame_start in 1..=3 {
+            let mut block = (*test_block()).clone();
+            block.frame_start = frame_start;
+            state.blocks.send(Arc::new(block)).unwrap();
+        }
+        assert!(
+            retained.upgrade().is_none(),
+            "stalled encoding retained raw PCM"
+        );
+        let lag: Value =
+            serde_json::from_str(fixture_message(&mut messages).await.to_text().unwrap()).unwrap();
+        assert_eq!(lag["code"], "server-client-lagged");
+        for frame in [2_u64, 3] {
+            let Message::Binary(payload) = fixture_message(&mut messages).await else {
+                panic!("expected retained PCM");
+            };
+            assert_eq!(
+                payload.as_ref(),
+                encode_pcm_block(&AudioBlock {
+                    frame_start: frame,
+                    ..(*test_block()).clone()
+                })
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(2), slow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(state.blocks.receiver_count(), 1);
+        close.send(Ok(Message::Close(None))).unwrap();
+        healthy.await.unwrap();
+        assert_eq!(
+            state.client_permits.available_permits(),
+            MAX_WEBSOCKET_CLIENTS
+        );
+        assert_eq!(state.blocks.receiver_count(), 0);
     }
 
     #[tokio::test]

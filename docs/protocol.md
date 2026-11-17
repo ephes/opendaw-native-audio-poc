@@ -79,6 +79,28 @@ the producer exits. This per-client transport limit does not change capture queu
 or buffering and does not interrupt other clients. The browser records unexpected
 transport loss as an interrupted session, retaining flushed recoverable audio.
 
+### Native PCM fanout retention
+
+Broadcast retention is bounded by both 256 blocks and a 256 MiB PCM byte budget.
+For payload size `P = channels * framesPerBlock * 4`, encoded size `E = P + 16`
+and socket limit `W = max(E, 4096) + 128`, reserve `P + 8 * (P + E + W)`
+bytes for a producer block and all eight admitted clients. Each client's reserve
+covers an out-of-ring raw `Arc`, one encoding and its WebSocket write buffer;
+encoding releases the raw reference before awaiting the send. Shared ring payloads
+are counted once, not once per subscriber. Choose the largest power-of-two queue
+capacity `C <= 256` with `C * P + reserve <= 256 MiB`. Rounding down is necessary
+because Tokio rounds broadcast channel capacities up. Checked arithmetic and room
+for at least one block are required before startup.
+
+WebSocket writes flush immediately and their buffer limit is `W` (including
+header/control headroom). Queue lag retains the existing `server-client-lagged`
+notification followed by the available PCM; the two-second send deadline still
+ends stalled clients. For 31 channels and 65,536 frames/block, `C = 8`; ordinary
+12-channel, 960-frame streaming keeps `C = 256`. No wire fields change. These are
+retained PCM/encoded byte bounds, not a whole-process memory limit: allocator
+slack, queue metadata, control traffic, the callback queue and browser allocations
+are separate.
+
 ## PCM Blocks
 
 PCM blocks should be binary WebSocket messages.
