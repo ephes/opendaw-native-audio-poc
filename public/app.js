@@ -235,6 +235,7 @@ function releaseMonitor(attempt) {
   attempt.closed = true;
   clearTimeout(attempt.timer);
   attempt.retire();
+  attempt.context?.removeEventListener("statechange", attempt.onStateChange);
   if (attempt.node) {
     attempt.node.port.removeEventListener("message", attempt.onMessage);
     attempt.node.removeEventListener("processorerror", attempt.onFault);
@@ -254,67 +255,98 @@ function stopMonitor() {
   els.monitor.textContent = "Start Monitor";
 }
 
+function renderMonitorState(attempt) {
+  if (monitorAttempt !== attempt || sharedBuffer !== attempt.buffer) return;
+  const state = attempt.context.state;
+  if (state === "closed") {
+    stopMonitor();
+    els.streamSummary.textContent = "Monitor context closed; Start Monitor to retry";
+    els.monitor.disabled = !sharedBuffer;
+  } else if (!attempt.starting) {
+    const running = state === "running";
+    els.monitor.textContent = running ? "Monitoring" : "Resume Monitor";
+    els.monitor.disabled = running || !sharedBuffer;
+    els.streamSummary.textContent = running
+      ? `${attempt.info.channels} channels, ${attempt.info.sampleRate} Hz, ${attempt.info.framesPerBlock} frames/block · Monitoring`
+      : `Monitor ${state}; click Resume Monitor to resume audio`;
+  }
+}
+
 function startMonitor() {
   if (!sharedBuffer) return Promise.resolve();
-  if (monitorAttempt) return monitorAttempt.promise;
-  const attempt = { buffer: sharedBuffer, info: streamInfo, context: null, node: null, starting: true };
-  attempt.retired = new Promise(resolve => { attempt.retire = resolve; });
-  monitorAttempt = attempt;
+  if (monitorAttempt?.starting || monitorAttempt?.context.state === "running") {
+    return monitorAttempt.promise;
+  }
+  const attempt = monitorAttempt ?? { buffer: sharedBuffer, info: streamInfo, context: null, node: null };
+  if (!monitorAttempt) {
+    attempt.retired = new Promise(resolve => { attempt.retire = resolve; });
+    monitorAttempt = attempt;
+  }
+  const resuming = Boolean(attempt.node);
+  attempt.starting = true;
   els.monitor.disabled = true;
+  els.monitor.textContent = resuming ? "Resuming Monitor…" : "Starting Monitor…";
   attempt.promise = (async () => {
     const current = () => monitorAttempt === attempt && sharedBuffer === attempt.buffer;
+    const operation = {};
+    attempt.operation = operation;
     attempt.timer = setTimeout(() => {
-      if (!current() || !attempt.starting) return;
+      if (!current() || !attempt.starting || attempt.operation !== operation) return;
       stopMonitor();
-      els.streamSummary.textContent = "Monitor startup timed out; Start Monitor to retry";
+      els.streamSummary.textContent = `Monitor ${resuming ? "resume" : "startup"} timed out; Start Monitor to retry`;
       els.monitor.disabled = !sharedBuffer;
     }, MONITOR_STARTUP_TIMEOUT_MS);
     try {
-      const context = new AudioContext({ sampleRate: attempt.info.sampleRate });
-      attempt.context = context;
-      await Promise.race([context.audioWorklet.addModule("/bridge-processor.js"), attempt.retired]);
-      if (!current()) return;
-      const node = new AudioWorkletNode(context, "native-bridge-processor", {
-        numberOfInputs: 0,
-        numberOfOutputs: 1,
-        outputChannelCount: [2],
-      });
-      attempt.node = node;
-      attempt.onMessage = (event) => {
-        if (current()) handleWorkletMessage(event);
-      };
-      attempt.onFault = () => {
+      if (!attempt.context) {
+        const context = new AudioContext({ sampleRate: attempt.info.sampleRate });
+        attempt.context = context;
+        attempt.onStateChange = () => renderMonitorState(attempt);
+        context.addEventListener("statechange", attempt.onStateChange);
+        await Promise.race([context.audioWorklet.addModule("/bridge-processor.js"), attempt.retired]);
         if (!current()) return;
-        stopMonitor();
-        els.streamSummary.textContent = "Monitor processor failed; Start Monitor to retry";
-        els.monitor.disabled = !sharedBuffer;
-      };
-      node.port.addEventListener("message", attempt.onMessage);
-      node.addEventListener("processorerror", attempt.onFault);
-      node.port.start();
-      node.connect(context.destination);
-      node.port.postMessage({
-        type: "configure", sharedBuffer: attempt.buffer,
-        left: Number(els.leftChannel.value), right: Number(els.rightChannel.value),
-      });
-      await Promise.race([context.resume(), attempt.retired]);
+        const node = new AudioWorkletNode(context, "native-bridge-processor", {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [2],
+        });
+        attempt.node = node;
+        attempt.onMessage = (event) => {
+          if (current()) handleWorkletMessage(event);
+        };
+        attempt.onFault = () => {
+          if (!current()) return;
+          stopMonitor();
+          els.streamSummary.textContent = "Monitor processor failed; Start Monitor to retry";
+          els.monitor.disabled = !sharedBuffer;
+        };
+        node.port.addEventListener("message", attempt.onMessage);
+        node.addEventListener("processorerror", attempt.onFault);
+        node.port.start();
+        node.connect(context.destination);
+        node.port.postMessage({
+          type: "configure", sharedBuffer: attempt.buffer,
+          left: Number(els.leftChannel.value), right: Number(els.rightChannel.value),
+        });
+      }
+      // On recovery, invoke resume before any await to retain the click's gesture.
+      await Promise.race([attempt.context.resume(), attempt.retired]);
       if (!current()) return;
-      audioContext = context;
-      workletNode = node;
-      els.monitor.textContent = "Monitoring";
+      audioContext = attempt.context;
+      workletNode = attempt.node;
     } catch (error) {
       if (current()) {
-        monitorAttempt = null;
-        els.monitor.textContent = "Start Monitor";
-        els.streamSummary.textContent = `Monitor failed: ${error.message}`;
+        stopMonitor();
+        els.streamSummary.textContent = `Monitor failed: ${error.message}; Start Monitor to retry`;
       }
       releaseMonitor(attempt);
     } finally {
       attempt.starting = false;
       clearTimeout(attempt.timer);
-      if (!current()) releaseMonitor(attempt);
-      if (!monitorAttempt || monitorAttempt === attempt) {
-        els.monitor.disabled = !sharedBuffer || Boolean(workletNode);
+      if (!current()) {
+        releaseMonitor(attempt);
+        if (!monitorAttempt) els.monitor.disabled = !sharedBuffer;
+      } else {
+        renderMonitorState(attempt);
       }
     }
   })();
